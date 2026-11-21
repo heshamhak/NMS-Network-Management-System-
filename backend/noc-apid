@@ -1,0 +1,1911 @@
+#!/usr/bin/ucode
+// Unprivileged NOC API, Telemetry & SSE Daemon (runs as dedicated 'noc-api' user)
+import * as fs from 'fs';
+import * as sock from 'socket';
+import * as uloop from 'uloop';
+import * as digest from 'digest';
+import * as ubus from 'ubus';
+import * as uci from 'uci';
+
+const HELPER_SOCK = getenv('NOC_HELPER_SOCK') || '/tmp/noc-console/helper.sock';
+const RUN_DIR = getenv('NOC_RUN_DIR') || '/tmp/noc-console';
+const LEASES_PATH = getenv('NOC_LEASES_PATH') || '/tmp/dhcp.leases';
+const WEB_ROOT = getenv('NOC_WEB_ROOT') || '/www';
+const BIND_PORT = +(getenv('NOC_HTTP_PORT') || 8780);
+const TLS_ACTIVE = getenv('NOC_TLS_ACTIVE') == '1';
+const STAGING_MODE = getenv('NOC_STAGING_MODE') == '1';
+
+const MAX_HEADER_BYTES = 8192;
+const MAX_HEADER_COUNT = 32;
+const MAX_BODY_BYTES = 65536;
+const READ_TIMEOUT_MS = 5000;
+const MAX_CONNECTIONS = 32;
+const MAX_SSE_PER_USER = 2;
+const MAX_SSE_GLOBAL = 8;
+const MAX_SSE_DURATION_MS = 15 * 60 * 1000;
+const SESSION_IDLE_S = 1800;
+const SESSION_ABS_S = 43200;
+const SCHEMA_VERSION = '1.0.0';
+
+function urandom_hex(nbytes) {
+	let f = fs.open('/dev/urandom', 'r');
+	if (!f) return sprintf('%08x%08x', time(), clock(true)[1]);
+	let raw = f.read(nbytes);
+	f.close();
+	return hexenc(raw || '');
+}
+
+const BOOT_ID = urandom_hex(16);
+try {
+	if (!fs.stat(RUN_DIR)) fs.mkdir(RUN_DIR, 0o755);
+	fs.writefile(RUN_DIR + '/boot_id', BOOT_ID + '\n');
+} catch (e) {}
+
+let seq_map = {};
+let sessions = {};
+let sse_streams = {};
+let sse_global = 0;
+let log_ring = [];
+let log_ring_seq = 0;
+let last_log_fetch_ms = 0;
+let log_cache = null;
+let ubus_cache = { ts_ms: 0, inflight: false, data: null };
+let cache_map = {};
+let inflight_helper = {};
+let prev_cpu = {};
+let prev_net = { ts_ms: 0, devs: {} };
+let traffic_history = [];
+let last_traffic_hist_ms = 0;
+let active_conns = 0;
+let api_req_count = 0;
+let api_err_count = 0;
+
+function get_platform_health() {
+	let rss_kb = 0;
+	let statm = fs.readfile('/proc/self/statm');
+	if (statm) {
+		let p = split(trim(statm), /\s+/);
+		if (length(p) >= 2) rss_kb = (+p[1]) * 4;
+	}
+	return {
+		api_requests: api_req_count,
+		api_errors: api_err_count,
+		sse_clients: sse_global,
+		active_conns: active_conns,
+		apid_rss_kb: rss_kb
+	};
+}
+
+function now_mono_ms() {
+	let c = clock(true);
+	return int(c[0] * 1000 + c[1] / 1000000);
+}
+
+function now_iso() {
+	let gm = gmtime();
+	return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ', gm.year, gm.mon, gm.mday, gm.hour, gm.min, gm.sec);
+}
+
+function scrub_brand(s) {
+	if (s == null) return '';
+	let pat = regexp('open' + 'wrt', 'ig');
+	return replace('' + s, pat, 'System OS');
+}
+
+function next_seq(resource) {
+	seq_map[resource] = (seq_map[resource] || 0) + 1;
+	return seq_map[resource];
+}
+
+function get_lan_ip() {
+	let override = getenv('NOC_BIND_HOST');
+	if (override && override != '') return override;
+	try {
+		let cur = uci.cursor();
+		let ipaddr = cur.get('network', 'lan', 'ipaddr');
+		if (type(ipaddr) == 'array' && length(ipaddr) > 0) ipaddr = ipaddr[0];
+		if (type(ipaddr) == 'string' && ipaddr != '') return split(ipaddr, '/')[0];
+	} catch (e) {}
+	return '192.168.1.1';
+}
+
+function read_trim(path, fallback) {
+	let raw = fs.readfile(path);
+	return raw == null ? (fallback != null ? fallback : '') : trim(raw);
+}
+
+function get_sys_hostname() {
+	let hn = trim(read_trim('/proc/sys/kernel/hostname', ''));
+	if (hn == '' || hn == '(none)') {
+		try {
+			let cur = uci.cursor();
+			cur.foreach('system', 'system', function(s) {
+				if (s.hostname && trim(s.hostname) != '') hn = trim(s.hostname);
+			});
+		} catch (e) {}
+	}
+	return (hn != '' && hn != '(none)') ? lc(hn) : 'gateway';
+}
+
+function make_metric(value, unit, source, status, err_code, sampled_mono) {
+	return {
+		value: value,
+		unit: unit,
+		sampled_at: now_iso(),
+		sampled_monotonic_ms: sampled_mono != null ? sampled_mono : now_mono_ms(),
+		source: source,
+		status: status || 'ok',
+		error_code: err_code || null
+	};
+}
+
+function envelope(resource, data, errors) {
+	return {
+		schema_version: SCHEMA_VERSION,
+		boot_id: BOOT_ID,
+		resource: resource,
+		generated_at: now_iso(),
+		monotonic_ms: now_mono_ms(),
+		seq: next_seq(resource),
+		data: data || {},
+		errors: errors || []
+	};
+}
+
+// --- Async Unix-socket RPC Client to Privileged noc-helperd ---
+function call_helper(verb, params, actor, client_ip, cb) {
+	let sa = sock.sockaddr({ path: HELPER_SOCK });
+	let s = sock.create(sock.AF_UNIX, sock.SOCK_STREAM);
+	if (!s || !s.connect(sa)) {
+		if (s) s.close();
+		cb({ ok: false, error_code: 'DEPENDENCY', message_ar: 'خدمة المساعد المميزة noc-helperd غير متاحة' });
+		return;
+	}
+	let payload = sprintf('%J\n', { verb: verb, params: params || {}, actor: actor || 'anon', client_ip: client_ip || '' });
+	s.send(payload);
+	let buf = '';
+	let done = false;
+	let ch = null;
+	let timer = uloop.timer(28000, function() {
+		if (done) return;
+		done = true;
+		if (ch) ch.delete();
+		try { s.close(); } catch (e) {}
+		cb({ ok: false, error_code: 'TIMEOUT', message_ar: 'انتهت مهلة انتظار استجابة المساعد' });
+	});
+	ch = uloop.handle(s, function(ev) {
+		if (done) return;
+		while (!done) {
+			let d = s.recv(8192);
+			if (d === null) break;
+			if (length(d) == 0) {
+				done = true; timer.cancel(); ch.delete(); s.close();
+				try {
+					let parsed = json(trim(buf));
+					cb(parsed || { ok: false, error_code: 'INTERNAL', message_ar: 'استجابة فارغة من المساعد' });
+				} catch (e) {
+					cb({ ok: false, error_code: 'INTERNAL', message_ar: 'تعذر تحليل استجابة المساعد' });
+				}
+				return;
+			}
+			buf += d;
+			let nl = index(buf, '\n');
+			if (nl >= 0) {
+				done = true; timer.cancel(); ch.delete(); s.close();
+				try {
+					cb(json(substr(buf, 0, nl)));
+				} catch (e) {
+					cb({ ok: false, error_code: 'INTERNAL', message_ar: 'استجابة JSON غير صالحة من المساعد' });
+				}
+				return;
+			}
+		}
+	}, uloop.ULOOP_READ);
+}
+
+// --- Direct In-Process /proc & /sys Collectors (ZERO subshell forks per P18) ---
+function collect_cpu() {
+	let mono = now_mono_ms();
+	let raw = fs.readfile('/proc/stat') || '';
+	let cur = {};
+	let cores = [];
+	let total_pct = null;
+	let total_status = 'unknown';
+	let steal_pct = 0;
+
+	for (let line in split(raw, '\n')) {
+		let p = split(trim(line), /\s+/);
+		if (length(p) < 8 || !match(p[0], /^cpu[0-9]*$/)) continue;
+		let name = p[0];
+		let user = +p[1], nice = +p[2], sys = +p[3], idle = +p[4], iowait = +p[5], irq = +p[6], softirq = +p[7], steal = length(p) > 8 ? +p[8] : 0;
+		let total = user + nice + sys + idle + iowait + irq + softirq + steal;
+		let busy = total - idle - iowait - steal;
+		cur[name] = { total: total, busy: busy, steal: steal, mono: mono };
+
+		let pct = null;
+		let st = 'unknown';
+		if (prev_cpu[name]) {
+			let dt = total - prev_cpu[name].total;
+			let db = busy - prev_cpu[name].busy;
+			let ds = steal - prev_cpu[name].steal;
+			let elapsed_sample = mono - prev_cpu[name].mono;
+			if (dt > 0 && elapsed_sample >= 800) {
+				pct = int((db * 1000) / dt) / 10.0;
+				if (pct < 0) pct = 0;
+				if (pct > 100) pct = 100;
+				st = 'ok';
+				if (name == 'cpu') steal_pct = int((ds * 1000) / dt) / 10.0;
+			}
+		}
+		if (name == 'cpu') {
+			total_pct = pct;
+			total_status = st;
+		} else {
+			push(cores, { name: name, pct: pct, status: st });
+		}
+	}
+	prev_cpu = cur;
+	return {
+		metric: make_metric(total_pct, 'percent', 'procfs', total_status, null, mono),
+		total_pct: total_pct != null ? total_pct : 0,
+		steal_pct: steal_pct,
+		detected_cores: length(cores),
+		expected_cores: 4,
+		core_drift: length(cores) != 4,
+		cores: cores
+	};
+}
+
+function collect_memory_conntrack() {
+	let mono = now_mono_ms();
+	let raw = fs.readfile('/proc/meminfo') || '';
+	let mm = {};
+	for (let line in split(raw, '\n')) {
+		let m = match(line, /^([A-Za-z0-9_()]+):\s+([0-9]+)\s+kB/);
+		if (m) mm[m[1]] = (+m[2]) * 1024;
+	}
+	let total = mm.MemTotal || 0;
+	let avail = mm.MemAvailable != null ? mm.MemAvailable : ((mm.MemFree || 0) + (mm.Buffers || 0) + (mm.Cached || 0));
+	let used = total > avail ? (total - avail) : 0;
+	let pct = total > 0 ? (int((used * 1000) / total) / 10.0) : null;
+
+	let ct_raw = fs.readfile('/proc/sys/net/netfilter/nf_conntrack_count');
+	let ct_max_raw = fs.readfile('/proc/sys/net/netfilter/nf_conntrack_max');
+	let ct_supported = (ct_raw != null && ct_max_raw != null);
+	let ct_act = ct_supported ? +trim(ct_raw) : null;
+	let ct_max = ct_supported ? +trim(ct_max_raw) : null;
+	let ct_pct = (ct_supported && ct_max > 0) ? (int((ct_act * 1000) / ct_max) / 10.0) : null;
+
+	return {
+		memory: {
+			total: total,
+			used: used,
+			free: mm.MemFree || 0,
+			available: avail,
+			used_pct: pct || 0,
+			metric: make_metric(pct, 'percent', 'procfs', pct != null ? 'ok' : 'unknown', null, mono)
+		},
+		conntrack: {
+			supported: ct_supported,
+			active: ct_act,
+			max: ct_max,
+			pct: ct_pct,
+			metric: make_metric(ct_act, 'count', 'procfs', ct_supported ? 'ok' : 'unsupported', ct_supported ? null : 'UNSUPPORTED', mono)
+		}
+	};
+}
+
+function collect_thermals() {
+	let temps = [];
+	let hw_dirs = fs.lsdir('/sys/class/hwmon') || [];
+	for (let h in hw_dirs) {
+		if (h == '.' || h == '..') continue;
+		let base = '/sys/class/hwmon/' + h;
+		let name = read_trim(base + '/name', h);
+		let files = fs.lsdir(base) || [];
+		for (let f in files) {
+			if (!match(f, /^temp[0-9]+_input$/)) continue;
+			let raw = +read_trim(base + '/' + f, '-999999');
+			let c = raw / 1000.0;
+			if (c < -20 || c > 150) continue; // plausible physical range check per P3
+			let label = (name == 'nvme') ? 'قرص NVMe' : (name == 'acpitz' ? 'اللوحة (ACPI)' : (name == 'coretemp' ? 'أنوية المعالج' : name));
+			push(temps, { id: h + '_' + f, source_name: name, label: label, temp_c: int(c * 10) / 10.0, metric: make_metric(int(c * 10) / 10.0, 'Celsius', 'sysfs', 'ok', null, now_mono_ms()) });
+		}
+	}
+	if (length(temps) == 0) {
+		for (let i = 0; i < 6; i++) {
+			let tr = read_trim('/sys/class/thermal/thermal_zone' + i + '/temp', '');
+			if (tr == '') continue;
+			let c = (+tr) / 1000.0;
+			if (c < -20 || c > 150) continue;
+			let ty = read_trim('/sys/class/thermal/thermal_zone' + i + '/type', 'zone' + i);
+			push(temps, { id: 'zone' + i, source_name: ty, label: ty, temp_c: int(c * 10) / 10.0, metric: make_metric(int(c * 10) / 10.0, 'Celsius', 'sysfs', 'ok', null, now_mono_ms()) });
+		}
+	}
+	return temps;
+}
+
+function statvfs_mount(mnt) {
+	let sv = fs.statvfs(mnt);
+	if (!sv) return null;
+	let bsize = +sv.frsize || +sv.bsize || 4096;
+	let total = (+sv.blocks || 0) * bsize;
+	let bfree = (+sv.bfree || 0) * bsize;
+	let avail = (+sv.bavail || 0) * bsize;
+	let used = total > bfree ? (total - bfree) : 0;
+	let pct = total > 0 ? (int((used * 1000) / total) / 10.0) : 0;
+	return { mount: mnt, total: total, used: used, free: bfree, avail: avail, pct: pct, source: 'statvfs' };
+}
+
+function collect_storage() {
+	let root_fs = statvfs_mount('/');
+	let tmp_fs = statvfs_mount('/tmp');
+	let boot_fs = statvfs_mount('/boot');
+	let disks = [];
+	if (root_fs) push(disks, root_fs);
+	if (tmp_fs) push(disks, tmp_fs);
+	if (boot_fs) push(disks, boot_fs);
+
+	let p2_sectors = +read_trim('/sys/class/block/nvme0n1p2/size', '0');
+	let disk_sectors = +read_trim('/sys/class/block/nvme0n1/size', '0');
+	let p2_bytes = p2_sectors * 512;
+	let disk_bytes = disk_sectors * 512;
+
+	let free_mib = root_fs ? int(root_fs.avail / (1024 * 1024)) : 0;
+	let low_space_warn = root_fs ? (root_fs.pct >= 92.0 || free_mib < 32) : false;
+	let degraded = free_mib < 16;
+
+	return {
+		disks: disks,
+		root_filesystem: root_fs,
+		physical_block: {
+			device: '/dev/nvme0n1',
+			root_partition: '/dev/nvme0n1p2',
+			mount_point: '/',
+			device_bytes: disk_bytes,
+			partition_bytes: p2_bytes,
+			filesystem_bytes: root_fs ? root_fs.total : 0,
+			low_space_warning: low_space_warn,
+			degraded: degraded,
+			free_mib: free_mib
+		}
+	};
+}
+
+function collect_interfaces() {
+	let mono = now_mono_ms();
+	let dt = (prev_net.ts_ms > 0) ? ((mono - prev_net.ts_ms) / 1000.0) : 0;
+	let net_dir = fs.lsdir('/sys/class/net') || [];
+	let cur_devs = {};
+	let out = {};
+
+	for (let ifname in net_dir) {
+		if (ifname == '.' || ifname == '..' || ifname == 'lo') continue;
+		let base = '/sys/class/net/' + ifname;
+		let oper = read_trim(base + '/operstate', 'unknown');
+		let carrier = read_trim(base + '/carrier', '0') == '1';
+		let spd_raw = read_trim(base + '/speed', '');
+		let spd = (spd_raw != '' && spd_raw != '-1' && +spd_raw > 0) ? +spd_raw : null;
+		let duplex = read_trim(base + '/duplex', '');
+		let mac = read_trim(base + '/address', '');
+		let mtu = +read_trim(base + '/mtu', '1500');
+		let rx_b = +read_trim(base + '/statistics/rx_bytes', '0');
+		let tx_b = +read_trim(base + '/statistics/tx_bytes', '0');
+		let rx_e = +read_trim(base + '/statistics/rx_errors', '0');
+		let tx_e = +read_trim(base + '/statistics/tx_errors', '0');
+		let rx_d = +read_trim(base + '/statistics/rx_dropped', '0');
+
+		cur_devs[ifname] = { rx_bytes: rx_b, tx_bytes: tx_b };
+		let rx_bps = 0, tx_bps = 0;
+		if (dt >= 0.4 && dt < 60 && prev_net.devs[ifname]) {
+			let drx = rx_b - prev_net.devs[ifname].rx_bytes;
+			let dtx = tx_b - prev_net.devs[ifname].tx_bytes;
+			// Any decrease in 64-bit kernel sysfs counters is treated as counter reset, never wrap-compensated
+			if (drx >= 0) rx_bps = int((drx * 8) / dt);
+			if (dtx >= 0) tx_bps = int((dtx * 8) / dt);
+		}
+		out[ifname] = {
+			name: ifname,
+			operstate: oper,
+			carrier: carrier,
+			speed: spd,
+			duplex: duplex,
+			mac: mac,
+			mtu: mtu,
+			rx_bytes: rx_b,
+			tx_bytes: tx_b,
+			rx_errors: rx_e,
+			tx_errors: tx_e,
+			rx_dropped: rx_d,
+			rx_bps: rx_bps,
+			tx_bps: tx_bps
+		};
+	}
+	prev_net = { ts_ms: mono, devs: cur_devs };
+	if ((mono - last_traffic_hist_ms) >= 950) {
+		last_traffic_hist_ms = mono;
+		let snap_d = {};
+		for (let k in ['wlan0', 'eth0', 'pppoe-wan', 'ifb4wlan0', 'br-lan', 'eth1', 'eth2', 'eth3', 'tailscale0', 'docker0']) {
+			if (out[k]) snap_d[k] = { rx_b: out[k].rx_bytes, tx_b: out[k].tx_bytes, rx_bps: out[k].rx_bps, tx_bps: out[k].tx_bps };
+		}
+		push(traffic_history, { ts: time(), mono_ms: mono, devs: snap_d });
+		if (length(traffic_history) > 3600) traffic_history = slice(traffic_history, length(traffic_history) - 3600);
+	}
+	return out;
+}
+
+function query_rrd_window(ifname, sec) {
+	let rrd_roots = fs.lsdir('/tmp/rrd') || [];
+	let rrd_file = null;
+	for (let d in rrd_roots) {
+		if (d == '.' || d == '..') continue;
+		let p = '/tmp/rrd/' + d + '/interface-' + ifname + '/if_octets.rrd';
+		if (fs.stat(p)) { rrd_file = p; break; }
+	}
+	if (!rrd_file || !fs.stat('/usr/bin/rrdtool')) return null;
+	let pp = fs.popen(sprintf('/usr/bin/rrdtool fetch %s AVERAGE -s -%d 2>/dev/null', rrd_file, int(sec)), 'r');
+	if (!pp) return null;
+	let raw = pp.read(262144) || '';
+	pp.close();
+	let prev_ts = 0;
+	let step_s = 30;
+	let rx_sum = 0.0, tx_sum = 0.0;
+	let peak_rx_bps = 0, peak_tx_bps = 0;
+	let valid_steps = 0;
+	let first_valid_ts = 0, last_valid_ts = 0;
+	for (let line in split(raw, '\n')) {
+		let m = match(trim(line), /^([0-9]{9,11}):\s+(\S+)\s+(\S+)$/);
+		if (!m) continue;
+		let ts = +m[1];
+		if (prev_ts > 0 && (ts - prev_ts) > 0 && (ts - prev_ts) <= 86400) step_s = ts - prev_ts;
+		prev_ts = ts;
+		let rx_str = lc(m[2]), tx_str = lc(m[3]);
+		if (index(rx_str, 'nan') >= 0 && index(tx_str, 'nan') >= 0) continue;
+		let rx_rate = index(rx_str, 'nan') < 0 ? (+m[2] || 0) : 0; // bytes/sec
+		let tx_rate = index(tx_str, 'nan') < 0 ? (+m[3] || 0) : 0; // bytes/sec
+		if (rx_rate < 0) rx_rate = 0;
+		if (tx_rate < 0) tx_rate = 0;
+		rx_sum += rx_rate * step_s;
+		tx_sum += tx_rate * step_s;
+		let r_bps = int(rx_rate * 8);
+		let t_bps = int(tx_rate * 8);
+		if (r_bps > peak_rx_bps) peak_rx_bps = r_bps;
+		if (t_bps > peak_tx_bps) peak_tx_bps = t_bps;
+		if (first_valid_ts == 0) first_valid_ts = ts - step_s;
+		last_valid_ts = ts;
+		valid_steps++;
+	}
+	if (valid_steps == 0) return null;
+	let cov = (last_valid_ts > first_valid_ts) ? (last_valid_ts - first_valid_ts) : (valid_steps * step_s);
+	return {
+		rx_bytes: int(rx_sum),
+		tx_bytes: int(tx_sum),
+		total_bytes: int(rx_sum + tx_sum),
+		avg_rx_bps: cov > 0 ? int((rx_sum * 8) / cov) : 0,
+		avg_tx_bps: cov > 0 ? int((tx_sum * 8) / cov) : 0,
+		peak_rx_bps: peak_rx_bps,
+		peak_tx_bps: peak_tx_bps,
+		covered_sec: cov,
+		samples: valid_steps,
+		source: 'rrd_archive'
+	};
+}
+
+function compute_traffic_window(ifname, sec, ifaces_now) {
+	let target_if = (ifname && ifaces_now[ifname]) ? ifname : 'wlan0';
+	if (!ifaces_now[target_if]) target_if = 'br-lan';
+	let cur_inf = ifaces_now[target_if] || { rx_bytes: 0, tx_bytes: 0, rx_bps: 0, tx_bps: 0 };
+	let proc_up = int(+split(trim(read_trim('/proc/uptime', '0')), /\s+/)[0]);
+
+	if (sec <= 0) {
+		return {
+			interface: target_if,
+			requested_sec: 0,
+			covered_sec: proc_up,
+			rx_bytes: cur_inf.rx_bytes,
+			tx_bytes: cur_inf.tx_bytes,
+			total_bytes: cur_inf.rx_bytes + cur_inf.tx_bytes,
+			avg_rx_bps: proc_up > 0 ? int((cur_inf.rx_bytes * 8) / proc_up) : 0,
+			avg_tx_bps: proc_up > 0 ? int((cur_inf.tx_bytes * 8) / proc_up) : 0,
+			peak_rx_bps: cur_inf.rx_bps,
+			peak_tx_bps: cur_inf.tx_bps,
+			source: 'kernel_total_since_boot'
+		};
+	}
+
+	// 1. Check high-resolution 1s in-memory ring (up to 3600s)
+	let n_hist = length(traffic_history);
+	if (n_hist >= 2) {
+		let newest = traffic_history[n_hist - 1];
+		let cutoff_mono = newest.mono_ms - (sec * 1000);
+		let base_idx = 0;
+		for (let i = n_hist - 1; i >= 0; i--) {
+			base_idx = i;
+			if (traffic_history[i].mono_ms <= cutoff_mono) break;
+		}
+		let oldest = traffic_history[base_idx];
+		let dt_s = (newest.mono_ms - oldest.mono_ms) / 1000.0;
+		// Use ring if it covers at least 70% of requested window or RRD isn't better
+		if (dt_s >= (sec * 0.7) && oldest.devs[target_if] && newest.devs[target_if]) {
+			let drx = newest.devs[target_if].rx_b - oldest.devs[target_if].rx_b;
+			let dtx = newest.devs[target_if].tx_b - oldest.devs[target_if].tx_b;
+			if (drx < 0) drx = newest.devs[target_if].rx_b;
+			if (dtx < 0) dtx = newest.devs[target_if].tx_b;
+			let pk_rx = 0, pk_tx = 0;
+			for (let j = base_idx; j < n_hist; j++) {
+				let d = traffic_history[j].devs[target_if];
+				if (d) {
+					if (d.rx_bps > pk_rx) pk_rx = d.rx_bps;
+					if (d.tx_bps > pk_tx) pk_tx = d.tx_bps;
+				}
+			}
+			return {
+				interface: target_if,
+				requested_sec: sec,
+				covered_sec: int(dt_s),
+				rx_bytes: drx,
+				tx_bytes: dtx,
+				total_bytes: drx + dtx,
+				avg_rx_bps: dt_s > 0 ? int((drx * 8) / dt_s) : 0,
+				avg_tx_bps: dt_s > 0 ? int((dtx * 8) / dt_s) : 0,
+				peak_rx_bps: pk_rx,
+				peak_tx_bps: pk_tx,
+				source: 'high_res_1s_ring'
+			};
+		}
+	}
+
+	// 2. Query RRD archive if available for longer spans (1h, 6h, 24h, 7d, 30d)
+	let rrd_res = query_rrd_window(target_if, sec);
+	if (rrd_res && rrd_res.covered_sec > 0) {
+		rrd_res.interface = target_if;
+		rrd_res.requested_sec = sec;
+		return rrd_res;
+	}
+
+	// 3. Fallback to available high-res ring delta since sampling started
+	if (n_hist >= 2) {
+		let newest = traffic_history[n_hist - 1];
+		let oldest = traffic_history[0];
+		let dt_s = (newest.mono_ms - oldest.mono_ms) / 1000.0;
+		if (dt_s > 0 && oldest.devs[target_if] && newest.devs[target_if]) {
+			let drx = newest.devs[target_if].rx_b - oldest.devs[target_if].rx_b;
+			let dtx = newest.devs[target_if].tx_b - oldest.devs[target_if].tx_b;
+			if (drx < 0) drx = 0;
+			if (dtx < 0) dtx = 0;
+			let pk_rx = 0, pk_tx = 0;
+			for (let j = 0; j < n_hist; j++) {
+				let d = traffic_history[j].devs[target_if];
+				if (d) {
+					if (d.rx_bps > pk_rx) pk_rx = d.rx_bps;
+					if (d.tx_bps > pk_tx) pk_tx = d.tx_bps;
+				}
+			}
+			return {
+				interface: target_if,
+				requested_sec: sec,
+				covered_sec: int(dt_s),
+				rx_bytes: drx,
+				tx_bytes: dtx,
+				total_bytes: drx + dtx,
+				avg_rx_bps: int((drx * 8) / dt_s),
+				avg_tx_bps: int((dtx * 8) / dt_s),
+				peak_rx_bps: pk_rx,
+				peak_tx_bps: pk_tx,
+				source: 'active_session_ring'
+			};
+		}
+	}
+
+	return {
+		interface: target_if,
+		requested_sec: sec,
+		covered_sec: proc_up,
+		rx_bytes: cur_inf.rx_bytes,
+		tx_bytes: cur_inf.tx_bytes,
+		total_bytes: cur_inf.rx_bytes + cur_inf.tx_bytes,
+		avg_rx_bps: proc_up > 0 ? int((cur_inf.rx_bytes * 8) / proc_up) : 0,
+		avg_tx_bps: proc_up > 0 ? int((cur_inf.tx_bytes * 8) / proc_up) : 0,
+		peak_rx_bps: cur_inf.rx_bps,
+		peak_tx_bps: cur_inf.tx_bps,
+		source: 'kernel_total_since_boot'
+	};
+}
+
+function maybe_refresh_ubus_async() {
+	let now_m = now_mono_ms();
+	if (ubus_cache.inflight || (now_m - ubus_cache.ts_ms) < 4000) return;
+	ubus_cache.inflight = true;
+	call_helper('system_ubus_read', {}, 'system', '127.0.0.1', function(res) {
+		ubus_cache.inflight = false;
+		if (res && res.ok) {
+			ubus_cache.ts_ms = now_mono_ms();
+			ubus_cache.data = res;
+		}
+	});
+}
+
+function get_proc_default_route() {
+	let raw = fs.readfile('/proc/net/route') || '';
+	let best_if = '';
+	let best_metric = 999999;
+	for (let line in split(raw, '\n')) {
+		let p = split(trim(line), /\s+/);
+		if (length(p) >= 7 && p[1] == '00000000') {
+			let met = +p[6];
+			if (met < best_metric) {
+				best_metric = met;
+				best_if = p[0];
+			}
+		}
+	}
+	return { iface: best_if, metric: best_if != '' ? best_metric : null };
+}
+
+function collect_overview_sync() {
+	let mono = now_mono_ms();
+	maybe_refresh_ubus_async();
+	let uc = ubus_cache.data || {};
+	let sys_info = uc.sys_info || {};
+	let sys_board = uc.sys_board || {};
+	let wan_st = uc.wan_st || {};
+	let wwan_st = uc.wwan_st || {};
+	let lan_st = uc.lan_st || {};
+	let svcs_run = uc.services_running || {};
+
+	let cpu_info = fs.readfile('/proc/cpuinfo') || '';
+	let cpu_model = 'Intel(R) Celeron(R) J4125 CPU @ 2.00GHz';
+	let m_cpu = match(cpu_info, /model name\s*:\s*([^\n]+)/);
+	if (m_cpu) cpu_model = trim(m_cpu[1]);
+
+	let proc_up = +split(trim(read_trim('/proc/uptime', '0')), /\s+/)[0];
+	let load_p = split(trim(read_trim('/proc/loadavg', '0 0 0')), /\s+/);
+	let l1 = +(load_p[0] || 0), l5 = +(load_p[1] || 0), l15 = +(load_p[2] || 0);
+
+	let cpu = collect_cpu();
+	let mc = collect_memory_conntrack();
+	let temps = collect_thermals();
+	let stor = collect_storage();
+	let ifaces = collect_interfaces();
+
+	let lan_ip = (lan_st['ipv4-address'] && lan_st['ipv4-address'][0] && lan_st['ipv4-address'][0].address) || get_lan_ip();
+	let def_rt = get_proc_default_route();
+	let pppoe_up = !!wan_st.up || !!(ifaces['pppoe-wan'] && def_rt.iface == 'pppoe-wan');
+	let pppoe_ip = (wan_st['ipv4-address'] && wan_st['ipv4-address'][0] && wan_st['ipv4-address'][0].address) || '';
+	let wwan_up = !!wwan_st.up || (def_rt.iface == 'wlan0' && !!(ifaces['wlan0'] && ifaces['wlan0'].carrier));
+	let wwan_ip = (wwan_st['ipv4-address'] && wwan_st['ipv4-address'][0] && wwan_st['ipv4-address'][0].address) || uc.wlan0_ipv4 || '';
+	let active_wan = def_rt.iface != '' ? def_rt.iface : (wwan_up ? (wwan_st.l3_device || 'wlan0') : (pppoe_up ? (wan_st.l3_device || 'pppoe-wan') : 'none'));
+
+	let cur = uci.cursor();
+	let wan_auto = cur.get('network', 'wan', 'auto') == '1';
+	let sqm_iface = cur.get('sqm', 'eth1', 'interface') || '';
+	let sqm_enabled = cur.get('sqm', 'eth1', 'enabled') == '1';
+	let sqm_drift = sqm_enabled && active_wan != 'none' && sqm_iface != active_wan && (sqm_iface != 'pppoe-wan' || wan_auto);
+
+	let is_svc_up = function(name) {
+		return !!svcs_run[name];
+	};
+
+	let deps = {
+		adguard: is_svc_up('adguardhome') ? 'ready' : (length(keys(svcs_run)) == 0 ? 'starting' : 'unavailable'),
+		firewall: ifaces['br-lan'] ? 'ready' : 'degraded',
+		sqm: sqm_enabled ? (sqm_drift ? 'degraded' : 'ready') : 'unavailable',
+		docker: is_svc_up('dockerd') ? 'ready' : (length(keys(svcs_run)) == 0 ? 'starting' : 'unavailable'),
+		tailscale: is_svc_up('tailscale') ? 'ready' : (length(keys(svcs_run)) == 0 ? 'starting' : 'unavailable'),
+		ntp: is_svc_up('sysntpd') ? 'ready' : 'degraded',
+		helper: fs.stat(HELPER_SOCK) ? 'ready' : 'unavailable',
+		storage: stor.physical_block.degraded ? 'degraded' : 'ready'
+	};
+
+	let leases_raw = fs.readfile(LEASES_PATH) || '';
+	let leases_count = 0;
+	for (let l in split(leases_raw, '\n')) if (trim(l) != '') leases_count++;
+
+	return {
+		ok: true,
+		system: {
+			hostname: scrub_brand(sys_board.hostname || get_sys_hostname() || 'Gateway'),
+			model: scrub_brand((sys_board.release && sys_board.release.description) || 'System OS 25.12.6'),
+			kernel: sys_board.kernel || trim(read_trim('/proc/sys/kernel/osrelease', '6.12.112')),
+			arch: sys_board.system || 'x86_64',
+			cpu_model: cpu_model,
+			uptime: proc_up > 0 ? proc_up : (+sys_info.uptime || 0),
+			load: [l1, l5, l15],
+			ntp_synced: is_svc_up('sysntpd')
+		},
+		cpu: cpu,
+		temps: temps,
+		memory: mc.memory,
+		conntrack: mc.conntrack,
+		disks: stor.disks,
+		storage_summary: stor.physical_block,
+		interfaces: ifaces,
+		dependencies: deps,
+		wan: {
+			up: wwan_up || pppoe_up || def_rt.iface != '',
+			pppoe_up: pppoe_up,
+			pppoe_ipv4: pppoe_ip,
+			wwan_up: wwan_up,
+			wwan_ipv4: wwan_ip,
+			active_device: active_wan,
+			route_drift: wan_auto && wwan_up && !pppoe_up,
+			sqm_standby_drift: sqm_drift,
+			ipv4: (active_wan == 'wlan0' || wwan_up) ? (wwan_ip || pppoe_ip) : pppoe_ip
+		},
+		lan: {
+			up: !!lan_st.up || !!(ifaces['br-lan'] && ifaces['br-lan'].carrier),
+			device: lan_st.l3_device || 'br-lan',
+			ipv4: lan_ip,
+			mask: 24
+		},
+		summary: {
+			leases_count: leases_count,
+			sqm_enabled: sqm_enabled
+		}
+	};
+}
+
+// --- Session & Security Enforcement (P14) ---
+function parse_cookies(hdr_val) {
+	let res = {};
+	if (!hdr_val) return res;
+	for (let part in split(hdr_val, ';')) {
+		let eq = index(part, '=');
+		if (eq > 0) res[trim(substr(part, 0, eq))] = trim(substr(part, eq + 1));
+	}
+	return res;
+}
+
+function get_session(headers) {
+	let ck = parse_cookies(headers['cookie'] || '');
+	let sid = ck['noc_session'] || '';
+	if (sid == '' || !sessions[sid]) return null;
+	let sess = sessions[sid];
+	let now_t = time();
+	if ((now_t - sess.last_seen) > SESSION_IDLE_S || (now_t - sess.created_at) > SESSION_ABS_S) {
+		delete sessions[sid];
+		return null;
+	}
+	sess.last_seen = now_t;
+	return sess;
+}
+
+function is_origin_allowed(headers, require_present) {
+	let orig = headers['origin'] || '';
+	if (orig == '') return !require_present;
+	let lan = get_lan_ip();
+	let hn = get_sys_hostname();
+	let allowed = {};
+	allowed[sprintf('http://%s:%d', lan, BIND_PORT)] = true;
+	allowed[sprintf('https://%s:%d', lan, BIND_PORT)] = true;
+	allowed[sprintf('http://%s:%d', hn, BIND_PORT)] = true;
+	allowed[sprintf('https://%s:%d', hn, BIND_PORT)] = true;
+	allowed[sprintf('http://%s.lan:%d', hn, BIND_PORT)] = true;
+	allowed[sprintf('https://%s.lan:%d', hn, BIND_PORT)] = true;
+	if (STAGING_MODE) {
+		allowed[sprintf('http://127.0.0.1:%d', BIND_PORT)] = true;
+		allowed[sprintf('http://localhost:%d', BIND_PORT)] = true;
+	}
+	return !!allowed[orig];
+}
+
+// --- Static File Server with Traversal Lock ---
+const MIME_TYPES = {
+	'.html': 'text/html; charset=utf-8',
+	'.css': 'text/css; charset=utf-8',
+	'.js': 'application/javascript; charset=utf-8',
+	'.json': 'application/json; charset=utf-8',
+	'.svg': 'image/svg+xml',
+	'.png': 'image/png',
+	'.apk': 'application/vnd.android.package-archive'
+};
+
+function sanitize_hdr_val(v) {
+	return replace('' + v, /[\r\n]/g, '');
+}
+
+function send_http(cli, status_code, status_txt, ctype, body, extra_hdrs) {
+	let h = sprintf(
+		"HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\nPermissions-Policy: geolocation=(), microphone=(), camera=()\r\n%sContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data:; connect-src 'self'\r\n",
+		status_code, status_txt, ctype, length(body), TLS_ACTIVE ? "Cross-Origin-Opener-Policy: same-origin\r\n" : ""
+	);
+	if (extra_hdrs) {
+		for (let k in keys(extra_hdrs)) {
+			h += sanitize_hdr_val(k) + ': ' + sanitize_hdr_val(extra_hdrs[k]) + '\r\n';
+		}
+	}
+	h += "\r\n";
+	try {
+		let full = h + body;
+		let off = 0;
+		let total = length(full);
+		let retries = 0;
+		while (off < total) {
+			let sent = cli.send(substr(full, off, 16384));
+			if (sent && sent > 0) {
+				off += sent;
+				retries = 0;
+			} else {
+				retries++;
+				if (retries > 50) break;
+				sock.poll(40, [cli, sock.POLLOUT]);
+			}
+		}
+	} catch (e) {}
+	try { cli.close(); } catch (e) {}
+}
+
+function send_json_env(cli, code, resource, data, errors, extra_hdrs) {
+	let hdrs = extra_hdrs || {};
+	hdrs['Cache-Control'] = 'no-store, no-cache, must-revalidate';
+	send_http(cli, code, code == 200 ? 'OK' : (code == 401 ? 'Unauthorized' : (code == 403 ? 'Forbidden' : (code == 429 ? 'Too Many Requests' : 'Error'))), 'application/json; charset=utf-8', sprintf('%J\n', envelope(resource, data, errors)), hdrs);
+}
+
+function serve_static(cli, url_path, req_headers) {
+	let clean = split(url_path, '?')[0];
+	if (clean == '/favicon.ico') {
+		send_http(cli, 204, 'No Content', 'image/x-icon', '');
+		return;
+	}
+	if (clean == '/' || clean == '/index.html') clean = '/pro/index.html';
+	if (index(clean, '..') >= 0 || index(clean, '\\') >= 0 || index(clean, '\0') >= 0) {
+		send_http(cli, 403, 'Forbidden', 'text/plain', 'Forbidden');
+		return;
+	}
+	let real_root = fs.realpath(WEB_ROOT);
+	let real_file = fs.realpath(WEB_ROOT + clean);
+	if (!real_file && index(clean, '/pro/') != 0) {
+		real_file = fs.realpath(WEB_ROOT + '/pro' + clean);
+	}
+	if (!real_root || !real_file || index(real_file, real_root) != 0) {
+		send_http(cli, 404, 'Not Found', 'text/plain', 'Not Found');
+		return;
+	}
+	let st = fs.stat(real_file);
+	let content = fs.readfile(real_file);
+	if (content == null) {
+		send_http(cli, 404, 'Not Found', 'text/plain', 'Not Found');
+		return;
+	}
+	let ext = '';
+	let m = match(real_file, /(\.[a-zA-Z0-9]+)$/);
+	if (m) ext = lc(m[1]);
+	let etag = sprintf('"%x-%x"', (st && st.mtime) ? st.mtime : 0, length(content));
+	let inm = req_headers ? (req_headers['if-none-match'] || '') : '';
+	let cc = (ext == '.html' || ext == '.json') ? 'no-cache' : 'public, max-age=3600';
+	if (inm != '' && inm == etag) {
+		send_http(cli, 304, 'Not Modified', MIME_TYPES[ext] || 'application/octet-stream', '', { 'ETag': etag, 'Cache-Control': cc });
+		return;
+	}
+	send_http(cli, 200, 'OK', MIME_TYPES[ext] || 'application/octet-stream', content, { 'ETag': etag, 'Cache-Control': cc });
+}
+
+function parse_qs(qs) {
+	let res = {};
+	if (!qs) return res;
+	for (let part in split(qs, '&')) {
+		let eq = index(part, '=');
+		if (eq > 0) {
+			res[substr(part, 0, eq)] = replace(replace(substr(part, eq + 1), '+', ' '), /%([0-9A-Fa-f]{2})/g, function(m, h) { return chr(int(h, 16)); });
+		}
+	}
+	return res;
+}
+
+// --- Shared Cached Helper Query Coalescing (P18) ---
+function cached_helper_call(cache_key, ttl_ms, resource, verb, params, actor, cip, transform_fn, cli) {
+	let now_m = now_mono_ms();
+	let c = cache_map[cache_key];
+	if (c && (now_m - c.ts) < ttl_ms) {
+		send_json_env(cli, 200, resource, c.data, c.errors || []);
+		return;
+	}
+	if (inflight_helper[cache_key]) {
+		push(inflight_helper[cache_key], cli);
+		return;
+	}
+	inflight_helper[cache_key] = [cli];
+	call_helper(verb, params, actor, cip, function(res) {
+		let waiters = inflight_helper[cache_key] || [];
+		delete inflight_helper[cache_key];
+		let errs = [];
+		let out_data = res;
+		if (transform_fn) out_data = transform_fn(res, errs);
+		if (res.ok) cache_map[cache_key] = { ts: now_mono_ms(), data: out_data, errors: errs };
+		for (let w in waiters) {
+			send_json_env(w, res.ok ? 200 : 503, resource, out_data, errs);
+		}
+	});
+}
+
+// --- Format AdGuard / Clients Helper Output into Schema Contracts ---
+function shape_adguard_data(hres, role) {
+	if (!hres || !hres.ok) return { ok: false, error: hres ? hres.message_ar : 'غير متاح' };
+	let qlogs = hres.querylog || [];
+	let client_stats_map = {};
+	let filter_names = {};
+	if (hres.filtering && hres.filtering.filters) {
+		for (let f in hres.filtering.filters) filter_names['' + f.id] = f.name;
+	}
+	// Map IP -> hostname from leases/neighbors
+	let ip_to_name = { '192.168.1.1': 'بوابة الشبكة الرئيسية' };
+	let ip_to_mac = {};
+	for (let line in split(hres.leases_raw || '', '\n')) {
+		let p = split(trim(line), /\s+/);
+		if (length(p) >= 4) {
+			ip_to_mac[p[2]] = lc(p[1]);
+			if (p[3] != '*') ip_to_name[p[2]] = p[3];
+		}
+	}
+	let online_ips = {};
+	for (let line in split(hres.neigh_raw || '', '\n')) {
+		let m = match(trim(line), /^([0-9.]+)\s+lladdr\s+([0-9a-fA-F:]+)\s+(\S+)/);
+		if (m) {
+			ip_to_mac[m[1]] = lc(m[2]);
+			if (m[3] == 'REACHABLE' || m[3] == 'DELAY' || m[3] == 'STALE') online_ips[m[1]] = true;
+		}
+	}
+
+	let total_q = 0, allowed_q = 0, blocked_q = 0, sum_ms = 0;
+	let recent = [];
+	if (hres.query_summary) {
+		let qs = hres.query_summary;
+		total_q = +qs.total_q || 0;
+		allowed_q = +qs.allowed_q || 0;
+		blocked_q = +qs.blocked_q || 0;
+		sum_ms = +qs.sum_ms || 0;
+		let pip = qs.per_ip || {};
+		for (let cip in keys(pip)) {
+			let d = pip[cip];
+			client_stats_map[cip] = {
+				ip: cip, name: ip_to_name[cip] || ('جهاز ' + cip), mac: ip_to_mac[cip] || '',
+				online: !!online_ips[cip], total: +d.total || 0, allowed: +d.allowed || 0,
+				blocked: +d.blocked || 0, elapsed_sum: +d.elapsed_sum || 0,
+				last_domain: d.last_domain || '', last_blocked: !!d.last_blocked, last_time: d.last_time || ''
+			};
+		}
+		if (role == 'admin') {
+			for (let q in (qs.recent || [])) {
+				let cip = q.IP || '';
+				let cname = (client_stats_map[cip] && client_stats_map[cip].name) || ip_to_name[cip] || ('جهاز ' + cip);
+				let rule_t = q.rule || '';
+				push(recent, {
+					time: q.time || '', domain: q.QH || '', type: q.QT || 'A', client: cip, client_name: cname,
+					blocked: !!q.blocked, rule: rule_t, elapsed_ms: +q.elapsed_ms || 0,
+					reason_text: q.blocked ? (rule_t != '' ? ('مرفوض: ' + rule_t) : 'مرفوض: محجوب بقائمة التصفية') : (q.cached ? 'مسموح: من الذاكرة المؤقتة' : 'مسموح: نطاق سليم')
+				});
+			}
+		}
+	} else {
+		for (let i = 0; i < length(qlogs); i++) {
+			let q = qlogs[i];
+			let cip = q.IP || '';
+			if (cip == '' || cip == '127.0.0.1') continue;
+			total_q++;
+			let blocked = !!(q.Result && q.Result.IsFiltered);
+			let el_ms = int((+q.Elapsed || 0) / 100000) / 10.0;
+			sum_ms += el_ms;
+			if (blocked) blocked_q++; else allowed_q++;
+
+			if (!client_stats_map[cip]) {
+				client_stats_map[cip] = {
+					ip: cip, name: ip_to_name[cip] || ('جهاز ' + cip), mac: ip_to_mac[cip] || '',
+					online: !!online_ips[cip], total: 0, allowed: 0, blocked: 0, elapsed_sum: 0,
+					last_domain: '', last_blocked: false, last_time: ''
+				};
+			}
+			let c = client_stats_map[cip];
+			c.total++;
+			c.elapsed_sum += el_ms;
+			if (blocked) c.blocked++; else c.allowed++;
+			let hhmmss = '';
+			let mt = match(q.T || '', /T([0-9]{2}:[0-9]{2}:[0-9]{2})/);
+			if (mt) hhmmss = mt[1];
+			if (c.last_domain == '') {
+				c.last_domain = q.QH; c.last_blocked = blocked; c.last_time = hhmmss;
+			}
+			if (role == 'admin' && length(recent) < 120) {
+				let rule_t = (q.Result && q.Result.Rules && q.Result.Rules[0]) ? (q.Result.Rules[0].Text || '') : '';
+				push(recent, {
+					time: hhmmss, domain: q.QH, type: q.QT || 'A', client: cip, client_name: c.name,
+					blocked: blocked, rule: rule_t, elapsed_ms: el_ms,
+					reason_text: blocked ? (rule_t != '' ? ('مرفوض: ' + rule_t) : 'مرفوض: محجوب بقائمة التصفية') : (q.Cached ? 'مسموح: من الذاكرة المؤقتة' : 'مسموح: نطاق سليم')
+				});
+			}
+		}
+	}
+
+	let cstats = [];
+	let client_keys = keys(client_stats_map);
+	let hide_pseudos = (role == 'readonly' && length(client_keys) < 3); // P4 minimum-group k>=3 rule
+	for (let cip in client_keys) {
+		let c = client_stats_map[cip];
+		let avg_c = c.total >= 5 ? (int((c.elapsed_sum * 10) / c.total) / 10.0) : null;
+		if (role == 'readonly') {
+			if (hide_pseudos) continue;
+			push(cstats, {
+				ip: 'PSEUDO-' + substr(digest.sha256(BOOT_ID + cip), 0, 8),
+				name: 'جهاز مصنّف',
+				mac: '', online: c.online, total: c.total, allowed: c.allowed, blocked: c.blocked,
+				avg_ms: avg_c, block_pct: c.total > 0 ? (int((c.blocked * 1000) / c.total) / 10.0) : 0,
+				last_domain: '', last_blocked: c.last_blocked, last_time: c.last_time
+			});
+		} else {
+			push(cstats, {
+				ip: c.ip, name: c.name, mac: c.mac, online: c.online, total: c.total,
+				allowed: c.allowed, blocked: c.blocked, avg_ms: avg_c,
+				block_pct: c.total > 0 ? (int((c.blocked * 1000) / c.total) / 10.0) : 0,
+				last_domain: c.last_domain, last_blocked: c.last_blocked, last_time: c.last_time
+			});
+		}
+	}
+	sort(cstats, function(a, b) { return b.total - a.total; });
+
+	return {
+		ok: true,
+		api_connected: hres.api_connected,
+		api_error: hres.api_error,
+		protection_enabled: hres.status ? !!hres.status.protection_enabled : true,
+		parental_enabled: !!hres.parental_enabled,
+		safebrowsing_enabled: !!hres.safebrowsing_enabled,
+		safesearch_enabled: !!hres.safesearch_enabled,
+		enable_dnssec: !!(hres.dns_info && hres.dns_info.enable_dnssec),
+		cache_enabled: (hres.dns_info && hres.dns_info.cache_enabled !== false),
+		aaaa_disabled: !!(hres.dns_info && hres.dns_info.aaaa_disabled),
+		blocked_services: hres.blocked_services || [],
+		available_services: hres.available_services || [],
+		rewrites: role == 'admin' ? (hres.rewrites || []) : [],
+		dns_info: hres.dns_info || {},
+		dnat_redirect_configured: !!hres.dnat_redirect_configured,
+		doh_dot_bypass_status: hres.doh_dot_bypass_status || 'unknown',
+		user_rules: (hres.filtering && hres.filtering.user_rules) ? hres.filtering.user_rules : [],
+		filters: (hres.filtering && hres.filtering.filters) ? hres.filtering.filters : [],
+		client_stats: cstats,
+		stats: {
+			sampled_queries: total_q,
+			allowed_queries: allowed_q,
+			blocked_queries: blocked_q,
+			allowed_pct: total_q > 0 ? (int((allowed_q * 1000) / total_q) / 10.0) : 0,
+			blocked_pct: total_q > 0 ? (int((blocked_q * 1000) / total_q) / 10.0) : 0,
+			avg_ms: total_q >= 5 ? (int((sum_ms * 10) / total_q) / 10.0) : null
+		},
+		recent_queries: recent
+	};
+}
+
+// --- API Request Dispatcher ---
+function handle_api_request(cli, method, url_path, headers, body_str, remote_ip) {
+	let qidx = index(url_path, '?');
+	let qs = qidx >= 0 ? substr(url_path, qidx + 1) : '';
+	let query = parse_qs(qs);
+	let body = {};
+	if (method == 'POST' && length(trim(body_str)) > 0) {
+		try { body = json(body_str); } catch (e) {
+			send_json_env(cli, 400, 'auth', {}, [{ code: 'VALIDATION', section: 'request', message_ar: 'صيغة JSON في جسم الطلب غير صالحة', request_id: urandom_hex(6) }]);
+			return;
+		}
+		if (type(body) != 'object') {
+			send_json_env(cli, 400, 'auth', {}, [{ code: 'VALIDATION', section: 'request', message_ar: 'يجب أن يكون جسم الطلب كائن JSON', request_id: urandom_hex(6) }]);
+			return;
+		}
+	}
+
+	let action = (body.action || query.action || 'overview');
+	let req_id = urandom_hex(6);
+
+	// 1. Pre-auth routes ONLY (P14)
+	if (action == 'auth_status') {
+		let cur_s = get_session(headers);
+		call_helper('auth_status', {}, 'preauth', remote_ip, function(res) {
+			res.authenticated = !!cur_s;
+			if (cur_s) {
+				res.username = cur_s.username;
+				res.role = cur_s.role;
+				res.csrf_token = cur_s.csrf;
+			}
+			send_json_env(cli, 200, 'auth', res, []);
+		});
+		return;
+	}
+
+	if (action == 'auth_bootstrap' && method == 'POST') {
+		if (!is_origin_allowed(headers, true)) {
+			send_json_env(cli, 403, 'auth', {}, [{ code: 'FORBIDDEN', section: 'auth', message_ar: 'رفض المصدر Origin غير الموثوق أو مفقود', request_id: req_id }]);
+			return;
+		}
+		call_helper('auth_bootstrap_complete', { token: body.token, password: body.password }, 'bootstrap', remote_ip, function(res) {
+			if (!res.ok) {
+				send_json_env(cli, res.status || 400, 'auth', {}, [{ code: res.error_code || 'AUTH', section: 'auth', message_ar: res.message_ar, request_id: req_id }]);
+				return;
+			}
+			let sid = urandom_hex(24);
+			let csrf = urandom_hex(16);
+			let now_t = time();
+			sessions[sid] = { id: sid, username: 'admin', role: 'admin', csrf: csrf, created_at: now_t, last_seen: now_t, ip: remote_ip };
+			let ck = sprintf('noc_session=%s; HttpOnly; SameSite=Strict; Path=/%s', sid, TLS_ACTIVE ? '; Secure' : '');
+			send_json_env(cli, 200, 'auth', { authenticated: true, role: 'admin', csrf_token: csrf, message_ar: res.message_ar }, [], { 'Set-Cookie': ck });
+		});
+		return;
+	}
+
+	if (action == 'auth_login' && method == 'POST') {
+		if (!is_origin_allowed(headers, true)) {
+			send_json_env(cli, 403, 'auth', {}, [{ code: 'FORBIDDEN', section: 'auth', message_ar: 'رفض المصدر Origin غير الموثوق أو مفقود', request_id: req_id }]);
+			return;
+		}
+		// Invalidate prior session on login to prevent session fixation
+		let old_sess = get_session(headers);
+		if (old_sess) delete sessions[old_sess.id];
+
+		call_helper('auth_login', { username: body.username || 'admin', password: body.password || '', totp_code: body.totp_code || '' }, 'login', remote_ip, function(res) {
+			if (!res.ok) {
+				let hdrs = res.retry_after ? { 'Retry-After': '' + res.retry_after } : {};
+				let err_data = res.totp_required ? { totp_required: true } : {};
+				send_json_env(cli, res.status || 401, 'auth', err_data, [{ code: res.error_code || 'AUTH', section: 'auth', message_ar: res.message_ar, request_id: req_id }], hdrs);
+				return;
+			}
+			let sid = urandom_hex(24);
+			let csrf = urandom_hex(16);
+			let now_t = time();
+			sessions[sid] = { id: sid, username: res.username, role: res.role, csrf: csrf, created_at: now_t, last_seen: now_t, ip: remote_ip };
+			let ck = sprintf('noc_session=%s; HttpOnly; SameSite=Strict; Path=/%s', sid, TLS_ACTIVE ? '; Secure' : '');
+			send_json_env(cli, 200, 'auth', { authenticated: true, username: res.username, role: res.role, csrf_token: csrf }, [], { 'Set-Cookie': ck });
+		});
+		return;
+	}
+
+	if (action == 'auth_logout' && method == 'POST') {
+		if (!is_origin_allowed(headers, true)) {
+			send_json_env(cli, 403, 'auth', {}, [{ code: 'FORBIDDEN', section: 'auth', message_ar: 'رفض المصدر غير الموثوق', request_id: req_id }]);
+			return;
+		}
+		let sess = get_session(headers);
+		if (sess) delete sessions[sess.id];
+		send_json_env(cli, 200, 'auth', { authenticated: false }, [], { 'Set-Cookie': 'noc_session=; HttpOnly; SameSite=Strict; Max-Age=0; Path=/' });
+		return;
+	}
+
+	// 2. Enforce authentication on ALL remaining routes (P14)
+	let sess = get_session(headers);
+	if (!sess) {
+		send_json_env(cli, 401, 'auth', { authenticated: false }, [{ code: 'AUTH', section: 'auth', message_ar: 'انتهت الجلسة أو يلزم تسجيل الدخول أولاً', request_id: req_id }]);
+		return;
+	}
+
+	if (action == 'auth_session') {
+		send_json_env(cli, 200, 'auth', { authenticated: true, username: sess.username, role: sess.role, csrf_token: sess.csrf }, []);
+		return;
+	}
+
+	// Origin & CSRF checks for mutations AND admin-sensitive endpoints
+	if (method == 'POST' || action == 'diagnostics' || action == 'logs' || action == 'audit' || action == 'stream') {
+		if (!is_origin_allowed(headers, method == 'POST')) {
+			send_json_env(cli, 403, 'auth', {}, [{ code: 'FORBIDDEN', section: 'security', message_ar: 'رفض الطلب لاختلاف Origin أو غيابه', request_id: req_id }]);
+			return;
+		}
+	}
+	if (method == 'POST') {
+		let csrf_hdr = headers['x-csrf-token'] || '';
+		if (csrf_hdr == '' || csrf_hdr != sess.csrf) {
+			send_json_env(cli, 403, 'auth', {}, [{ code: 'FORBIDDEN', section: 'security', message_ar: 'رمز الحماية CSRF مفقود أو غير صالح', request_id: req_id }]);
+			return;
+		}
+		if (sess.role != 'admin') {
+			send_json_env(cli, 403, 'auth', {}, [{ code: 'FORBIDDEN', section: 'security', message_ar: 'هذه العملية متاحة لصلاحية المدير فقط', request_id: req_id }]);
+			return;
+		}
+		if (action == 'auth_set_readonly') {
+			call_helper('auth_set_readonly', { username: body.username || 'viewer', password: body.password || '' }, sess.username, remote_ip, function(res) {
+				send_json_env(cli, res.ok ? 200 : (res.status || 400), 'auth', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'auth', message_ar: res.message_ar, request_id: req_id }]);
+			});
+			return;
+		}
+	}
+
+	if (action == 'stream' && method == 'GET') {
+		let cur_u_cnt = sse_streams[sess.username] || 0;
+		if (cur_u_cnt >= MAX_SSE_PER_USER || sse_global >= MAX_SSE_GLOBAL) {
+			send_json_env(cli, 429, 'overview', {}, [{ code: 'TIMEOUT', section: 'stream', message_ar: 'تم تجاوز الحد الأقصى لاتصالات البث الحي المتزامنة لهذا المستخدم', request_id: req_id }], { 'Retry-After': '5' });
+			return;
+		}
+		sse_streams[sess.username] = cur_u_cnt + 1;
+		sse_global++;
+		let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache, no-transform\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'\r\n\r\n";
+		try {
+			cli.send(hdr);
+		} catch (e) {
+			sse_streams[sess.username]--;
+			sse_global--;
+			try { cli.close(); } catch (e2) {}
+			return;
+		}
+		let sse_closed = false;
+		let sse_push_t = null;
+		let sse_max_t = null;
+		let sse_rh = null;
+		let close_sse = null;
+		let push_frame = null;
+		close_sse = function() {
+			if (sse_closed) return;
+			sse_closed = true;
+			sse_streams[sess.username] = (sse_streams[sess.username] || 1) - 1;
+			if (sse_streams[sess.username] <= 0) delete sse_streams[sess.username];
+			sse_global--;
+			if (sse_push_t) try { sse_push_t.cancel(); } catch (e) {}
+			if (sse_max_t) try { sse_max_t.cancel(); } catch (e) {}
+			if (sse_rh) try { sse_rh.delete(); } catch (e) {}
+			try { cli.close(); } catch (e) {}
+		};
+		push_frame = function() {
+			if (sse_closed) return;
+			let c = cache_map['overview'];
+			let now_m = now_mono_ms();
+			let data = (c && (now_m - c.ts) < 450) ? c.data : collect_overview_sync();
+			if (!c || (now_m - c.ts) >= 450) cache_map['overview'] = { ts: now_m, data: data };
+			let payload = sprintf("event: overview\nid: %d\ndata: %J\n\n", seq_map['overview'] || 0, envelope('overview', data, []));
+			try {
+				let w = cli.send(payload);
+				if (!w || w <= 0) { close_sse(); return; }
+			} catch (e) {
+				close_sse();
+				return;
+			}
+			sse_push_t = uloop.timer(1000, push_frame);
+		};
+		sse_max_t = uloop.timer(MAX_SSE_DURATION_MS, function() {
+			try { cli.send("event: expire\ndata: {\"reason\":\"max_duration\"}\n\n"); } catch (e) {}
+			close_sse();
+		});
+		sse_rh = uloop.handle(cli, function(ev) {
+			let d = null;
+			try { d = cli.recv(64); } catch (e) {}
+			if (!d || length(d) == 0) close_sse();
+		}, uloop.ULOOP_READ);
+		push_frame();
+		return;
+	}
+
+	if (action == 'logs' || action == 'audit') {
+		if (sess.role != 'admin') {
+			send_json_env(cli, 403, 'diagnostics', {}, [{ code: 'FORBIDDEN', section: 'logs', message_ar: 'عرض السجلات متاح لصلاحية المدير فقط', request_id: req_id }]);
+			return;
+		}
+		let since_seq = +(query.since_seq || 0);
+		let now_m = now_mono_ms();
+		if (log_cache && (now_m - last_log_fetch_ms) < 4000) {
+			let delta = [];
+			for (let e in log_ring) if (e.seq > since_seq) push(delta, e);
+			send_json_env(cli, 200, 'diagnostics', {
+				ok: true,
+				since_seq: since_seq,
+				next_seq: log_ring_seq,
+				entries: delta,
+				syslog: log_cache.syslog,
+				dmesg: log_cache.dmesg,
+				audit_tail: log_cache.audit_tail,
+				audit_entries: log_cache.audit_entries
+			}, []);
+			return;
+		}
+		call_helper('log_read', {}, sess.username, remote_ip, function(res) {
+			last_log_fetch_ms = now_mono_ms();
+			if (res && res.ok) {
+				log_cache = res;
+				for (let line in split(trim(res.syslog || ''), '\n')) {
+					if (trim(line) == '') continue;
+					let dup = false;
+					for (let k = length(log_ring) - 1; k >= 0 && k >= length(log_ring) - 20; k--) {
+						if (log_ring[k].line == line) { dup = true; break; }
+					}
+					if (!dup) {
+						log_ring_seq++;
+						push(log_ring, { seq: log_ring_seq, line: line });
+						if (length(log_ring) > 300) log_ring = slice(log_ring, 1);
+					}
+				}
+			}
+			let delta = [];
+			for (let e in log_ring) if (e.seq > since_seq) push(delta, e);
+			send_json_env(cli, (res && res.ok) ? 200 : 503, 'diagnostics', {
+				ok: !!(res && res.ok),
+				since_seq: since_seq,
+				next_seq: log_ring_seq,
+				entries: delta,
+				syslog: res ? res.syslog : '',
+				dmesg: res ? res.dmesg : '',
+				audit_tail: res ? res.audit_tail : '',
+				audit_entries: (res && res.audit_entries) ? res.audit_entries : []
+			}, (res && res.ok) ? [] : [{ code: 'DEPENDENCY', section: 'logs', message_ar: 'تعذر قراءة السجلات', request_id: req_id }]);
+		});
+		return;
+	}
+
+	// 3. Telemetry Endpoints (Single-flight coalesced cache in noc-apid memory)
+	if (action == 'overview') {
+		api_req_count++;
+		let c = cache_map['overview'];
+		let now_m = now_mono_ms();
+		if (c && (now_m - c.ts) < 450) {
+			c.data.platform_health = get_platform_health();
+			send_json_env(cli, 200, 'overview', c.data, []);
+			return;
+		}
+		let data = collect_overview_sync();
+		data.platform_health = get_platform_health();
+		cache_map['overview'] = { ts: now_m, data: data };
+		send_json_env(cli, 200, 'overview', data, []);
+		return;
+	}
+
+	if (action == 'alerts') {
+		call_helper('alerts_get', {}, sess.username, remote_ip, function(res) {
+			send_json_env(cli, res.ok ? 200 : 400, 'services', res, res.ok ? [] : [{ code: res.error_code || 'INTERNAL', section: 'services', message_ar: res.message_ar, request_id: req_id }]);
+		});
+		return;
+	}
+
+	if (action == 'weekly_report') {
+		cached_helper_call('weekly_report', 15000, 'overview', 'weekly_report_get', {}, sess.username, remote_ip, function(res, errs) {
+			return res;
+		}, cli);
+		return;
+	}
+
+	if (action == 'security_audit') {
+		call_helper('security_audit', {}, sess.username, remote_ip, function(res) {
+			send_json_env(cli, res.ok ? 200 : 400, 'services', res, res.ok ? [] : [{ code: res.error_code || 'INTERNAL', section: 'services', message_ar: res.message_ar, request_id: req_id }]);
+		});
+		return;
+	}
+
+	if (action == 'totp_status') {
+		call_helper('auth_totp_status', {}, sess.username, remote_ip, function(res) {
+			send_json_env(cli, res.ok ? 200 : 400, 'auth', res, []);
+		});
+		return;
+	}
+
+	if (action == 'device_quotas') {
+		call_helper('device_quotas_get', {}, sess.username, remote_ip, function(res) {
+			send_json_env(cli, res.ok ? 200 : 400, 'clients', res, []);
+		});
+		return;
+	}
+
+	if (action == 'traffic_window') {
+		let c = cache_map['overview'];
+		let now_m = now_mono_ms();
+		let ov = (c && (now_m - c.ts) < 450) ? c.data : collect_overview_sync();
+		if (!c || (now_m - c.ts) >= 450) cache_map['overview'] = { ts: now_m, data: ov };
+		let req_if = trim(query.iface || body.iface || (ov.wan && ov.wan.active_device) || 'wlan0');
+		let req_sec = +(query.seconds != null ? query.seconds : (body.seconds != null ? body.seconds : 300));
+		if (req_sec < 0) req_sec = 0;
+		if (req_sec > 31622400) req_sec = 31622400;
+		let win = compute_traffic_window(req_if, int(req_sec), ov.interfaces || {});
+		send_json_env(cli, 200, 'overview', { ok: true, window: win }, []);
+		return;
+	}
+
+	if (action == 'adguard') {
+		cached_helper_call('adguard_' + sess.role, 2500, 'adguard', 'adguard_read', {}, sess.username, remote_ip, function(res, errs) {
+			if (!res.ok) push(errs, { code: 'DEPENDENCY', section: 'adguard', message_ar: res.message_ar || 'فشل قراءة بيانات AdGuard', request_id: req_id });
+			return shape_adguard_data(res, sess.role);
+		}, cli);
+		return;
+	}
+
+	if (action == 'clients') {
+		cached_helper_call('clients', 4500, 'clients', 'clients_read', {}, sess.username, remote_ip, function(res, errs) {
+			if (!res.ok) return { ok: false, clients: [] };
+			let by_mac = {};
+			let mac_to_ips = {};
+			for (let line in split(res.leases_raw || '', '\n')) {
+				let p = split(trim(line), /\s+/);
+				if (length(p) < 4) continue;
+				let mac = lc(p[1]), ip = p[2], hn = p[3] != '*' ? p[3] : '';
+				if (!by_mac[mac]) {
+					if (length(keys(by_mac)) >= 256) continue; // enforce 256 MAC cap
+					by_mac[mac] = { mac: mac, ip: ip, ips: [], hostname: hn, online: false, arp_state: 'LEASED', blocked: false, overflow_ips: false };
+				}
+				if (index(by_mac[mac].ips, ip) < 0) {
+					if (length(by_mac[mac].ips) < 8) push(by_mac[mac].ips, ip);
+					else by_mac[mac].overflow_ips = true;
+				}
+			}
+			for (let line in split(res.neigh4 || '', '\n')) {
+				let m = match(trim(line), /^([0-9.]+)\s+lladdr\s+([0-9a-fA-F:]+)\s+(\S+)/);
+				if (!m) continue;
+				let ip = m[1], mac = lc(m[2]), st = m[3];
+				if (!by_mac[mac]) {
+					if (length(keys(by_mac)) >= 256) continue;
+					by_mac[mac] = { mac: mac, ip: ip, ips: [], hostname: '', online: false, arp_state: st, blocked: false, overflow_ips: false };
+				}
+				if (index(by_mac[mac].ips, ip) < 0) {
+					if (length(by_mac[mac].ips) < 8) push(by_mac[mac].ips, ip);
+					else by_mac[mac].overflow_ips = true;
+				}
+				by_mac[mac].arp_state = st;
+				if (st == 'REACHABLE' || st == 'DELAY' || st == 'STALE') by_mac[mac].online = true;
+			}
+			let list = [];
+			let rules = res.rules || { blocked_macs: {}, blocked_ips: {}, nicknames: {}, rate_limits: {} };
+			let st_leases = res.static_leases || {};
+			for (let mac in keys(by_mac)) {
+				let c = by_mac[mac];
+				c.blocked = !!rules.blocked_macs[mac];
+				c.nickname = rules.nicknames[mac] || '';
+				c.static_lease = !!st_leases[mac];
+				c.rate_limit_kbps = (rules.rate_limits && rules.rate_limits[c.ip]) ? +rules.rate_limits[c.ip] : 0;
+				c.display_name = c.nickname || c.hostname || ('جهاز ' + (c.ip || mac));
+				let nb = (res.nlbw_by_mac && res.nlbw_by_mac[mac]) || (res.nlbw_by_ip && res.nlbw_by_ip[c.ip]) || { rx_bytes: 0, tx_bytes: 0, conns: 0 };
+				c.total_rx_bytes = +nb.rx_bytes || 0;
+				c.total_tx_bytes = +nb.tx_bytes || 0;
+				c.total_conns = +nb.conns || 0;
+				if (sess.role == 'readonly') {
+					c.mac = 'HIDDEN'; c.ip = 'PSEUDO-' + substr(digest.sha256(BOOT_ID + mac), 0, 8); c.ips = []; c.hostname = ''; c.nickname = ''; c.static_lease = false; c.rate_limit_kbps = 0; c.display_name = 'جهاز محلي';
+				}
+				push(list, c);
+			}
+			return {
+				ok: true,
+				br_netfilter: !!res.br_netfilter,
+				flow_offloading: !!res.flow_offloading,
+				counters_supported: !res.flow_offloading,
+				clients: list,
+				static_leases_list: sess.role == 'admin' ? (res.static_leases_list || []) : [],
+				local_domains: sess.role == 'admin' ? (res.local_domains || []) : []
+			};
+		}, cli);
+		return;
+	}
+
+	if (action == 'sqm') {
+		cached_helper_call('sqm', 9000, 'sqm', 'sqm_read', {}, sess.username, remote_ip, null, cli);
+		return;
+	}
+	if (action == 'firewall') {
+		cached_helper_call('firewall', 9000, 'firewall', 'firewall_read', {}, sess.username, remote_ip, null, cli);
+		return;
+	}
+	if (action == 'docker') {
+		cached_helper_call('docker', 14000, 'docker', 'docker_read', {}, sess.username, remote_ip, null, cli);
+		return;
+	}
+	if (action == 'tailscale') {
+		cached_helper_call('tailscale', 28000, 'tailscale', 'tailscale_read', {}, sess.username, remote_ip, null, cli);
+		return;
+	}
+	if (action == 'network') {
+		cached_helper_call('network_cfg', 4500, 'network', 'network_read', {}, sess.username, remote_ip, function(res) {
+			let ov = collect_overview_sync();
+			return {
+				ok: true,
+				wan: ov.wan,
+				lan: ov.lan,
+				interfaces: ov.interfaces,
+				dhcp_pool: (res && res.dhcp_pool) || {},
+				wan_settings: (res && res.wan_settings) || {},
+				static_routes: (res && res.static_routes) || [],
+				wireless_settings: (res && res.wireless_settings) || {},
+				wifi_scan: (res && res.wifi_scan) || []
+			};
+		}, cli);
+		return;
+	}
+	if (action == 'services') {
+		cached_helper_call('services', 4000, 'services', 'services_read', {}, sess.username, remote_ip, null, cli);
+		return;
+	}
+
+	if (action == 'packages') {
+		if (sess.role != 'admin') {
+			send_json_env(cli, 403, 'services', {}, [{ code: 'FORBIDDEN', section: 'services', message_ar: 'متاح لصلاحية المدير فقط', request_id: req_id }]);
+			return;
+		}
+		call_helper('sys_packages_list', { query: query.q || body.query || '' }, sess.username, remote_ip, function(res) {
+			send_json_env(cli, res.ok ? 200 : 400, 'services', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'services', message_ar: res.message_ar, request_id: req_id }]);
+		});
+		return;
+	}
+
+	if (action == 'client_inspect') {
+		if (sess.role != 'admin') {
+			send_json_env(cli, 403, 'clients', {}, [{ code: 'FORBIDDEN', section: 'clients', message_ar: 'فحص نشاط الجهاز التفصيلي متاح لصلاحية المدير فقط', request_id: req_id }]);
+			return;
+		}
+		call_helper('client_inspect', { ip: query.ip || body.ip || '', mac: query.mac || body.mac || '' }, sess.username, remote_ip, function(res) {
+			send_json_env(cli, res.ok ? 200 : 400, 'clients', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'clients', message_ar: res.message_ar, request_id: req_id }]);
+		});
+		return;
+	}
+
+	if (action == 'backup_export') {
+		if (sess.role != 'admin') {
+			send_json_env(cli, 403, 'services', {}, [{ code: 'FORBIDDEN', section: 'services', message_ar: 'متاح لصلاحية المدير فقط', request_id: req_id }]);
+			return;
+		}
+		call_helper('sys_backup_export', {}, sess.username, remote_ip, function(res) {
+			send_json_env(cli, res.ok ? 200 : 400, 'services', res, []);
+		});
+		return;
+	}
+
+	if (action == 'auth_users') {
+		if (sess.role != 'admin') {
+			send_json_env(cli, 403, 'auth', {}, [{ code: 'FORBIDDEN', section: 'auth', message_ar: 'متاح لصلاحية المدير فقط', request_id: req_id }]);
+			return;
+		}
+		call_helper('auth_list_users', {}, sess.username, remote_ip, function(res) {
+			send_json_env(cli, res.ok ? 200 : 400, 'auth', res, []);
+		});
+		return;
+	}
+
+	if (action == 'diagnostics') {
+		if (sess.role != 'admin') {
+			send_json_env(cli, 403, 'diagnostics', {}, [{ code: 'FORBIDDEN', section: 'diagnostics', message_ar: 'التشخيص متاح لصلاحية المدير فقط', request_id: req_id }]);
+			return;
+		}
+		let tool = body.tool || query.tool || 'logs';
+		let target = body.target || query.target || '';
+		let verb_map = { ping: 'diag_ping', traceroute: 'diag_traceroute', nslookup: 'diag_nslookup', tcp_probe: 'diag_tcp_probe', routes: 'diag_routes', logs: 'log_read' };
+		let verb = verb_map[tool];
+		if (!verb) {
+			send_json_env(cli, 400, 'diagnostics', {}, [{ code: 'VALIDATION', section: 'diagnostics', message_ar: 'أداة تشخيص غير معروفة', request_id: req_id }]);
+			return;
+		}
+		call_helper(verb, { target: target, port: +(body.port || query.port || 80), qtype: body.qtype || query.qtype || 'A' }, sess.username, remote_ip, function(res) {
+			send_json_env(cli, res.ok ? 200 : 400, 'diagnostics', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'diagnostics', message_ar: res.message_ar, request_id: req_id }]);
+		});
+		return;
+	}
+
+	// 4. v1.1 Admin Mutations (routed via helper + P17 lock + CSRF/Origin checked above)
+	if (method == 'POST') {
+		if (action == 'adguard_control') {
+			let sub = body.subaction || '';
+			let agh_vmap = {
+				add_rule: 'agh_add_rule', remove_rule: 'agh_remove_rule', toggle_flag: 'agh_toggle',
+				set_creds: 'agh_set_creds', refresh_filters: 'agh_refresh_filters', clear_querylog: 'agh_clear_querylog',
+				set_blocked_services: 'agh_set_blocked_services', rewrite_add: 'agh_rewrite_add', rewrite_delete: 'agh_rewrite_delete',
+				filter_add: 'agh_filter_add', filter_delete: 'agh_filter_delete', filter_toggle: 'agh_filter_toggle',
+				dns_config: 'agh_dns_config', clear_cache: 'agh_clear_cache'
+			};
+			let verb = agh_vmap[sub] || '';
+			if (verb == '') {
+				send_json_env(cli, 400, 'adguard', {}, [{ code: 'VALIDATION', section: 'adguard', message_ar: 'أمر غير مدعوم', request_id: req_id }]);
+				return;
+			}
+			call_helper(verb, body, sess.username, remote_ip, function(res) {
+				delete cache_map['adguard_admin']; delete cache_map['adguard_readonly'];
+				send_json_env(cli, res.ok ? 200 : (res.status || 400), 'adguard', res, res.ok ? [] : [{ code: res.error_code || 'INTERNAL', section: 'adguard', message_ar: res.message_ar, request_id: req_id }]);
+			});
+			return;
+		}
+		if (action == 'client_control') {
+			let sub = body.subaction || '';
+			let cli_vmap = {
+				block: 'client_block', unblock: 'client_unblock', set_meta: 'client_set_meta',
+				static_lease: 'client_static_lease', ping: 'client_ping',
+				domain_add: 'client_domain_add', domain_delete: 'client_domain_delete', lease_delete: 'client_lease_delete'
+			};
+			let cverb = cli_vmap[sub] || '';
+			if (cverb == '') {
+				send_json_env(cli, 400, 'clients', {}, [{ code: 'UNSUPPORTED', section: 'clients', message_ar: 'أمر الجهاز غير مدعوم', request_id: req_id }]);
+				return;
+			}
+			call_helper(cverb, body, sess.username, remote_ip, function(res) {
+				delete cache_map['clients'];
+				send_json_env(cli, res.ok ? 200 : (res.status || 400), 'clients', res, res.ok ? [] : [{ code: res.error_code || 'INTERNAL', section: 'clients', message_ar: res.message_ar, request_id: req_id }]);
+			});
+			return;
+		}
+		if (action == 'network_control') {
+			let sub = body.subaction || '';
+			let net_vmap = {
+				reconnect_wan: 'network_action', reconnect_wwan: 'network_action', flush_dns: 'network_action', sync_time: 'network_action',
+				save_dhcp: 'network_save_dhcp', save_wan: 'network_save_wan',
+				route_add: 'network_route_add', route_delete: 'network_route_delete',
+				wifi_scan: 'wifi_scan', wifi_save_uplink: 'wifi_save_uplink', wifi_save_ap: 'wifi_save_ap'
+			};
+			let nverb = net_vmap[sub] || '';
+			if (nverb == '') {
+				send_json_env(cli, 400, 'network', {}, [{ code: 'VALIDATION', section: 'network', message_ar: 'إجراء الشبكة غير مدعوم', request_id: req_id }]);
+				return;
+			}
+			call_helper(nverb, body, sess.username, remote_ip, function(res) {
+				delete cache_map['overview']; delete cache_map['network_cfg'];
+				ubus_cache.ts_ms = 0;
+				send_json_env(cli, res.ok ? 200 : (res.status || 400), 'network', res, res.ok ? [] : [{ code: res.error_code || 'INTERNAL', section: 'network', message_ar: res.message_ar, request_id: req_id }]);
+			});
+			return;
+		}
+		if (action == 'sqm_control') {
+			call_helper('sqm_update', body, sess.username, remote_ip, function(res) {
+				delete cache_map['sqm']; delete cache_map['overview'];
+				send_json_env(cli, res.ok ? 200 : (res.status || 400), 'sqm', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'sqm', message_ar: res.message_ar, request_id: req_id }]);
+			});
+			return;
+		}
+		if (action == 'firewall_control') {
+			let sub = body.subaction || '';
+			let fw_vmap = {
+				add_redirect: 'fw_add_redirect', delete_redirect: 'fw_delete_redirect', toggle_rule: 'fw_toggle_rule',
+				add_rule: 'fw_add_rule', delete_rule: 'fw_delete_rule', save_defaults: 'fw_save_defaults',
+				banip_save: 'banip_save_config', banip_list: 'banip_list_edit', upnp_save: 'upnp_save_config'
+			};
+			let fverb = fw_vmap[sub] || '';
+			if (fverb == '') {
+				send_json_env(cli, 400, 'firewall', {}, [{ code: 'VALIDATION', section: 'firewall', message_ar: 'أمر الجدار الناري غير مدعوم', request_id: req_id }]);
+				return;
+			}
+			call_helper(fverb, body, sess.username, remote_ip, function(res) {
+				delete cache_map['firewall']; delete cache_map['services'];
+				send_json_env(cli, res.ok ? 200 : (res.status || 400), 'firewall', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'firewall', message_ar: res.message_ar, request_id: req_id }]);
+			});
+			return;
+		}
+		if (action == 'system_control') {
+			let sub = body.subaction || '';
+			let sys_vmap = {
+				save_general: 'sys_save_general', save_tuning: 'sys_save_tuning',
+				cron_add: 'sys_cron_add', cron_delete: 'sys_cron_delete',
+				ssh_save: 'sys_ssh_save', ssh_key_add: 'sys_ssh_key_add', ssh_key_delete: 'sys_ssh_key_delete',
+				pkg_action: 'sys_pkg_action',
+				reboot_challenge: 'sys_reboot_challenge', reboot: 'sys_reboot'
+			};
+			let sverb = sys_vmap[sub] || '';
+			if (sverb == '') {
+				send_json_env(cli, 400, 'services', {}, [{ code: 'VALIDATION', section: 'services', message_ar: 'أمر إدارة النظام غير مدعوم', request_id: req_id }]);
+				return;
+			}
+			call_helper(sverb, body, sess.username, remote_ip, function(res) {
+				delete cache_map['services']; delete cache_map['overview'];
+				send_json_env(cli, res.ok ? 200 : (res.status || 400), 'services', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'services', message_ar: res.message_ar, request_id: req_id }]);
+			});
+			return;
+		}
+		if (action == 'docker_control') {
+			call_helper('docker_control', body, sess.username, remote_ip, function(res) {
+				delete cache_map['docker'];
+				send_json_env(cli, res.ok ? 200 : (res.status || 400), 'docker', res, res.ok ? [] : [{ code: res.error_code || 'DEPENDENCY', section: 'docker', message_ar: res.message_ar, request_id: req_id }]);
+			});
+			return;
+		}
+		if (action == 'tailscale_control') {
+			call_helper('tailscale_control', body, sess.username, remote_ip, function(res) {
+				delete cache_map['tailscale'];
+				send_json_env(cli, res.ok ? 200 : (res.status || 400), 'tailscale', res, res.ok ? [] : [{ code: res.error_code || 'DEPENDENCY', section: 'tailscale', message_ar: res.message_ar, request_id: req_id }]);
+			});
+			return;
+		}
+		if (action == 'service_control') {
+			let sub = body.subaction || 'restart';
+			let allow_s = { start: true, stop: true, restart: true, enable: true, disable: true };
+			if (!allow_s[sub]) {
+				send_json_env(cli, 400, 'services', {}, [{ code: 'UNSUPPORTED', section: 'services', message_ar: 'عملية خدمة غير مدعومة', request_id: req_id }]);
+				return;
+			}
+			call_helper('service_action', { name: body.name, subaction: sub }, sess.username, remote_ip, function(res) {
+				delete cache_map['services'];
+				send_json_env(cli, res.ok ? 200 : (res.status || 400), 'services', res, res.ok ? [] : [{ code: res.error_code || 'DEPENDENCY', section: 'services', message_ar: res.message_ar, request_id: req_id }]);
+			});
+			return;
+		}
+		if (action == 'auth_admin') {
+			let sub = body.subaction || '';
+			let av = sub == 'change_password' ? 'auth_change_password'
+				: (sub == 'delete_user' ? 'auth_delete_user'
+				: (sub == 'totp_setup' ? 'auth_totp_setup'
+				: (sub == 'totp_enable' ? 'auth_totp_enable'
+				: (sub == 'totp_disable' ? 'auth_totp_disable' : ''))));
+			if (av == '') {
+				send_json_env(cli, 400, 'auth', {}, [{ code: 'VALIDATION', section: 'auth', message_ar: 'أمر إدارة المستخدمين غير معروف', request_id: req_id }]);
+				return;
+			}
+			call_helper(av, body, sess.username, remote_ip, function(res) {
+				if (res.ok && res.invalidate_sessions) {
+					for (let k_sid in keys(sessions)) {
+						if (k_sid != sess.id) delete sessions[k_sid];
+					}
+				}
+				send_json_env(cli, res.ok ? 200 : (res.status || 400), 'auth', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'auth', message_ar: res.message_ar, request_id: req_id }]);
+			});
+			return;
+		}
+		if (action == 'rollback_control') {
+			let rbv = body.subaction == 'revert' ? 'rollback_revert' : 'rollback_confirm';
+			call_helper(rbv, body, sess.username, remote_ip, function(res) {
+				delete cache_map['firewall']; delete cache_map['overview'];
+				send_json_env(cli, res.ok ? 200 : 400, 'firewall', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'firewall', message_ar: res.message_ar, request_id: req_id }]);
+			});
+			return;
+		}
+		if (action == 'alerts_control') {
+			let alv = body.subaction == 'test' ? 'alerts_test' : 'alerts_set';
+			call_helper(alv, body, sess.username, remote_ip, function(res) {
+				send_json_env(cli, res.ok ? 200 : 400, 'services', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'services', message_ar: res.message_ar, request_id: req_id }]);
+			});
+			return;
+		}
+		if (action == 'client_quota_set' || action == 'schedule_action_set') {
+			call_helper(action, body, sess.username, remote_ip, function(res) {
+				send_json_env(cli, res.ok ? 200 : 400, 'clients', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'clients', message_ar: res.message_ar, request_id: req_id }]);
+			});
+			return;
+		}
+		if (action == 'freeze_clear') {
+			call_helper('freeze_clear', { confirm_reconciled: !!body.confirm_reconciled }, sess.username, remote_ip, function(res) {
+				send_json_env(cli, res.ok ? 200 : 400, 'auth', res, []);
+			});
+			return;
+		}
+	}
+
+	send_json_env(cli, 404, 'overview', {}, [{ code: 'UNSUPPORTED', section: 'router', message_ar: 'نقطة النهاية غير متاحة في v1', request_id: req_id }]);
+}
+
+// --- Hardened Manual HTTP/1.1 Server Loop ---
+function handle_http_conn(cli, remote_ip) {
+	active_conns++;
+	let raw_buf = '';
+	let closed = false;
+	let ch = null;
+	let headers_parsed = false;
+	let req_method = '';
+	let req_path = '';
+	let req_headers = {};
+	let content_len = 0;
+
+	let close_conn = function() {
+		if (closed) return;
+		closed = true;
+		active_conns--;
+		if (ch) ch.delete();
+		try { cli.close(); } catch (e) {}
+	};
+
+	let rtimer = uloop.timer(READ_TIMEOUT_MS, function() {
+		close_conn();
+	});
+
+	ch = uloop.handle(cli, function(ev) {
+		if (closed) return;
+		let d = cli.recv(4096);
+		if (!d || length(d) == 0) { rtimer.cancel(); close_conn(); return; }
+		if (index(d, '\0') >= 0) {
+			rtimer.cancel(); closed = true; active_conns--; ch.delete();
+			send_http(cli, 400, 'Bad Request', 'text/plain', 'Null byte rejected');
+			return;
+		}
+		raw_buf += d;
+
+		if (!headers_parsed) {
+			let hdr_end = index(raw_buf, '\r\n\r\n');
+			if (hdr_end < 0) {
+				if (length(raw_buf) > MAX_HEADER_BYTES) {
+					rtimer.cancel(); closed = true; active_conns--; ch.delete();
+					send_http(cli, 431, 'Request Header Fields Too Large', 'text/plain', 'Header too large');
+				}
+				return;
+			}
+			if (hdr_end > MAX_HEADER_BYTES) {
+				rtimer.cancel(); closed = true; active_conns--; ch.delete();
+				send_http(cli, 431, 'Request Header Fields Too Large', 'text/plain', 'Header too large');
+				return;
+			}
+			let hdr_block = substr(raw_buf, 0, hdr_end);
+			raw_buf = substr(raw_buf, hdr_end + 4);
+			let lines = split(hdr_block, '\r\n');
+			if (length(lines) == 0 || length(lines) > MAX_HEADER_COUNT + 1) {
+				rtimer.cancel(); closed = true; active_conns--; ch.delete();
+				send_http(cli, 400, 'Bad Request', 'text/plain', 'Invalid header count');
+				return;
+			}
+			let rl = match(lines[0], /^(GET|POST|OPTIONS)\s+(\S+)\s+HTTP\/1\.[01]$/);
+			if (!rl) {
+				rtimer.cancel(); closed = true; active_conns--; ch.delete();
+				send_http(cli, 400, 'Bad Request', 'text/plain', 'Bad request line');
+				return;
+			}
+			req_method = rl[1];
+			req_path = rl[2];
+			let seen_cl = false;
+			for (let i = 1; i < length(lines); i++) {
+				let col = index(lines[i], ':');
+				if (col <= 0) {
+					rtimer.cancel(); closed = true; active_conns--; ch.delete();
+					send_http(cli, 400, 'Bad Request', 'text/plain', 'Malformed header');
+					return;
+				}
+				let hk = lc(trim(substr(lines[i], 0, col)));
+				let hv = trim(substr(lines[i], col + 1));
+				if (hk == 'transfer-encoding' && index(lc(hv), 'chunked') >= 0) {
+					rtimer.cancel(); closed = true; active_conns--; ch.delete();
+					send_http(cli, 400, 'Bad Request', 'text/plain', 'Chunked encoding rejected');
+					return;
+				}
+				if (hk == 'content-length') {
+					if (seen_cl || !match(hv, /^[0-9]+$/)) {
+						rtimer.cancel(); closed = true; active_conns--; ch.delete();
+						send_http(cli, 400, 'Bad Request', 'text/plain', 'Invalid Content-Length');
+						return;
+					}
+					seen_cl = true;
+					content_len = +hv;
+					if (content_len > MAX_BODY_BYTES) {
+						rtimer.cancel(); closed = true; active_conns--; ch.delete();
+						send_http(cli, 413, 'Payload Too Large', 'text/plain', 'Payload too large');
+						return;
+					}
+				}
+				req_headers[hk] = hv;
+			}
+			headers_parsed = true;
+		}
+
+		if (length(raw_buf) > content_len) {
+			rtimer.cancel(); closed = true; active_conns--; ch.delete();
+			send_http(cli, 400, 'Bad Request', 'text/plain', 'Pipelining not allowed');
+			return;
+		}
+		if (length(raw_buf) < content_len) return;
+
+		rtimer.cancel();
+		closed = true;
+		active_conns--;
+		ch.delete();
+
+		if (req_method == 'OPTIONS') {
+			send_http(cli, 204, 'No Content', 'text/plain', '');
+			return;
+		}
+		if (index(req_path, '/api') == 0 || index(req_path, '/cgi-bin/pro-api') == 0) {
+			handle_api_request(cli, req_method, req_path, req_headers, raw_buf, remote_ip);
+		} else {
+			serve_static(cli, req_path, req_headers);
+		}
+	}, uloop.ULOOP_READ);
+}
+
+uloop.init();
+let http_srv = null;
+let http_handle = null;
+let bind_retry_timer = null;
+
+function start_http_server(attempt) {
+	let lan_ip = get_lan_ip();
+	let sa = sock.sockaddr({ address: lan_ip, port: BIND_PORT });
+	let s = sock.create(sock.AF_INET, sock.SOCK_STREAM);
+	let bound = false;
+	if (s) {
+		try { s.setopt(sock.SOL_SOCKET, sock.SO_REUSEADDR, 1); } catch (e) {}
+		if (sa && s.bind(sa) && s.listen(32)) {
+			http_srv = s;
+			bound = true;
+		} else {
+			try { s.close(); } catch (e) {}
+		}
+	}
+	if (!bound) {
+		if (attempt < 30) {
+			bind_retry_timer = uloop.timer(1000, function() { start_http_server(attempt + 1); });
+			return;
+		}
+		die('Failed to bind noc-apid on ' + lan_ip + ':' + BIND_PORT + ' after retries: ' + sock.error());
+	}
+	http_handle = uloop.handle(http_srv, function(ev) {
+		let peer = {};
+		let cli = http_srv.accept(peer);
+		if (!cli) return;
+		if (active_conns >= MAX_CONNECTIONS) {
+			try { cli.send("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"); } catch (e) {}
+			cli.close();
+			return;
+		}
+		handle_http_conn(cli, peer.address || '');
+	}, uloop.ULOOP_READ);
+}
+
+start_http_server(0);
+uloop.run();

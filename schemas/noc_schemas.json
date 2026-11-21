@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NOC Console Versioned Telemetry & Control Contract",
+  "schema_version": "1.0.0",
+  "$defs": {
+    "ResourceEnum": {
+      "type": "string",
+      "enum": [
+        "overview",
+        "adguard",
+        "clients",
+        "network",
+        "sqm",
+        "firewall",
+        "docker",
+        "tailscale",
+        "services",
+        "diagnostics",
+        "auth"
+      ]
+    },
+    "SourceEnum": {
+      "type": "string",
+      "enum": [
+        "procfs",
+        "sysfs",
+        "statvfs",
+        "ubus",
+        "uci",
+        "nftables",
+        "tc",
+        "adguard_api",
+        "docker_engine",
+        "tailscale_cli",
+        "noc_helper",
+        "system_log"
+      ]
+    },
+    "StatusEnum": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "degraded",
+        "offline",
+        "unknown",
+        "unsupported",
+        "stale"
+      ]
+    },
+    "DependencyStateEnum": {
+      "type": "string",
+      "enum": [
+        "starting",
+        "ready",
+        "degraded",
+        "unavailable",
+        "unprovisioned"
+      ]
+    },
+    "ErrorCodeEnum": {
+      "type": "string",
+      "enum": [
+        "AUTH",
+        "FORBIDDEN",
+        "VALIDATION",
+        "TIMEOUT",
+        "DEPENDENCY",
+        "INTERNAL",
+        "UNSUPPORTED"
+      ]
+    },
+    "UnitEnum": {
+      "type": ["string", "null"],
+      "enum": [
+        "bytes",
+        "bits/s",
+        "Celsius",
+        "milliseconds",
+        "ratio",
+        "percent",
+        "count",
+        "Mbps",
+        "seconds",
+        null
+      ]
+    },
+    "ErrorItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "section", "message_ar", "request_id"],
+      "properties": {
+        "code": { "$ref": "#/$defs/ErrorCodeEnum" },
+        "section": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "message_ar": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" }
+      }
+    },
+    "Metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "value",
+        "unit",
+        "sampled_at",
+        "sampled_monotonic_ms",
+        "source",
+        "status",
+        "error_code"
+      ],
+      "properties": {
+        "value": { "type": ["number", "string", "boolean", "null"] },
+        "unit": { "$ref": "#/$defs/UnitEnum" },
+        "sampled_at": { "type": ["string", "null"] },
+        "sampled_monotonic_ms": { "type": "integer", "minimum": 0 },
+        "source": { "$ref": "#/$defs/SourceEnum" },
+        "status": { "$ref": "#/$defs/StatusEnum" },
+        "error_code": {
+          "oneOf": [
+            { "$ref": "#/$defs/ErrorCodeEnum" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "Envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "boot_id",
+        "resource",
+        "generated_at",
+        "monotonic_ms",
+        "seq",
+        "data",
+        "errors"
+      ],
+      "properties": {
+        "schema_version": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$" },
+        "boot_id": { "type": "string", "pattern": "^[a-f0-9-]{8,64}$" },
+        "resource": { "$ref": "#/$defs/ResourceEnum" },
+        "generated_at": { "type": "string", "minLength": 10 },
+        "monotonic_ms": { "type": "integer", "minimum": 0 },
+        "seq": { "type": "integer", "minimum": 1 },
+        "data": { "type": "object" },
+        "errors": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ErrorItem" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>نظام إدارة الشبكة NMS — جاري التحويل</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #18181B;
+      color: #E4E4E7;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      text-align: center;
+    }
+    .box {
+      background: #27272A;
+      border: 1px solid #3F3F46;
+      border-radius: 10px;
+      padding: 24px 28px;
+      max-width: 420px;
+    }
+    a {
+      display: inline-block;
+      margin-top: 14px;
+      padding: 10px 18px;
+      background: #2563EB;
+      color: #FFFFFF;
+      text-decoration: none;
+      border-radius: 8px;
+      font-weight: 600;
+    }
+    a:hover { background: #1D4ED8; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>نظام إدارة الشبكة NMS</h1>
+    <p id="statusMsg">جاري التحويل الآمن إلى بوابة التحكم المستقلة على المنفذ 8780...</p>
+    <a id="manualLink" href="#">فتح نظام إدارة الشبكة NMS</a>
+  </div>
+  <script>
+    (function() {
+      var proto = 'http:';
+      var host = window.location.hostname || window.location.host.split(':')[0];
+      if (!host) return;
+      var target = proto + '//' + host + ':8780/';
+      var link = document.getElementById('manualLink');
+      if (link) link.href = target;
+      window.location.replace(target);
+    })();
+  </script>
+</body>
+</html>

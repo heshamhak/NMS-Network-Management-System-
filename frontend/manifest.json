@@ -1,0 +1,11 @@
+{
+  "name": "نظام إدارة الشبكة — NMS (Network Management System)",
+  "short_name": "NMS",
+  "start_url": "/pro/index.html",
+  "scope": "/",
+  "display": "standalone",
+  "dir": "rtl",
+  "lang": "ar",
+  "background_color": "#18181B",
+  "theme_color": "#18181B"
+}

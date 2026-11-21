@@ -1,0 +1,2086 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#18181B" />
+  <title>NMS — نظام إدارة الشبكة</title>
+  <link rel="manifest" href="/pro/manifest.json" />
+  <link rel="stylesheet" href="/pro/styles.css" />
+  <link rel="stylesheet" href="/pro/lab.css" />
+</head>
+<body>
+  <!-- Authentication / Bootstrap Modal Overlay -->
+  <div id="authOverlay" class="auth-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="authModeTitle">
+    <div class="auth-card">
+      <div class="auth-header">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="4" width="18" height="16" rx="2" />
+            <path d="M7 9h10M7 13h6M7 17h4" />
+          </svg>
+        </div>
+        <div>
+          <h1 id="authModeTitle">تسجيل الدخول إلى نظام إدارة الشبكة NMS</h1>
+          <p id="authModeDesc">يرجى المصادقة للوصول إلى بيانات البوابة والتحكم الشبكي.</p>
+        </div>
+        <button type="button" id="btnAuthLangToggle" class="btn btn-secondary btn-sm" aria-label="Switch Language">EN</button>
+      </div>
+
+      <form id="authForm" class="auth-form" autocomplete="off">
+        <div id="bootstrapTokenGroup" class="form-group hidden">
+          <label for="bootstrapTokenInput">رمز التهيئة الأولية (من /etc/noc-console/bootstrap.token)</label>
+          <input id="bootstrapTokenInput" type="text" class="form-input mono" placeholder="أدخل رمز التهيئة الأولية" />
+        </div>
+
+        <div id="authUserGroup" class="form-group">
+          <label for="authUserInput">اسم المستخدم</label>
+          <input id="authUserInput" type="text" class="form-input" value="admin" autocomplete="username" required />
+        </div>
+
+        <div class="form-group">
+          <label for="authPassInput" id="authPassLabel">كلمة المرور</label>
+          <input id="authPassInput" type="password" class="form-input" placeholder="12 حرفاً على الأقل" autocomplete="current-password" required />
+        </div>
+
+        <div id="authTotpGroup" class="form-group hidden">
+          <label for="authTotpInput">رمز المصادقة الثنائية (TOTP - 6 أرقام)</label>
+          <input id="authTotpInput" type="text" inputmode="numeric" maxlength="6" class="form-input mono" placeholder="000000" />
+        </div>
+
+        <div id="authErrorBox" class="alert-box alert-danger hidden" role="alert"></div>
+
+        <button id="authSubmitBtn" type="submit" class="btn btn-primary btn-full">دخول</button>
+      </form>
+
+      <div id="authRecoveryNote" class="auth-footnote">
+        في حال نسيان كلمة المرور أو تجاوز محاولات الدخول، يمكن استعادة الوصول محلياً عبر الطرفية:
+        <code class="mono">/usr/libexec/noc-helperd --reset-bootstrap</code>
+      </div>
+    </div>
+  </div>
+
+  <!-- Confirm Action Dialog -->
+  <div id="confirmModal" class="auth-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+    <div class="confirm-card">
+      <h2 id="confirmTitle">تأكيد تنفيذ العملية</h2>
+      <p id="confirmBody" class="confirm-desc"></p>
+      <div class="confirm-actions">
+        <button id="confirmCancelBtn" type="button" class="btn btn-secondary">إلغاء</button>
+        <button id="confirmProceedBtn" type="button" class="btn btn-primary">تأكيد التنفيذ</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Mobile Drawer Backdrop -->
+  <div id="mobileNavBackdrop" class="drawer-backdrop hidden" aria-hidden="true"></div>
+
+  <!-- Main Workspace Shell -->
+  <div id="appShell" class="app-shell">
+    <!-- Vertical Right Sidebar (Ubiquiti UniFi OS Style) -->
+    <aside id="mainSidebar" class="sidebar" aria-label="التنقل الرئيسي">
+      <div class="sidebar-brand">
+        <div class="brand-logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="9" />
+            <circle cx="12" cy="12" r="3" />
+            <path d="M12 3v3M12 18v3M3 12h3M18 12h3" />
+          </svg>
+        </div>
+        <div class="brand-text">
+          <span class="brand-title">نظام إدارة الشبكة NMS</span>
+          <span class="brand-sub" id="sidebarHostname">Network Management System</span>
+        </div>
+      </div>
+
+      <nav class="sidebar-nav" id="sidebarNav">
+        <div class="nav-group" role="group" aria-label="المراقبة">
+          <div class="nav-group-title">المراقبة</div>
+          <button type="button" class="sidebar-btn active" data-tab="dashboard">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 14l4-4M3.34 19a10 10 0 1 1 17.32 0" />
+              </svg>
+            </span>
+            <span>الأداء العام والمنافذ</span>
+          </button>
+          <button type="button" class="sidebar-btn" data-tab="topology">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="5" r="2.5" />
+                <circle cx="6" cy="19" r="2.5" />
+                <circle cx="18" cy="19" r="2.5" />
+                <path d="M12 7.5v4.5M12 12l-6 4.5M12 12l6 4.5" />
+              </svg>
+            </span>
+            <span>شجرة المسارات الحية</span>
+          </button>
+        </div>
+
+        <div class="nav-group" role="group" aria-label="الشبكة">
+          <div class="nav-group-title">الشبكة</div>
+          <button type="button" class="sidebar-btn" data-tab="network">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="9" />
+                <path d="M2 12h20M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18" />
+              </svg>
+            </span>
+            <span>الشبكة والتوجيه</span>
+          </button>
+          <button type="button" class="sidebar-btn" data-tab="sqm">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 18V8M10 18V4M16 18v-6M22 18v-9" />
+              </svg>
+            </span>
+            <span>إدارة التدفق SQM</span>
+          </button>
+        </div>
+
+        <div class="nav-group" role="group" aria-label="الأجهزة والخصوصية">
+          <div class="nav-group-title">الأجهزة والخصوصية</div>
+          <button type="button" class="sidebar-btn" data-tab="clients">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="2" y="3" width="20" height="14" rx="2" />
+                <path d="M8 21h8M12 17v4" />
+              </svg>
+            </span>
+            <span>الأجهزة المتصلة</span>
+          </button>
+          <button type="button" class="sidebar-btn" data-tab="adguard">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 2l7 4v6c0 5-3.5 9.74-7 10-3.5-.26-7-5-7-10V6l7-4z" />
+              </svg>
+            </span>
+            <span>الحجب والخصوصية</span>
+          </button>
+        </div>
+
+        <div class="nav-group" role="group" aria-label="الأمان والوصول">
+          <div class="nav-group-title">الأمان والوصول</div>
+          <button type="button" class="sidebar-btn" data-tab="firewall">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="5" width="18" height="14" rx="2" />
+                <path d="M3 10h18M9 10v9M15 5v5" />
+              </svg>
+            </span>
+            <span>الجدار الناري</span>
+          </button>
+          <button type="button" class="sidebar-btn" data-tab="tailscale">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="6" cy="12" r="3" />
+                <circle cx="18" cy="6" r="3" />
+                <circle cx="18" cy="18" r="3" />
+                <path d="M8.7 10.7l6.6-3.4M8.7 13.3l6.6 3.4" />
+              </svg>
+            </span>
+            <span>الشبكة الخاصة VPN</span>
+          </button>
+        </div>
+
+        <div class="nav-group" role="group" aria-label="النظام">
+          <div class="nav-group-title">النظام</div>
+          <button type="button" class="sidebar-btn" data-tab="services">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.77 1 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+              </svg>
+            </span>
+            <span>الخدمات والصلاحيات</span>
+          </button>
+          <button type="button" class="sidebar-btn" data-tab="docker">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 10h4v4H4zM10 10h4v4h-4zM16 10h4v4h-4zM7 4h4v4H7zM13 4h4v4h-4zM2 16h20l-2 4H4l-2-4z" />
+              </svg>
+            </span>
+            <span>الحاويات البرمجية</span>
+          </button>
+          <button type="button" class="sidebar-btn" data-tab="diagnostics">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="4 17 10 11 4 5" />
+                <line x1="12" y1="19" x2="20" y2="19" />
+              </svg>
+            </span>
+            <span>التشخيص والتدقيق</span>
+          </button>
+        </div>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="role-pill" id="roleBadge">غير مصادق</div>
+        <button type="button" id="btnLogout" class="btn btn-secondary btn-full btn-sm">تسجيل الخروج</button>
+      </div>
+    </aside>
+
+    <!-- Main Content Column -->
+    <div class="main-column">
+      <!-- Operations Command Bar -->
+      <header id="opsCommandBar" class="command-bar">
+        <div class="cmd-right">
+          <button type="button" id="mobileNavBtn" class="btn-icon mobile-only" aria-label="فتح قائمة التنقل" aria-expanded="false">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M3 6h18M3 12h18M3 18h18" />
+            </svg>
+          </button>
+          <div>
+            <div class="cmd-title-row">
+              <h2 id="activePageTitle">الأداء العام والمنافذ</h2>
+              <span class="status-pill pill-neutral" id="cmdConnBadge">بانتظار الاتصال</span>
+            </div>
+            <div class="cmd-meta-row">
+              <span id="cmdGwName" class="mono">192.168.1.1</span>
+              <span class="sep">|</span>
+              <span>عمر العينة: <strong id="cmdSampleAge" class="mono">--</strong></span>
+              <span class="sep">|</span>
+              <span id="cmdUserBadge">--</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="cmd-left">
+          <div id="cmdHealthStrip" class="health-strip" aria-label="صحة الأنظمة الفرعية"></div>
+          <span class="status-pill pill-neutral" id="cmdAlertBadge">التنبيهات: 0</span>
+          <button type="button" id="btnLangToggle" class="btn btn-secondary btn-sm" aria-label="Switch Language">EN</button>
+          <button type="button" id="btnCmdPalette" class="btn btn-secondary btn-sm">بحث وأوامر (Ctrl+K)</button>
+          <button type="button" id="btnRefreshNow" class="btn btn-secondary btn-sm">تحديث فوري</button>
+        </div>
+      </header>
+
+      <!-- Auto-Rollback Confirmation Banner -->
+      <div id="rollbackBanner" class="banner banner-warning hidden" role="alert">
+        <div class="banner-text">
+          <strong>تأكيد التعديل الحساس قبل التراجع التلقائي</strong>
+          <span id="rollbackCountdownText" class="mono">متبقي 60 ثانية</span>
+        </div>
+        <div class="inline-form">
+          <button type="button" id="btnConfirmRollback" class="btn btn-primary btn-sm">تأكيد واعتماد التغيير</button>
+          <button type="button" id="btnRevertRollback" class="btn btn-secondary btn-sm">تراجع فوري</button>
+        </div>
+      </div>
+
+      <!-- Global Security Freeze Banner -->
+      <div id="globalFreezeBanner" class="banner banner-danger hidden" role="alert">
+        <div class="banner-text">
+          <strong>تم تجميد التعديلات الحساسة لحماية استقرار النظام</strong>
+          <span id="freezeReasonText"></span>
+        </div>
+        <button type="button" id="btnClearFreeze" class="btn btn-secondary btn-sm">تأكيد المطابقة وفك التجميد</button>
+      </div>
+
+      <!-- Global Route / Storage Drift Warning Banner -->
+      <div id="globalDriftBanner" class="banner banner-warning hidden" role="status">
+        <div id="driftBannerText" class="banner-text"></div>
+      </div>
+
+      <!-- Workspace Views -->
+      <main class="workspace">
+        <!-- TAB 1: DASHBOARD -->
+        <section id="view-dashboard" class="tab-view active">
+          <div class="kpi-grid-3">
+            <!-- CPU Gauge Card -->
+            <article class="card kpi-card">
+              <div class="card-head">
+                <h3>المعالج المركزي</h3>
+                <span class="badge mono" id="cpuTempBadge">-- °C</span>
+              </div>
+              <div class="gauge-wrap">
+                <div class="gauge-box" id="cpuMeterBox" role="meter" aria-label="نسبة استخدام المعالج" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                  <svg viewBox="0 0 120 120" class="gauge-svg">
+                    <circle cx="60" cy="60" r="50" class="gauge-track" />
+                    <circle cx="60" cy="60" r="50" id="cpuGaugeArc" class="gauge-arc arc-emerald" stroke-dasharray="314.16" stroke-dashoffset="314.16" />
+                  </svg>
+                  <div class="gauge-center">
+                    <span class="gauge-val mono" id="cpuTotalPct">0.0%</span>
+                    <span class="gauge-lbl">الاستخدام الكلي</span>
+                  </div>
+                </div>
+                <div class="kpi-details">
+                  <div class="sub-label" id="cpuModelText">--</div>
+                  <div class="progress-bar"><div class="progress-fill" id="cpuTotalBar"></div></div>
+                  <div class="meta-line">متوسط الحمل: <span class="mono" id="loadAvgText">0.00 / 0.00 / 0.00</span></div>
+                  <div class="cores-grid" id="cpuCoresGrid"></div>
+                </div>
+              </div>
+            </article>
+
+            <!-- Memory & Conntrack Gauge Card -->
+            <article class="card kpi-card">
+              <div class="card-head">
+                <h3>الذاكرة وتتبع الاتصالات</h3>
+                <span class="badge mono" id="ramPctBadge">0.0%</span>
+              </div>
+              <div class="gauge-wrap">
+                <div class="gauge-box" id="ramMeterBox" role="meter" aria-label="نسبة استخدام الذاكرة" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                  <svg viewBox="0 0 120 120" class="gauge-svg">
+                    <circle cx="60" cy="60" r="50" class="gauge-track" />
+                    <circle cx="60" cy="60" r="50" id="ramGaugeArc" class="gauge-arc arc-emerald" stroke-dasharray="314.16" stroke-dashoffset="314.16" />
+                  </svg>
+                  <div class="gauge-center">
+                    <span class="gauge-val mono" id="ramGaugePct">0.0%</span>
+                    <span class="gauge-lbl">الذاكرة المستخدمة</span>
+                  </div>
+                </div>
+                <div class="kpi-details">
+                  <div class="kv-row"><span>المستخدم الفعلي</span><strong class="mono" id="ramUsedText">--</strong></div>
+                  <div class="kv-row"><span>المتاح</span><strong class="mono" id="ramAvailText">--</strong></div>
+                  <div class="progress-bar"><div class="progress-fill" id="ramBar"></div></div>
+                  <div class="kv-row"><span>جدول الاتصالات (Conntrack)</span><strong class="mono" id="conntrackText">--</strong></div>
+                  <div class="progress-bar"><div class="progress-fill" id="conntrackBar"></div></div>
+                </div>
+              </div>
+            </article>
+
+            <!-- Rootfs vs NVMe Storage Card (Strict Honesty P3) -->
+            <article class="card kpi-card">
+              <div class="card-head">
+                <h3>التخزين والنظام</h3>
+                <span class="badge mono" id="uptimeBadge">--</span>
+              </div>
+              <div class="gauge-wrap">
+                <div class="gauge-box" id="diskMeterBox" role="meter" aria-label="نسبة استخدام نظام الملفات الجذري" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                  <svg viewBox="0 0 120 120" class="gauge-svg">
+                    <circle cx="60" cy="60" r="50" class="gauge-track" />
+                    <circle cx="60" cy="60" r="50" id="diskGaugeArc" class="gauge-arc arc-amber" stroke-dasharray="314.16" stroke-dashoffset="314.16" />
+                  </svg>
+                  <div class="gauge-center">
+                    <span class="gauge-val mono" id="diskGaugePct">0.0%</span>
+                    <span class="gauge-lbl">نظام الجذر (/)</span>
+                  </div>
+                </div>
+                <div class="kpi-details">
+                  <div class="kv-row"><span>نظام الجذر (/) الفعلي</span><strong class="mono" id="diskUsedText">--</strong></div>
+                  <div class="kv-row"><span>المتاح على الجذر</span><strong class="mono" id="diskAvailText">--</strong></div>
+                  <div class="kv-row"><span>القسم الفيزيائي nvme0n1p2</span><strong class="mono" id="nvmeSummaryText">--</strong></div>
+                  <div class="meta-line" id="sysReleaseText">--</div>
+                  <div class="meta-line mono" id="sysKernelText">--</div>
+                </div>
+              </div>
+              <div id="disksContainer" class="disks-strip"></div>
+            </article>
+          </div>
+
+          <!-- Ports Status Section (Split into Internet Ingress vs Internet Egress/LAN Distribution) -->
+          <article class="card">
+            <div class="card-head">
+              <h3>قسم المنافذ</h3>
+              <span class="sub-label">التوزيع الفعلي لمنافذ دخول الإنترنت ومنافذ خروج وتوزيع الإنترنت للشبكة المحلية</span>
+            </div>
+            <div class="ports-split-grid">
+              <div class="inset-panel ports-group-panel">
+                <div class="card-head">
+                  <h4>القسم الأول: منافذ دخول الإنترنت (منافذ الارتباط الخارجي WAN / WWAN)</h4>
+                  <span class="status-pill pill-success mono" id="portsIngressBadge">--</span>
+                </div>
+                <div id="portsIngressStrip" class="ports-grid"></div>
+              </div>
+              <div class="inset-panel ports-group-panel">
+                <div class="card-head">
+                  <h4>القسم الثاني: منافذ خروج الإنترنت (منافذ التوزيع المحلي LAN والشبكات الفرعية)</h4>
+                  <span class="status-pill pill-neutral mono" id="portsEgressBadge">--</span>
+                </div>
+                <div id="portsEgressStrip" class="ports-grid"></div>
+              </div>
+            </div>
+          </article>
+
+          <!-- Quick Operations Bar -->
+          <article class="card admin-only">
+            <div class="card-head">
+              <h3>إجراءات التشغيل السريعة</h3>
+              <span class="sub-label">تنفيذ مباشر للأوامر التشغيلية الموثوقة على البوابة</span>
+            </div>
+            <div class="inline-form">
+              <button type="button" id="btnQuickFlushDns" class="btn btn-secondary btn-sm">تفريغ وتحديث ذاكرة DNS</button>
+              <button type="button" id="btnQuickSyncTime" class="btn btn-secondary btn-sm">مزامنة توقيت النظام (NTP)</button>
+              <button type="button" id="btnQuickRecheckWan" class="btn btn-primary btn-sm">تحديث وإعادة فحص مسارات الشبكة</button>
+            </div>
+          </article>
+
+          <!-- Live Throughput Spline Chart & Time-Window Consumption Analyzer -->
+          <article class="card">
+            <div class="card-head">
+              <div class="chart-title-group">
+                <h3 id="wanCardTitle">معدل النقل المباشر وحاسبة الاستهلاك الزمني</h3>
+                <span class="status-pill pill-neutral" id="wanBadge">--</span>
+              </div>
+              <div class="chart-controls">
+                <select id="wanIfaceSelect" class="form-select form-select-sm mono" aria-label="اختيار واجهة القياس">
+                  <option value="wlan0">wlan0 (دخول الإنترنت اللاسلكي)</option>
+                  <option value="eth0">eth0 (دخول الإنترنت السلكي)</option>
+                  <option value="pppoe-wan">pppoe-wan (نفق المزود)</option>
+                  <option value="br-lan">br-lan (جسر خروج الإنترنت المحلي)</option>
+                  <option value="eth1">eth1 (منفذ خروج LAN 1)</option>
+                  <option value="eth2">eth2 (منفذ خروج LAN 2)</option>
+                  <option value="eth3">eth3 (منفذ خروج LAN 3)</option>
+                  <option value="tailscale0">tailscale0 (الشبكة الخاصة VPN)</option>
+                </select>
+                <select id="rateUnitSelect" class="form-select form-select-sm" aria-label="وحدة قياس السرعة">
+                  <option value="auto_bits">وحدة السرعة: تلقائي بالبت (bps / Kbps / Mbps)</option>
+                  <option value="auto_bytes">وحدة السرعة: تلقائي بالبايت (B/s / KB/s / MB/s)</option>
+                  <option value="mbps">وحدة السرعة: ثابت (Mbps)</option>
+                  <option value="kbps">وحدة السرعة: ثابت (Kbps)</option>
+                  <option value="mbs">وحدة السرعة: ثابت (MB/s)</option>
+                  <option value="kbs">وحدة السرعة: ثابت (KB/s)</option>
+                </select>
+                <select id="dataUnitSelect" class="form-select form-select-sm" aria-label="وحدة قياس حجم البيانات">
+                  <option value="iec_auto">حجم البيانات: تلقائي ثنائي (KiB / MiB / GiB - 1024)</option>
+                  <option value="si_auto">حجم البيانات: تلقائي عشري (KB / MB / GB - 1000)</option>
+                  <option value="mib">حجم البيانات: ثابت بالميجابايت (MiB)</option>
+                  <option value="gib">حجم البيانات: ثابت بالجيجابايت (GiB)</option>
+                </select>
+                <select id="sampleSpeedSelect" class="form-select form-select-sm" aria-label="سرعة القياس الفعلي">
+                  <option value="1000">سرعة القياس: فوري (كل 1 ثانية)</option>
+                  <option value="2000">سرعة القياس: قياسي (كل 2 ثانية)</option>
+                  <option value="5000">سرعة القياس: هادئ (كل 5 ثوانٍ)</option>
+                </select>
+                <span class="mono peak-badge" id="chartPeakLabel">سقف القياس: --</span>
+              </div>
+            </div>
+
+            <div class="throughput-metrics">
+              <div class="tp-stat">
+                <span class="dot dot-rx" aria-hidden="true"></span>
+                <span>التنزيل الفوري (RX)</span>
+                <strong class="mono" id="liveRxSpeed">0 bps</strong>
+                <span class="sub-total mono" id="totalRxBytes">0 B</span>
+              </div>
+              <div class="tp-stat">
+                <span class="dot dot-tx" aria-hidden="true"></span>
+                <span>الرفع الفوري (TX)</span>
+                <strong class="mono" id="liveTxSpeed">0 bps</strong>
+                <span class="sub-total mono" id="totalTxBytes">0 B</span>
+              </div>
+              <div class="tp-stat">
+                <span class="sub-label">الفاصل الزمني الفعلي للعينة (dt):</span>
+                <strong class="mono" id="actualSampleDtText">1.00 ث</strong>
+              </div>
+            </div>
+
+            <div id="net-chart-root" class="chart-wrap"></div>
+
+            <!-- Time-Window Consumption Calculator & Live Stopwatch Meter -->
+            <div class="inset-panel">
+              <div class="card-head">
+                <h4>حساب كمية الاستهلاك لمدة زمنية محددة (على الواجهة المختارة أعلاه)</h4>
+                <div class="inline-form">
+                  <select id="trafficWindowPresetSelect" class="form-select form-select-sm">
+                    <option value="60">آخر دقيقة واحدة (60 ثانية)</option>
+                    <option value="300" selected>آخر 5 دقائق</option>
+                    <option value="900">آخر 15 دقيقة</option>
+                    <option value="3600">آخر ساعة واحدة</option>
+                    <option value="21600">آخر 6 ساعات</option>
+                    <option value="86400">آخر 24 ساعة (يوم كامل)</option>
+                    <option value="604800">آخر 7 أيام (أسبوع)</option>
+                    <option value="2592000">آخر 30 يوماً (شهر)</option>
+                    <option value="0">منذ إقلاع النظام بالكامل</option>
+                    <option value="custom">مدة مخصصة يدوياً...</option>
+                  </select>
+                  <input type="number" id="trafficCustomDurationInput" class="form-input form-input-sm mono diag-port-input hidden" min="1" max="365" value="10" placeholder="المدة" />
+                  <select id="trafficCustomUnitSelect" class="form-select form-select-sm hidden">
+                    <option value="60">دقيقة</option>
+                    <option value="3600">ساعة</option>
+                    <option value="86400">يوم</option>
+                  </select>
+                  <button type="button" id="btnCalcTrafficWindow" class="btn btn-primary btn-sm">حساب الاستهلاك للمدة</button>
+                  <button type="button" id="btnToggleTrafficStopwatch" class="btn btn-primary btn-sm">بدء عداد قياس مباشر</button>
+                </div>
+              </div>
+
+              <div class="stat-cards-4">
+                <div class="inset-panel mini-stat">
+                  <span class="mini-lbl" id="winPeriodLabel">المدة المحسوبة</span>
+                  <strong class="mono" id="winCoveredText">--</strong>
+                  <span class="mini-sub mono" id="winSourceText">--</span>
+                </div>
+                <div class="inset-panel mini-stat">
+                  <span class="mini-lbl">استهلاك التنزيل (RX) في المدة</span>
+                  <strong class="mono val-success" id="winRxBytesText">--</strong>
+                  <span class="mini-sub mono" id="winAvgRxRateText">المتوسط: --</span>
+                </div>
+                <div class="inset-panel mini-stat">
+                  <span class="mini-lbl">استهلاك الرفع (TX) في المدة</span>
+                  <strong class="mono val-warning" id="winTxBytesText">--</strong>
+                  <span class="mini-sub mono" id="winAvgTxRateText">المتوسط: --</span>
+                </div>
+                <div class="inset-panel mini-stat">
+                  <span class="mini-lbl">إجمالي الاستهلاك الكلي (RX + TX)</span>
+                  <strong class="mono" id="winTotalBytesText">--</strong>
+                  <span class="mini-sub mono" id="winPeakRateText">الذروة: --</span>
+                </div>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <!-- TAB 2: ADGUARD HOME -->
+        <section id="view-adguard" class="tab-view">
+          <div class="stat-cards-4">
+            <article class="card mini-stat">
+              <span class="mini-lbl">إجمالي الاستعلامات (عينة)</span>
+              <strong class="mini-val mono" id="aghTotalQueries">0</strong>
+              <span class="mini-sub" id="aghStatusText">--</span>
+            </article>
+            <article class="card mini-stat">
+              <span class="mini-lbl">المسموح به</span>
+              <strong class="mini-val mono val-success" id="aghAllowedQueries">0</strong>
+              <span class="mini-sub mono" id="aghAllowPct">0%</span>
+            </article>
+            <article class="card mini-stat">
+              <span class="mini-lbl">المحجوب والمرفوض</span>
+              <strong class="mini-val mono val-danger" id="aghBlockedQueries">0</strong>
+              <span class="mini-sub mono" id="aghBlockPct">0%</span>
+            </article>
+            <article class="card mini-stat">
+              <span class="mini-lbl">الأجهزة النشطة / الاستجابة</span>
+              <strong class="mini-val mono" id="aghActiveClientsCount">0</strong>
+              <span class="mini-sub mono"><span id="aghAvgMs">--</span> ms | <span id="aghFiltersCount">0</span> قوائم</span>
+            </article>
+          </div>
+
+          <div class="grid-2">
+            <!-- AdGuard Controls & Creds Setup -->
+            <article class="card">
+              <div class="card-head">
+                <h3>إعدادات الحماية والتحكم</h3>
+                <div class="inline-form">
+                  <button type="button" id="btnAghRefreshFilters" class="btn btn-secondary btn-sm admin-only">تحديث قوائم الفلترة</button>
+                  <button type="button" id="btnAghClearCache" class="btn btn-secondary btn-sm admin-only">مسح الكاش</button>
+                  <button type="button" id="btnAghClearLog" class="btn btn-danger btn-sm admin-only">مسح سجل الاستعلامات</button>
+                  <button type="button" id="btnToggleAghCreds" class="btn btn-secondary btn-sm">تهيئة بيانات المحرك</button>
+                </div>
+              </div>
+
+              <div class="toggles-list">
+                <div class="toggle-item">
+                  <div>
+                    <div class="toggle-title">الحماية الرئيسية لتصفية DNS</div>
+                    <div class="toggle-sub">تفعيل أو تعطيل الفلترة على مستوى الشبكة</div>
+                  </div>
+                  <label class="switch">
+                    <input type="checkbox" id="aghProtToggle" />
+                    <span class="switch-slider"></span>
+                  </label>
+                </div>
+
+                <div class="pause-row">
+                  <select id="aghPauseSelect" class="form-select">
+                    <option value="300">إيقاف مؤقت 5 دقائق</option>
+                    <option value="900">إيقاف مؤقت 15 دقيقة</option>
+                    <option value="3600">إيقاف مؤقت ساعة واحدة</option>
+                  </select>
+                  <button type="button" id="btnAghApplyPause" class="btn btn-secondary btn-sm">تطبيق الإيقاف المؤقت</button>
+                </div>
+
+                <div class="toggle-item">
+                  <div>
+                    <div class="toggle-title">التصفح الآمن (Safe Browsing)</div>
+                    <div class="toggle-sub">حجب مواقع الاحتيال والبرمجيات الخبيثة</div>
+                  </div>
+                  <label class="switch">
+                    <input type="checkbox" id="aghSafeToggle" />
+                    <span class="switch-slider"></span>
+                  </label>
+                </div>
+
+                <div class="toggle-item">
+                  <div>
+                    <div class="toggle-title">الرقابة العائلية (Parental Control)</div>
+                    <div class="toggle-sub">حجب نطاقات المحتوى غير الملائم</div>
+                  </div>
+                  <label class="switch">
+                    <input type="checkbox" id="aghParentalToggle" />
+                    <span class="switch-slider"></span>
+                  </label>
+                </div>
+
+                <div class="toggle-item">
+                  <div>
+                    <div class="toggle-title">فرض البحث الآمن (Safe Search)</div>
+                    <div class="toggle-sub">تفعيل تصفية النتائج الصريحة في محركات البحث</div>
+                  </div>
+                  <label class="switch">
+                    <input type="checkbox" id="aghSafeSearchToggle" />
+                    <span class="switch-slider"></span>
+                  </label>
+                </div>
+
+                <div class="toggle-item">
+                  <div>
+                    <div class="toggle-title">التحقق من توقيع DNSSEC</div>
+                    <div class="toggle-sub">التحقق التشفيري من صحة سجلات النطاقات</div>
+                  </div>
+                  <label class="switch">
+                    <input type="checkbox" id="aghDnssecToggle" />
+                    <span class="switch-slider"></span>
+                  </label>
+                </div>
+
+                <div class="toggle-item">
+                  <div>
+                    <div class="toggle-title">تفعيل ذاكرة التخزين المؤقت DNS</div>
+                    <div class="toggle-sub">تسريع الاستجابة للاستعلامات المتكررة</div>
+                  </div>
+                  <label class="switch">
+                    <input type="checkbox" id="aghCacheToggle" />
+                    <span class="switch-slider"></span>
+                  </label>
+                </div>
+
+                <div class="toggle-item">
+                  <div>
+                    <div class="toggle-title">تعطيل سجلات IPv6 (AAAA)</div>
+                    <div class="toggle-sub">منع تسرب استعلامات IPv6 عند الاعتماد على IPv4 فقط</div>
+                  </div>
+                  <label class="switch">
+                    <input type="checkbox" id="aghIpv6BlockToggle" />
+                    <span class="switch-slider"></span>
+                  </label>
+                </div>
+              </div>
+
+              <div class="inset-panel admin-only">
+                <h4>ضبط أداء خادم DNS</h4>
+                <div class="form-row-3">
+                  <div class="form-group">
+                    <label for="aghUpstreamModeSelect">وضع الاستعلام</label>
+                    <select id="aghUpstreamModeSelect" class="form-select">
+                      <option value="parallel">متوازٍ (Parallel)</option>
+                      <option value="load_balance">توازن الحمل (Load Balance)</option>
+                      <option value="fastest_addr">الأسرع استجابة (Fastest)</option>
+                    </select>
+                  </div>
+                  <div class="form-group">
+                    <label for="aghCacheSizeInput">حجم الكاش (Bytes)</label>
+                    <input type="number" id="aghCacheSizeInput" class="form-input mono" min="0" max="268435456" value="67108864" />
+                  </div>
+                  <div class="form-group">
+                    <label for="aghRatelimitInput">حد الطلبات / ثانية</label>
+                    <input type="number" id="aghRatelimitInput" class="form-input mono" min="0" max="10000" value="0" />
+                  </div>
+                </div>
+                <div class="confirm-actions">
+                  <button type="button" id="btnSaveAghDnsConfig" class="btn btn-primary btn-sm">حفظ ضبط خادم DNS</button>
+                </div>
+              </div>
+
+              <!-- AdGuard Creds Configuration Box -->
+              <div id="aghCredsSetupBox" class="inset-panel hidden">
+                <h4>ربط حساب إدارة محرك التصفية المحلي (127.0.0.1:8080)</h4>
+                <div class="form-row-2">
+                  <input type="text" id="aghCredUser" class="form-input" placeholder="اسم مستخدم AdGuard" />
+                  <input type="password" id="aghCredPass" class="form-input" placeholder="كلمة مرور AdGuard" />
+                </div>
+                <button type="button" id="btnSaveAghCreds" class="btn btn-primary btn-sm">حفظ والتحقق من الاتصال</button>
+              </div>
+            </article>
+
+            <!-- Custom Filtering Rules -->
+            <article class="card">
+              <div class="card-head">
+                <h3>قواعد النطاقات المخصصة</h3>
+                <span class="sub-label">القواعد المدارة بواسطة الغرفة تحفظ بصيغة ||domain^</span>
+              </div>
+              <div class="inline-form">
+                <input type="text" id="customDnsRuleInput" class="form-input mono" placeholder="||ads.example.com^ أو @@||trusted.com^" />
+                <button type="button" id="btnAddDnsRule" class="btn btn-primary btn-sm">إضافة قاعدة</button>
+              </div>
+              <div id="aghCustomRulesList" class="rules-list"></div>
+            </article>
+          </div>
+
+          <!-- Blocked Services One-Click Control -->
+          <article class="card admin-only">
+            <div class="card-head">
+              <h3>حجب التطبيقات والخدمات بنقرة واحدة</h3>
+              <button type="button" id="btnSaveAghBlockedServices" class="btn btn-primary btn-sm">حفظ وتطبيق قائمة الحجب</button>
+            </div>
+            <div id="aghBlockedServicesGrid" class="services-pill-grid"></div>
+          </article>
+
+          <!-- DNS Rewrites & Filter Subscriptions -->
+          <div class="grid-2 admin-only">
+            <article class="card">
+              <div class="card-head"><h3>إعادة توجيه النطاقات المحلية (DNS Rewrites)</h3></div>
+              <div class="inline-form">
+                <input type="text" id="aghRewriteDomainInput" class="form-input mono" placeholder="مثال: nas.home" />
+                <input type="text" id="aghRewriteAnswerInput" class="form-input mono" placeholder="عنوان IP (192.168.1.x)" />
+                <button type="button" id="btnAddAghRewrite" class="btn btn-primary btn-sm">إضافة توجيه</button>
+              </div>
+              <div class="table-scroll">
+                <table class="data-table">
+                  <thead><tr><th>النطاق</th><th>العنوان الهدف</th><th>إجراء</th></tr></thead>
+                  <tbody id="aghRewritesBody"></tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-head"><h3>قوائم الفلاتر والاشتراكات</h3></div>
+              <div class="inline-form">
+                <select id="aghFilterPresetSelect" class="form-select">
+                  <option value="">-- اختر قائمة حجب جاهزة للتنزيل السريع --</option>
+                  <option value="OISD Blocklist Small|small.oisd.nl">قائمة OISD الشاملة للإعلانات والتتبع (Small)</option>
+                  <option value="StevenBlack Unified Hosts|raw.githubusercontent.com/StevenBlack/hosts/master/hosts">قائمة StevenBlack الموحدة للحجب</option>
+                  <option value="HaGeZi Multi Light|raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/light.txt">قائمة HaGeZi Multi Light المتوازنة</option>
+                  <option value="URLHaus Malware Filter|urlhaus.abuse.ch/downloads/hostfile/">قائمة URLHaus لحجب البرمجيات الخبيثة</option>
+                  <option value="NoCoin Crypto Filter|raw.githubusercontent.com/hoshsadiq/adblock-nocoin-list/master/hosts.txt">قائمة NoCoin لمنع تعدين العملات بالمتصفح</option>
+                </select>
+                <button type="button" id="btnApplyFilterPreset" class="btn btn-primary btn-sm">تنزيل وتفعيل القائمة المختارة</button>
+              </div>
+              <div class="inline-form">
+                <input type="text" id="aghFilterNameInput" class="form-input" placeholder="اسم القائمة المخصصة" />
+                <input type="text" id="aghFilterUrlInput" class="form-input mono" placeholder="رابط القائمة الخارجي الآمن (list.txt)" />
+                <button type="button" id="btnAddAghFilter" class="btn btn-primary btn-sm">إضافة اشتراك مخصص</button>
+              </div>
+              <div class="table-scroll">
+                <table class="data-table">
+                  <thead><tr><th>القائمة</th><th>القواعد</th><th>الحالة</th><th>التحكم</th></tr></thead>
+                  <tbody id="aghFiltersBody"></tbody>
+                </table>
+              </div>
+            </article>
+          </div>
+
+          <!-- Per-Device AdGuard Telemetry Grid -->
+          <article class="card">
+            <div class="card-head">
+              <h3>إحصائيات الاستعلامات لكل جهاز</h3>
+              <span class="sub-label">مرتبطة بسجلات الجيران ARP وتعيينات DHCP</span>
+            </div>
+            <div id="aghClientsStatsGrid" class="clients-stats-grid"></div>
+          </article>
+
+          <!-- Live Query Log Table -->
+          <article class="card">
+            <div class="card-head">
+              <h3>سجل الاستعلامات المباشر والقرارات</h3>
+              <div class="filter-bar">
+                <input type="text" id="aghQuerySearch" class="form-input form-input-sm" placeholder="بحث بالنطاق..." />
+                <select id="aghClientFilter" class="form-select form-select-sm"><option value="">جميع الأجهزة</option></select>
+                <select id="aghFilterModeSelect" class="form-select form-select-sm">
+                  <option value="all">الكل</option>
+                  <option value="blocked">المرفوض فقط</option>
+                  <option value="allowed">المسموح فقط</option>
+                </select>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>الوقت</th>
+                    <th>الجهاز</th>
+                    <th>النطاق المطلوب</th>
+                    <th>النوع</th>
+                    <th>الاستجابة</th>
+                    <th>القرار والسبب</th>
+                    <th>إجراء</th>
+                  </tr>
+                </thead>
+                <tbody id="aghQueriesContainer"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <!-- TAB 3: CLIENTS -->
+        <section id="view-clients" class="tab-view">
+          <article class="card">
+            <div class="card-head">
+              <h3>الأجهزة المتصلة وقائمة العناوين</h3>
+              <div class="filter-bar">
+                <input type="text" id="clientsSearchInput" class="form-input form-input-sm" placeholder="بحث بالاسم أو IP أو MAC..." />
+                <select id="clientsFilterSelect" class="form-select form-select-sm">
+                  <option value="all">جميع الأجهزة</option>
+                  <option value="online">المتصلة حالياً</option>
+                  <option value="blocked">المحظورة</option>
+                </select>
+                <button type="button" id="btnOpenAddDevice" class="btn btn-primary btn-sm admin-only">+ إضافة جهاز جديد</button>
+              </div>
+            </div>
+            <div id="clientsCapabilityNote" class="alert-box alert-warning hidden"></div>
+            <div id="clientPingResult" class="alert-box alert-neutral mono hidden"></div>
+
+            <!-- Interactive Client Metadata & Rate Limit & Static DHCP Editor -->
+            <div id="clientEditPanel" class="inset-panel hidden">
+              <h4 id="clientEditPanelTitle">إضافة أو تعديل بيانات الجهاز وتقييد السرعة وتثبيت DHCP</h4>
+              <div class="form-row-3">
+                <div class="form-group">
+                  <label for="clientEditMac">عنوان MAC (بصيغة aa:bb:cc:dd:ee:ff)</label>
+                  <input type="text" id="clientEditMac" class="form-input mono" placeholder="aa:bb:cc:dd:ee:ff" />
+                </div>
+                <div class="form-group">
+                  <label for="clientEditIp">عنوان IP المستهدف</label>
+                  <input type="text" id="clientEditIp" class="form-input mono" placeholder="192.168.1.x" />
+                </div>
+                <div class="form-group">
+                  <label for="clientEditName">الاسم المستعار / اسم المضيف</label>
+                  <input type="text" id="clientEditName" class="form-input" placeholder="مثال: الهاتف الشخصي" />
+                </div>
+              </div>
+              <div class="form-row-2">
+                <div class="form-group">
+                  <label for="clientEditRateKbps">حد السرعة القصوى (Kbps — أدخل 0 للإلغاء)</label>
+                  <input type="number" id="clientEditRateKbps" class="form-input mono" min="0" max="1000000" value="0" />
+                </div>
+                <div class="toggle-item">
+                  <div>
+                    <div class="toggle-title">تثبيت عنوان IP ثابت (Static DHCP)</div>
+                    <div class="toggle-sub">منح نفس العنوان دائماً لهذا الجهاز</div>
+                  </div>
+                  <label class="switch">
+                    <input type="checkbox" id="clientEditStaticChk" />
+                    <span class="switch-slider"></span>
+                  </label>
+                </div>
+              </div>
+              <div class="confirm-actions">
+                <button type="button" id="btnCancelClientMeta" class="btn btn-secondary btn-sm">إلغاء</button>
+                <button type="button" id="btnSaveClientMeta" class="btn btn-primary btn-sm">حفظ وتطبيق</button>
+              </div>
+            </div>
+
+            <!-- Deep Device Activity, Block History & Live Search Inspector -->
+            <div id="clientDeepInspectPanel" class="inset-panel hidden">
+              <div class="card-head">
+                <h4 id="clientInspectTitle">الفحص التفصيلي لنشاط الجهاز وسجل الحجب</h4>
+                <div class="inline-form">
+                  <input type="text" id="clientInspectSearchInput" class="form-input form-input-sm" placeholder="ابحث فيما يقوم به الجهاز (نطاق، عنوان IP، منفذ، بروتوكول)..." />
+                  <button type="button" id="btnRefreshClientInspect" class="btn btn-primary btn-sm">تحديث النشاط الحي</button>
+                  <button type="button" id="btnCloseClientInspect" class="btn btn-secondary btn-sm">إغلاق النافذة</button>
+                </div>
+              </div>
+              <div id="clientInspectIdentityGrid" class="stat-cards-4"></div>
+              <div id="clientInspectTopDomains" class="list-chips"></div>
+              <div>
+                <h4 class="sub-heading">الاتصالات الحية الجارية حالياً (Conntrack Active Sessions)</h4>
+                <div class="table-scroll table-scroll-bounded">
+                  <table class="data-table">
+                    <thead><tr><th>البروتوكول</th><th>الحالة</th><th>المصدر</th><th>الوجهة والمنفذ</th><th>البيانات</th></tr></thead>
+                    <tbody id="clientInspectFlowsBody"></tbody>
+                  </table>
+                </div>
+              </div>
+              <div>
+                <h4 class="sub-heading">نشاط DNS المباشر (ما يطلبه الجهاز حالياً)</h4>
+                <div class="table-scroll table-scroll-bounded">
+                  <table class="data-table">
+                    <thead><tr><th>الوقت</th><th>النطاق المطلوب</th><th>النوع</th><th>القرار</th><th>إجراء</th></tr></thead>
+                    <tbody id="clientInspectDnsBody"></tbody>
+                  </table>
+                </div>
+              </div>
+              <div>
+                <h4 class="sub-heading">سجل النطاقات المحجوبة على هذا الجهاز (DNS Block History)</h4>
+                <div class="table-scroll table-scroll-bounded">
+                  <table class="data-table">
+                    <thead><tr><th>الوقت</th><th>النطاق المحجوب</th><th>قاعدة الحجب</th><th>إجراء</th></tr></thead>
+                    <tbody id="clientInspectBlockedBody"></tbody>
+                  </table>
+                </div>
+              </div>
+              <div>
+                <h4 class="sub-heading">تاريخ الحجب الإداري وتقييد السرعة للجهاز (Audit History)</h4>
+                <div class="table-scroll table-scroll-bounded">
+                  <table class="data-table">
+                    <thead><tr><th>التوقيت</th><th>العملية</th><th>الهدف</th><th>النتيجة</th><th>التفاصيل</th></tr></thead>
+                    <tbody id="clientInspectAuditBody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>الجهاز</th>
+                    <th>عنوان IP</th>
+                    <th>عنوان MAC</th>
+                    <th>الحالة / المميزات</th>
+                    <th>الاستهلاك الكلي (RX / TX)</th>
+                    <th>حالة الجسر/ARP</th>
+                    <th>التحكم</th>
+                  </tr>
+                </thead>
+                <tbody id="clientsTableBody"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="card admin-only">
+            <div class="card-head">
+              <h3>حجوزات العناوين الثابتة (Static DHCP Leases)</h3>
+              <span class="sub-label">إضافة جهاز ثابت جديد أو إدارة الحجوزات الحالية</span>
+            </div>
+            <div class="inline-form">
+              <input type="text" id="staticLeaseNameInput" class="form-input" placeholder="اسم الجهاز (مثال: Smart-TV)" />
+              <input type="text" id="staticLeaseMacInput" class="form-input mono" placeholder="عنوان MAC (aa:bb:cc:dd:ee:ff)" />
+              <input type="text" id="staticLeaseIpInput" class="form-input mono" placeholder="عنوان IP (192.168.1.x)" />
+              <button type="button" id="btnAddStaticLease" class="btn btn-primary btn-sm">إضافة حجز ثابت</button>
+            </div>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead><tr><th>الاسم</th><th>عنوان MAC</th><th>عنوان IP</th><th>المدة</th><th>إجراء</th></tr></thead>
+                <tbody id="clientsStaticLeasesBody"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="card admin-only">
+              <div class="card-head"><h3>سجلات النطاقات المحلية الثابتة (Local Domains)</h3></div>
+              <div class="inline-form">
+                <input type="text" id="clientDomainNameInput" class="form-input mono" placeholder="اسم المضيف (مثال: media.lan)" />
+                <input type="text" id="clientDomainIpInput" class="form-input mono" placeholder="عنوان IP (192.168.1.x)" />
+                <button type="button" id="btnAddClientDomain" class="btn btn-primary btn-sm">إضافة نطاق</button>
+              </div>
+              <div class="table-scroll">
+                <table class="data-table">
+                  <thead><tr><th>النطاق المحلي</th><th>عنوان IP</th><th>إجراء</th></tr></thead>
+                  <tbody id="clientsDomainsBody"></tbody>
+                </table>
+              </div>
+            </article>
+        </section>
+
+        <!-- TAB 4: NETWORK & ROUTING -->
+        <section id="view-network" class="tab-view">
+          <article class="card admin-only">
+            <div class="card-head">
+              <h3>التحكم بالوصلات الخارجية وبروتوكول DNS</h3>
+              <div class="inline-form">
+                <button type="button" id="btnNetReconnectWan" class="btn btn-secondary btn-sm">إعادة ربط منفذ WAN</button>
+                <button type="button" id="btnNetReconnectWwan" class="btn btn-secondary btn-sm">إعادة ربط الوصلة اللاسلكية</button>
+                <button type="button" id="btnNetFlushDns" class="btn btn-primary btn-sm">تحديث خدمة DNS</button>
+              </div>
+            </div>
+          </article>
+          <div class="grid-2">
+            <article class="card" id="netWanCard">
+              <div class="card-head"><h3>حالة منافذ الارتباط الخارجي والمسارات</h3></div>
+              <div id="netWanDetails" class="kv-stack"></div>
+            </article>
+            <article class="card" id="netLanCard">
+              <div class="card-head"><h3>حالة الشبكة المحلية LAN</h3></div>
+              <div id="netLanDetails" class="kv-stack"></div>
+            </article>
+          </div>
+
+          <div class="grid-2 admin-only">
+            <article class="card">
+              <div class="card-head">
+                <h3>ضبط خادم DHCP والمحلل المحلي (Dnsmasq)</h3>
+                <button type="button" id="btnSaveNetDhcp" class="btn btn-primary btn-sm">حفظ وتطبيق DHCP</button>
+              </div>
+              <div class="form-row-2">
+                <div class="form-group">
+                  <label for="netDhcpStart">بداية النطاق (Start)</label>
+                  <input type="number" id="netDhcpStart" class="form-input mono" min="2" max="250" value="5" />
+                </div>
+                <div class="form-group">
+                  <label for="netDhcpLimit">عدد العناوين (Limit)</label>
+                  <input type="number" id="netDhcpLimit" class="form-input mono" min="5" max="250" value="31" />
+                </div>
+              </div>
+              <div class="form-row-2">
+                <div class="form-group">
+                  <label for="netDhcpLease">مدة الإيجار (Lease Time)</label>
+                  <input type="text" id="netDhcpLease" class="form-input mono" value="1h" placeholder="1h أو 12h أو infinite" />
+                </div>
+                <div class="form-group">
+                  <label for="netDhcpCacheSize">حجم ذاكرة DNS (Cache Size)</label>
+                  <input type="number" id="netDhcpCacheSize" class="form-input mono" min="0" max="10000" value="1000" />
+                </div>
+              </div>
+              <div class="toggle-item">
+                <div>
+                  <div class="toggle-title">الحماية من ارتداد DNS (Rebind Protection)</div>
+                  <div class="toggle-sub">منع النطاقات الخارجية من التحليل إلى عناوين خاصة</div>
+                </div>
+                <label class="switch">
+                  <input type="checkbox" id="netDhcpRebindChk" checked />
+                  <span class="switch-slider"></span>
+                </label>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-head">
+                <h3>إعدادات منفذ WAN (PPPoE) وتوجيه الحزم</h3>
+                <button type="button" id="btnSaveNetWan" class="btn btn-primary btn-sm">حفظ إعدادات WAN</button>
+              </div>
+              <div class="form-row-2">
+                <div class="form-group">
+                  <label for="netWanUser">اسم مستخدم الاشتراك (PPPoE)</label>
+                  <input type="text" id="netWanUser" class="form-input mono" placeholder="اسم المستخدم لدى المزود" />
+                </div>
+                <div class="form-group">
+                  <label for="netWanPass">كلمة مرور الاشتراك (اتركها فارغة للإبقاء)</label>
+                  <input type="password" id="netWanPass" class="form-input" placeholder="********" />
+                </div>
+              </div>
+              <div class="form-row-2">
+                <div class="form-group">
+                  <label for="netWanMtu">وحدة النقل القصوى (MTU)</label>
+                  <input type="number" id="netWanMtu" class="form-input mono" min="576" max="1500" value="1492" />
+                </div>
+                <div class="form-group">
+                  <label for="netWanMetric">أولوية المسار (Metric)</label>
+                  <input type="number" id="netWanMetric" class="form-input mono" min="1" max="1000" value="10" />
+                </div>
+              </div>
+              <div class="form-row-2">
+                <div class="toggle-item">
+                  <span class="toggle-title">اتصال تلقائي عند الإقلاع</span>
+                  <label class="switch"><input type="checkbox" id="netWanAutoChk" /><span class="switch-slider"></span></label>
+                </div>
+                <div class="toggle-item">
+                  <span class="toggle-title">توزيع الحزم على الأنوية (Packet Steering)</span>
+                  <label class="switch"><input type="checkbox" id="netPacketSteeringChk" checked /><span class="switch-slider"></span></label>
+                </div>
+              </div>
+            </article>
+          </div>
+
+          <div class="grid-2 admin-only">
+            <article class="card">
+              <div class="card-head">
+                <h3>الوصلة اللاسلكية الصاعدة (wlan0) ومسح الشبكات</h3>
+                <div class="inline-form">
+                  <button type="button" id="btnWifiScan" class="btn btn-secondary btn-sm">مسح الشبكات المجاورة</button>
+                  <button type="button" id="btnSaveWifiUplink" class="btn btn-primary btn-sm">حفظ وربط الشبكة</button>
+                </div>
+              </div>
+              <div class="form-row-2">
+                <div class="form-group">
+                  <label for="wifiUplinkSsid">اسم شبكة الارتباط (SSID)</label>
+                  <input type="text" id="wifiUplinkSsid" class="form-input mono" placeholder="اسم الشبكة اللاسلكية" />
+                </div>
+                <div class="form-group">
+                  <label for="wifiUplinkPsk">كلمة المرور (اتركها فارغة للإبقاء على الحالية)</label>
+                  <input type="password" id="wifiUplinkPsk" class="form-input" placeholder="8..63 محرفاً" />
+                </div>
+              </div>
+              <div class="table-scroll">
+                <table class="data-table">
+                  <thead><tr><th>الشبكة (SSID)</th><th>الإشارة</th><th>التردد</th><th>الحماية</th><th>اختيار</th></tr></thead>
+                  <tbody id="wifiScanBody"></tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-head">
+                <h3>نقطة الوصول اللاسلكية المحلية 5GHz (radio0)</h3>
+                <button type="button" id="btnSaveWifiAp" class="btn btn-primary btn-sm">حفظ إعدادات البث</button>
+              </div>
+              <div class="toggle-item">
+                <div>
+                  <div class="toggle-title">تفعيل البث اللاسلكي المحلي (Access Point)</div>
+                  <div class="toggle-sub">يتطلب تشفير WPA2 أو WPA3 ومفتاح أمان صالح</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="wifiApEnableChk" /><span class="switch-slider"></span></label>
+              </div>
+              <div class="form-row-2">
+                <div class="form-group">
+                  <label for="wifiApSsid">اسم الشبكة المحلية (SSID)</label>
+                  <input type="text" id="wifiApSsid" class="form-input mono" value="Gateway-AP" />
+                </div>
+                <div class="form-group">
+                  <label for="wifiApKey">مفتاح الأمان (WPA Key)</label>
+                  <input type="password" id="wifiApKey" class="form-input" placeholder="8..63 محرفاً" />
+                </div>
+              </div>
+              <div class="form-row-3">
+                <div class="form-group">
+                  <label for="wifiApEnc">التشفير</label>
+                  <select id="wifiApEnc" class="form-select">
+                    <option value="psk2">WPA2-PSK (CCMP)</option>
+                    <option value="sae-mixed">WPA2/WPA3 Mixed</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="wifiApChannel">القناة (Channel)</label>
+                  <select id="wifiApChannel" class="form-select mono">
+                    <option value="36">36 (5180 MHz)</option>
+                    <option value="40">40 (5200 MHz)</option>
+                    <option value="44">44 (5220 MHz)</option>
+                    <option value="48">48 (5240 MHz)</option>
+                    <option value="149">149 (5745 MHz)</option>
+                    <option value="auto">Auto</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="wifiApHtmode">عرض النطاق</label>
+                  <select id="wifiApHtmode" class="form-select mono">
+                    <option value="HT20">HT20</option>
+                    <option value="HT40">HT40</option>
+                    <option value="VHT40">VHT40</option>
+                    <option value="VHT80">VHT80</option>
+                  </select>
+                </div>
+              </div>
+            </article>
+          </div>
+
+          <article class="card admin-only">
+            <div class="card-head"><h3>جدول المسارات الثابتة المخصصة (Static Routes)</h3></div>
+            <div class="inline-form">
+              <select id="routeIfaceSelect" class="form-select">
+                <option value="wwan">wwan (wlan0)</option>
+                <option value="wan">wan (pppoe)</option>
+                <option value="lan">lan (br-lan)</option>
+              </select>
+              <input type="text" id="routeTargetInput" class="form-input mono" placeholder="الشبكة الهدف (مثال: 10.10.0.0)" />
+              <input type="text" id="routeMaskInput" class="form-input mono" value="255.255.255.0" placeholder="القناع Netmask" />
+              <input type="text" id="routeGwInput" class="form-input mono" placeholder="البوابة Gateway" />
+              <input type="number" id="routeMetricInput" class="form-input mono diag-port-input" min="0" max="1000" value="10" placeholder="Metric" />
+              <button type="button" id="btnAddStaticRoute" class="btn btn-primary btn-sm">إضافة مسار</button>
+            </div>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead><tr><th>الواجهة</th><th>الهدف</th><th>القناع</th><th>البوابة</th><th>الأولوية</th><th>إجراء</th></tr></thead>
+                <tbody id="staticRoutesBody"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head"><h3>تفاصيل جميع الواجهات الشبكية</h3></div>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>الواجهة</th>
+                    <th>الحالة</th>
+                    <th>السرعة</th>
+                    <th>MTU</th>
+                    <th>عنوان MAC</th>
+                    <th>الاستقبال RX</th>
+                    <th>الإرسال TX</th>
+                    <th>أخطاء / فقدان</th>
+                  </tr>
+                </thead>
+                <tbody id="netInterfacesTableBody"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <!-- TAB 5: SQM -->
+        <section id="view-sqm" class="tab-view">
+          <article class="card">
+            <div class="card-head">
+              <h3>إدارة جودة الخدمة وتشكيل التدفق (SQM CAKE)</h3>
+              <span class="status-pill pill-neutral" id="sqmStatusBadge">--</span>
+            </div>
+            <div id="sqmDriftAlert" class="alert-box alert-warning hidden"></div>
+            <div id="sqmConfigGrid" class="kv-stack"></div>
+
+            <div id="sqmEditorCard" class="inset-panel admin-only">
+              <div class="card-head">
+                <h4>ضبط وتعديل إعدادات SQM المتقدمة</h4>
+                <button type="button" id="btnSqmBindActive" class="btn btn-secondary btn-sm">ربط بالمنفذ النشط تلقائياً</button>
+              </div>
+              <div class="form-row-3">
+                <div class="toggle-item">
+                  <span class="toggle-title">تفعيل تشكيل التدفق</span>
+                  <label class="switch">
+                    <input type="checkbox" id="sqmEnableToggle" />
+                    <span class="switch-slider"></span>
+                  </label>
+                </div>
+                <div class="form-group">
+                  <label for="sqmIfaceSelect">الواجهة المستهدفة</label>
+                  <select id="sqmIfaceSelect" class="form-select">
+                    <option value="pppoe-wan">pppoe-wan</option>
+                    <option value="wlan0">wlan0</option>
+                    <option value="eth0">eth0</option>
+                    <option value="br-lan">br-lan</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="sqmQdiscSelect">خوارزمية الطابور</label>
+                  <select id="sqmQdiscSelect" class="form-select">
+                    <option value="cake">cake</option>
+                    <option value="fq_codel">fq_codel</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-row-3">
+                <div class="form-group">
+                  <label for="sqmDownInput">سرعة التنزيل (Kbps)</label>
+                  <input type="number" id="sqmDownInput" class="form-input mono" min="0" max="1000000" value="2000" />
+                </div>
+                <div class="form-group">
+                  <label for="sqmUpInput">سرعة الرفع (Kbps)</label>
+                  <input type="number" id="sqmUpInput" class="form-input mono" min="0" max="1000000" value="4000" />
+                </div>
+                <div class="form-group">
+                  <label for="sqmOverheadInput">حمل التغليف Overhead (bytes)</label>
+                  <input type="number" id="sqmOverheadInput" class="form-input mono" min="0" max="128" value="44" />
+                </div>
+              </div>
+              <div class="form-row-4">
+                <div class="form-group">
+                  <label for="sqmLinklayerSelect">طبقة الارتباط (Linklayer)</label>
+                  <select id="sqmLinklayerSelect" class="form-select mono">
+                    <option value="ethernet">ethernet</option>
+                    <option value="atm">atm</option>
+                    <option value="none">none</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="sqmIngressEcnSelect">إشعار الازدحام وارد (Ingress ECN)</label>
+                  <select id="sqmIngressEcnSelect" class="form-select mono">
+                    <option value="ECN">ECN</option>
+                    <option value="NOECN">NOECN</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="sqmEgressEcnSelect">إشعار الازدحام صادر (Egress ECN)</label>
+                  <select id="sqmEgressEcnSelect" class="form-select mono">
+                    <option value="ECN">ECN</option>
+                    <option value="NOECN">NOECN</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="sqmVerbosityInput">مستوى السجل (Verbosity 0..10)</label>
+                  <input type="number" id="sqmVerbosityInput" class="form-input mono" min="0" max="10" value="5" />
+                </div>
+              </div>
+              <div class="form-row-3">
+                <div class="toggle-item">
+                  <span class="toggle-title">تصفير علامات DSCP (Squash DSCP)</span>
+                  <label class="switch"><input type="checkbox" id="sqmSquashDscpChk" checked /><span class="switch-slider"></span></label>
+                </div>
+                <div class="toggle-item">
+                  <span class="toggle-title">توحيد أولوية الوارد (Squash Ingress)</span>
+                  <label class="switch"><input type="checkbox" id="sqmSquashIngressChk" checked /><span class="switch-slider"></span></label>
+                </div>
+                <div class="form-group">
+                  <label for="sqmScriptSelect">نص التشغيل</label>
+                  <select id="sqmScriptSelect" class="form-select mono">
+                    <option value="piece_of_cake.qos">piece_of_cake.qos</option>
+                    <option value="layer_cake.qos">layer_cake.qos</option>
+                    <option value="simple.qos">simple.qos</option>
+                  </select>
+                </div>
+              </div>
+              <div class="confirm-actions">
+                <button type="button" id="btnSaveSqm" class="btn btn-primary btn-sm">حفظ وتطبيق SQM</button>
+              </div>
+            </div>
+
+            <h4 class="sub-heading">إحصائيات الطابور الفعلي (tc -s qdisc)</h4>
+            <pre id="sqmTcStatsPre" class="log-pre mono"></pre>
+          </article>
+        </section>
+
+        <!-- TAB 6: FIREWALL -->
+        <section id="view-firewall" class="tab-view">
+          <article class="card">
+            <div class="card-head">
+              <h3>ملخص الجدار الناري وحماية الحظر</h3>
+              <span class="status-pill pill-neutral" id="fwBanipBadge">--</span>
+            </div>
+            <div id="fwZonesGrid" class="zones-grid"></div>
+            <div class="inset-panel admin-only">
+              <div class="card-head">
+                <h4>الخيارات العامة للجدار الناري ومنطقة WAN</h4>
+                <button type="button" id="btnSaveFwDefaults" class="btn btn-primary btn-sm">حفظ الخيارات العامة</button>
+              </div>
+              <div class="form-row-4">
+                <div class="toggle-item">
+                  <span class="toggle-title">حماية فيضان SYN</span>
+                  <label class="switch"><input type="checkbox" id="fwSynFloodChk" checked /><span class="switch-slider"></span></label>
+                </div>
+                <div class="toggle-item">
+                  <span class="toggle-title">إسقاط الحزم التالفة (Drop Invalid)</span>
+                  <label class="switch"><input type="checkbox" id="fwDropInvalidChk" /><span class="switch-slider"></span></label>
+                </div>
+                <div class="toggle-item">
+                  <span class="toggle-title">تغطية الشبكة (WAN Masquerade)</span>
+                  <label class="switch"><input type="checkbox" id="fwWanMasqChk" checked /><span class="switch-slider"></span></label>
+                </div>
+                <div class="toggle-item">
+                  <span class="toggle-title">ضبط حجم الرزمة (WAN MSS Clamping)</span>
+                  <label class="switch"><input type="checkbox" id="fwWanMtuFixChk" checked /><span class="switch-slider"></span></label>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head"><h3>قواعد المرور (Firewall Rules)</h3></div>
+            <div class="inset-panel admin-only">
+              <h4>إضافة قاعدة مرور مخصصة (مع فحص fw4 التلقائي)</h4>
+              <div class="inline-form">
+                <input type="text" id="fwRuleName" class="form-input" placeholder="اسم القاعدة" />
+                <select id="fwRuleSrc" class="form-select">
+                  <option value="lan">المصدر: LAN</option>
+                  <option value="wan">المصدر: WAN</option>
+                  <option value="docker">المصدر: Docker</option>
+                </select>
+                <select id="fwRuleDest" class="form-select">
+                  <option value="wan">الوجهة: WAN</option>
+                  <option value="lan">الوجهة: LAN</option>
+                  <option value="">الوجهة: الجهاز نفسه (Input)</option>
+                </select>
+                <select id="fwRuleProto" class="form-select">
+                  <option value="tcp">TCP</option>
+                  <option value="udp">UDP</option>
+                  <option value="tcp udp">TCP+UDP</option>
+                  <option value="icmp">ICMP</option>
+                  <option value="all">الكل</option>
+                </select>
+                <input type="text" id="fwRuleSrcIp" class="form-input mono" placeholder="IP المصدر (اختياري)" />
+                <input type="text" id="fwRulePort" class="form-input mono diag-port-input" placeholder="المنفذ" />
+                <select id="fwRuleTarget" class="form-select">
+                  <option value="ACCEPT">ACCEPT (سماح)</option>
+                  <option value="DROP">DROP (إسقاط)</option>
+                  <option value="REJECT">REJECT (رفض)</option>
+                </select>
+                <button type="button" id="btnAddFwRule" class="btn btn-primary btn-sm">إضافة القاعدة</button>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>الاسم</th>
+                    <th>المصدر</th>
+                    <th>الوجهة</th>
+                    <th>البروتوكول</th>
+                    <th>المنفذ</th>
+                    <th>الإجراء</th>
+                    <th>الحالة</th>
+                    <th>تبديل / حذف</th>
+                  </tr>
+                </thead>
+                <tbody id="fwRulesBody"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head"><h3>قواعد التحويل (Port Forwarding &amp; UPnP)</h3></div>
+            <div class="inset-panel admin-only">
+              <h4>إضافة قاعدة تحويل منفذ (مع حماية المنافذ الإدارية)</h4>
+              <div class="inline-form">
+                <input type="text" id="fwFwdName" class="form-input" placeholder="وصف القاعدة (مثال: WebApp)" />
+                <select id="fwFwdProto" class="form-select">
+                  <option value="tcp">TCP</option>
+                  <option value="udp">UDP</option>
+                  <option value="tcp udp">TCP+UDP</option>
+                </select>
+                <input type="number" id="fwFwdExtPort" class="form-input mono" min="1" max="65535" placeholder="المنفذ الخارجي" />
+                <input type="text" id="fwFwdIntIp" class="form-input mono" placeholder="IP الداخلي (192.168.1.x)" />
+                <input type="number" id="fwFwdIntPort" class="form-input mono" min="1" max="65535" placeholder="المنفذ الداخلي" />
+                <button type="button" id="btnAddFwRedirect" class="btn btn-primary btn-sm">إضافة التحويل</button>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>الوصف</th>
+                    <th>المصدر / البروتوكول</th>
+                    <th>المنفذ الخارجي</th>
+                    <th>الوجهة الداخلية</th>
+                    <th>الحالة</th>
+                    <th>إجراء</th>
+                  </tr>
+                </thead>
+                <tbody id="fwRedirectsBody"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <div class="grid-2 admin-only">
+            <article class="card">
+              <div class="card-head">
+                <h3>منظومة الحظر الوقائي (banIP)</h3>
+                <button type="button" id="btnSaveBanip" class="btn btn-primary btn-sm">حفظ إعدادات banIP</button>
+              </div>
+              <div class="form-row-3">
+                <div class="toggle-item">
+                  <span class="toggle-title">تفعيل banIP</span>
+                  <label class="switch"><input type="checkbox" id="banipEnableChk" /><span class="switch-slider"></span></label>
+                </div>
+                <div class="toggle-item">
+                  <span class="toggle-title">حظر تلقائي للمهاجمين</span>
+                  <label class="switch"><input type="checkbox" id="banipAutoBlockChk" checked /><span class="switch-slider"></span></label>
+                </div>
+                <div class="toggle-item">
+                  <span class="toggle-title">سماح تلقائي للشبكة</span>
+                  <label class="switch"><input type="checkbox" id="banipAutoAllowChk" checked /><span class="switch-slider"></span></label>
+                </div>
+              </div>
+              <div class="form-row-3">
+                <div class="form-group">
+                  <label for="banipIcmpInput">حد ICMP Flood</label>
+                  <input type="number" id="banipIcmpInput" class="form-input mono" min="1" max="1000" value="25" />
+                </div>
+                <div class="form-group">
+                  <label for="banipSynInput">حد SYN Flood</label>
+                  <input type="number" id="banipSynInput" class="form-input mono" min="1" max="1000" value="10" />
+                </div>
+                <div class="form-group">
+                  <label for="banipUdpInput">حد UDP Flood</label>
+                  <input type="number" id="banipUdpInput" class="form-input mono" min="1" max="5000" value="100" />
+                </div>
+              </div>
+              <div class="inline-form">
+                <input type="text" id="banipEntryInput" class="form-input mono" placeholder="عنوان IP أو CIDR (مثال: 203.0.113.5)" />
+                <select id="banipListTypeSelect" class="form-select">
+                  <option value="blocklist">قائمة الحظر (Blocklist)</option>
+                  <option value="allowlist">قائمة السماح (Allowlist)</option>
+                </select>
+                <button type="button" id="btnAddBanipEntry" class="btn btn-secondary btn-sm">إضافة للقائمة</button>
+              </div>
+              <div>
+                <div class="sub-label">عناوين محظورة يدوياً:</div>
+                <div id="banipBlocklistContainer" class="list-chips"></div>
+              </div>
+              <div>
+                <div class="sub-label">عناوين مسموحة يدوياً:</div>
+                <div id="banipAllowlistContainer" class="list-chips"></div>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-head">
+                <h3>إعدادات فتح المنافذ التلقائي (UPnP / NAT-PMP)</h3>
+                <button type="button" id="btnSaveUpnp" class="btn btn-primary btn-sm">حفظ وتطبيق UPnP</button>
+              </div>
+              <div class="form-row-3">
+                <div class="toggle-item">
+                  <span class="toggle-title">تفعيل الخدمة</span>
+                  <label class="switch"><input type="checkbox" id="upnpEnableChk" checked /><span class="switch-slider"></span></label>
+                </div>
+                <div class="toggle-item">
+                  <span class="toggle-title">بروتوكول NAT-PMP</span>
+                  <label class="switch"><input type="checkbox" id="upnpNatpmpChk" checked /><span class="switch-slider"></span></label>
+                </div>
+                <div class="toggle-item">
+                  <span class="toggle-title">الوضع الآمن (Secure Mode)</span>
+                  <label class="switch"><input type="checkbox" id="upnpSecureChk" checked /><span class="switch-slider"></span></label>
+                </div>
+              </div>
+              <div class="form-row-2">
+                <div class="form-group">
+                  <label for="upnpExtIfaceSelect">واجهة الإنترنت الخارجية</label>
+                  <select id="upnpExtIfaceSelect" class="form-select mono">
+                    <option value="wwan">wwan (wlan0)</option>
+                    <option value="wan">wan (pppoe)</option>
+                  </select>
+                </div>
+                <div class="toggle-item">
+                  <span class="toggle-title">اكتشاف STUN الخارجي</span>
+                  <label class="switch"><input type="checkbox" id="upnpStunChk" checked /><span class="switch-slider"></span></label>
+                </div>
+              </div>
+              <div class="form-row-2">
+                <div class="form-group">
+                  <label for="upnpStunHostInput">خادم STUN</label>
+                  <input type="text" id="upnpStunHostInput" class="form-input mono" value="stun.cloudflare.com" />
+                </div>
+                <div class="form-group">
+                  <label for="upnpStunPortInput">منفذ STUN</label>
+                  <input type="number" id="upnpStunPortInput" class="form-input mono" min="1" max="65535" value="3478" />
+                </div>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <!-- TAB 7: DOCKER -->
+        <section id="view-docker" class="tab-view">
+          <article class="card">
+            <div class="card-head">
+              <h3>محرك الحاويات البرمجية</h3>
+              <span class="status-pill pill-neutral" id="dockerStateBadge">--</span>
+            </div>
+            <div id="dockerStateBanner" class="alert-box alert-neutral"></div>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>المعرف</th>
+                    <th>الاسم</th>
+                    <th>الصورة</th>
+                    <th>الحالة</th>
+                    <th>التفاصيل</th>
+                    <th>المنافذ</th>
+                    <th>التحكم وسياسة الإقلاع</th>
+                  </tr>
+                </thead>
+                <tbody id="dockerContainersBody"></tbody>
+              </table>
+            </div>
+            <pre id="dockerLogsPre" class="log-pre mono hidden"></pre>
+          </article>
+          <article class="card">
+            <div class="card-head">
+              <h3>صور الحاويات المحلية (Images)</h3>
+              <button type="button" id="btnDockerPruneImages" class="btn btn-secondary btn-sm admin-only">تنظيف الصور اليتيمة (Dangling)</button>
+            </div>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>المستودع والوسم</th>
+                    <th>المعرف</th>
+                    <th>الحجم</th>
+                  </tr>
+                </thead>
+                <tbody id="dockerImagesBody"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <div class="grid-2">
+            <article class="card">
+              <div class="card-head"><h3>شبكات الحاويات (Docker Networks)</h3></div>
+              <div class="table-scroll">
+                <table class="data-table">
+                  <thead><tr><th>اسم الشبكة</th><th>المشغل (Driver)</th><th>النطاق (Scope)</th></tr></thead>
+                  <tbody id="dockerNetworksBody"></tbody>
+                </table>
+              </div>
+            </article>
+            <article class="card">
+              <div class="card-head"><h3>أحجام التخزين الدائمة (Docker Volumes)</h3></div>
+              <div class="table-scroll">
+                <table class="data-table">
+                  <thead><tr><th>اسم الحجم</th><th>المشغل (Driver)</th></tr></thead>
+                  <tbody id="dockerVolumesBody"></tbody>
+                </table>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <!-- TAB 8: TAILSCALE -->
+        <section id="view-tailscale" class="tab-view">
+          <article class="card">
+            <div class="card-head">
+              <h3>عقدة الشبكة الخاصة المشفرة</h3>
+              <div class="inline-form">
+                <button type="button" id="btnTsNetcheck" class="btn btn-secondary btn-sm admin-only">فحص الشبكة (Netcheck)</button>
+                <button type="button" id="btnTsReconnect" class="btn btn-primary btn-sm admin-only">إعادة تشغيل اتصال VPN</button>
+                <span class="status-pill pill-neutral" id="tsStateBadge">--</span>
+              </div>
+            </div>
+            <div id="tsSelfCard" class="kv-stack"></div>
+
+            <div class="inset-panel admin-only">
+              <div class="card-head">
+                <h4>خصائص التوجيه والأمان (tailscale set)</h4>
+                <button type="button" id="btnSaveTsFlags" class="btn btn-primary btn-sm">حفظ خصائص الشبكة الخاصة</button>
+              </div>
+              <div class="form-row-4">
+                <div class="toggle-item">
+                  <span class="toggle-title">قبول مسارات الأقران (Accept Routes)</span>
+                  <label class="switch"><input type="checkbox" id="tsAcceptRoutesChk" /><span class="switch-slider"></span></label>
+                </div>
+                <div class="toggle-item">
+                  <span class="toggle-title">استخدام DNS الشبكة (Accept DNS)</span>
+                  <label class="switch"><input type="checkbox" id="tsAcceptDnsChk" /><span class="switch-slider"></span></label>
+                </div>
+                <div class="toggle-item">
+                  <span class="toggle-title">رفع الدروع (Shields Up)</span>
+                  <label class="switch"><input type="checkbox" id="tsShieldsUpChk" /><span class="switch-slider"></span></label>
+                </div>
+                <div class="toggle-item">
+                  <span class="toggle-title">إعلان الشبكة المحلية (192.168.1.0/24)</span>
+                  <label class="switch"><input type="checkbox" id="tsAdvLanChk" checked /><span class="switch-slider"></span></label>
+                </div>
+              </div>
+            </div>
+
+            <h4 class="sub-heading">حالة الوكيل العكسي (Tailscale Serve)</h4>
+            <pre id="tsServeStatusPre" class="log-pre mono">--</pre>
+            <pre id="tsDiagPre" class="log-pre mono hidden"></pre>
+          </article>
+          <article class="card">
+            <div class="card-head"><h3>الأقران المتصلون في الشبكة الخاصة</h3></div>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>الاسم</th>
+                    <th>النظام</th>
+                    <th>عناوين VPN</th>
+                    <th>الحالة</th>
+                    <th>البيانات المستلمة / المرسلة</th>
+                    <th>عقدة خروج</th>
+                    <th>فحص</th>
+                  </tr>
+                </thead>
+                <tbody id="tsPeersBody"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <!-- TAB 9: SERVICES & ACCESS -->
+        <section id="view-services" class="tab-view">
+          <article class="card">
+            <div class="card-head">
+              <h3>الخدمات النظامية المعتمدة</h3>
+              <span class="sub-label">إدارة التشغيل والإقلاع التلقائي عبر procd مع حماية الخدمات الأساسية</span>
+            </div>
+            <div id="servicesGrid" class="services-grid"></div>
+          </article>
+
+          <div class="grid-2 admin-only">
+            <article class="card">
+              <div class="card-head">
+                <h3>إعدادات النظام العامة والتوقيت (NTP)</h3>
+                <button type="button" id="btnSaveSysGeneral" class="btn btn-primary btn-sm">حفظ إعدادات النظام</button>
+              </div>
+              <div class="form-row-3">
+                <div class="form-group">
+                  <label for="sysHostnameInput">اسم البوابة (Hostname)</label>
+                  <input type="text" id="sysHostnameInput" class="form-input mono" value="Gateway" />
+                </div>
+                <div class="form-group">
+                  <label for="sysZonenameSelect">المنطقة الزمنية</label>
+                  <select id="sysZonenameSelect" class="form-select mono">
+                    <option value="Asia/Baghdad|<-03>-3">Asia/Baghdad (GMT+3)</option>
+                    <option value="UTC|GMT0">UTC (GMT0)</option>
+                    <option value="Asia/Riyadh|<-03>-3">Asia/Riyadh (GMT+3)</option>
+                    <option value="Asia/Dubai|<-04>-4">Asia/Dubai (GMT+4)</option>
+                    <option value="Africa/Cairo|EET-2">Africa/Cairo (GMT+2)</option>
+                    <option value="Europe/Istanbul|<-03>-3">Europe/Istanbul (GMT+3)</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="sysLogSizeInput">حجم سجل النظام (KiB)</label>
+                  <input type="number" id="sysLogSizeInput" class="form-input mono" min="16" max="1024" value="128" />
+                </div>
+              </div>
+              <div class="form-row-2">
+                <div class="toggle-item">
+                  <span class="toggle-title">مزامنة التوقيت التلقائية (NTP Client)</span>
+                  <label class="switch"><input type="checkbox" id="sysNtpEnableChk" checked /><span class="switch-slider"></span></label>
+                </div>
+                <div class="toggle-item">
+                  <span class="toggle-title">تخديم التوقيت للشبكة المحلية (NTP Server)</span>
+                  <label class="switch"><input type="checkbox" id="sysNtpServerChk" /><span class="switch-slider"></span></label>
+                </div>
+              </div>
+              <div class="form-group">
+                <label for="sysNtpServersInput">خوادم التوقيت NTP (مفصولة بفاصلة)</label>
+                <input type="text" id="sysNtpServersInput" class="form-input mono" value="0.pool.ntp.org, 1.pool.ntp.org, time.cloudflare.com" />
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-head">
+                <h3>ضبط النواة والنسخ الاحتياطي والطاقة</h3>
+                <button type="button" id="btnSaveSysTuning" class="btn btn-primary btn-sm">حفظ ضبط النواة</button>
+              </div>
+              <div class="form-row-2">
+                <div class="form-group">
+                  <label for="sysConntrackMaxInput">سقف جدول الاتصالات (nf_conntrack_max)</label>
+                  <input type="number" id="sysConntrackMaxInput" class="form-input mono" min="16384" max="524288" value="262144" />
+                </div>
+                <div class="toggle-item">
+                  <span class="toggle-title">توزيع معالجة الحزم (Packet Steering)</span>
+                  <label class="switch"><input type="checkbox" id="sysPacketSteeringChk" checked /><span class="switch-slider"></span></label>
+                </div>
+              </div>
+              <div class="inset-panel">
+                <h4>تصدير الإعدادات وإعادة تشغيل البوابة</h4>
+                <div class="inline-form">
+                  <button type="button" id="btnExportSysBackup" class="btn btn-secondary btn-sm">تصدير نسخة احتياطية للإعدادات (JSON)</button>
+                  <button type="button" id="btnSysReboot" class="btn btn-danger btn-sm">إعادة تشغيل البوابة (بتحدي تأكيد ثنائي)</button>
+                </div>
+              </div>
+            </article>
+          </div>
+
+          <div class="grid-2 admin-only">
+            <article class="card">
+              <div class="card-head"><h3>المهام الدورية المجدولة (Crontab)</h3></div>
+              <div class="inline-form">
+                <select id="cronTemplateSelect" class="form-select"></select>
+                <input type="text" id="cronScheduleInput" class="form-input mono" value="0 4 * * *" placeholder="التوقيت (مثال: 0 4 * * *)" />
+                <button type="button" id="btnAddCronJob" class="btn btn-primary btn-sm">إضافة مهمة مجدولة</button>
+              </div>
+              <div class="table-scroll">
+                <table class="data-table">
+                  <thead><tr><th>#</th><th>السطر المجدول</th><th>إجراء</th></tr></thead>
+                  <tbody id="cronJobsBody"></tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-head">
+                <h3>أمان الوصول SSH (Dropbear) والمفاتيح</h3>
+                <button type="button" id="btnSaveSshConfig" class="btn btn-primary btn-sm">حفظ إعدادات SSH</button>
+              </div>
+              <div class="form-row-2">
+                <div class="toggle-item">
+                  <span class="toggle-title">الدخول بكلمة المرور (PasswordAuth)</span>
+                  <label class="switch"><input type="checkbox" id="sshPassAuthChk" checked /><span class="switch-slider"></span></label>
+                </div>
+                <div class="toggle-item">
+                  <span class="toggle-title">كلمة مرور الجذر (RootPasswordAuth)</span>
+                  <label class="switch"><input type="checkbox" id="sshRootPassAuthChk" checked /><span class="switch-slider"></span></label>
+                </div>
+              </div>
+              <div class="inline-form">
+                <input type="text" id="sshNewKeyInput" class="form-input mono" placeholder="ssh-ed25519 AAAAC3NzaC... user@host" />
+                <button type="button" id="btnAddSshKey" class="btn btn-secondary btn-sm">إضافة مفتاح عام</button>
+              </div>
+              <div class="table-scroll">
+                <table class="data-table">
+                  <thead><tr><th>النوع</th><th>بصمة المفتاح</th><th>الوصف</th><th>إجراء</th></tr></thead>
+                  <tbody id="sshKeysBody"></tbody>
+                </table>
+              </div>
+            </article>
+          </div>
+
+          <article class="card admin-only">
+            <div class="card-head">
+              <h3>إدارة البرامج والحزم وترقية النظام (APK Package &amp; System Upgrade Manager)</h3>
+              <span class="status-pill pill-neutral mono" id="pkgCountBadge">--</span>
+            </div>
+            <div class="inset-panel">
+              <div class="card-head">
+                <h4>حالة إصدار النظام وتحديث المستودعات وترقية الحزم</h4>
+                <div class="inline-form">
+                  <button type="button" id="btnPkgUpdateRepos" class="btn btn-primary btn-sm">تحديث فهرس المستودعات (apk update)</button>
+                  <button type="button" id="btnPkgCheckUpgrades" class="btn btn-primary btn-sm">فحص ترقيات النظام والحزم</button>
+                </div>
+              </div>
+              <div id="sysUpgradeSummaryRow" class="kv-row">
+                <span>إصدار النظام والنواة الحالي</span>
+                <strong id="sysPkgVersionText" class="mono">System OS 25.12.6 | Kernel 6.12.112</strong>
+              </div>
+              <div class="inline-form">
+                <input type="text" id="pkgActionNameInput" class="form-input mono" placeholder="اسم البرنامج أو الحزمة للتثبيت أو التحديث (مثال: htop أو curl أو tcpdump)..." />
+                <button type="button" id="btnPkgInstall" class="btn btn-primary btn-sm">تنزيل وتثبيت برنامج</button>
+                <button type="button" id="btnPkgUpgradeOne" class="btn btn-primary btn-sm">تحديث البرنامج</button>
+              </div>
+              <pre id="pkgActionOutputPre" class="log-pre mono hidden"></pre>
+            </div>
+            <div class="inline-form">
+              <input type="text" id="pkgSearchInput" class="form-input mono" placeholder="ابحث في الحزم المثبتة (مثال: nftables أو ucode أو kmod)..." />
+              <button type="button" id="btnSearchPackages" class="btn btn-primary btn-sm">بحث في الحزم</button>
+            </div>
+            <div id="packagesListGrid" class="pkg-grid"></div>
+          </article>
+
+          <article id="readonlyProvisionCard" class="card admin-only">
+            <div class="card-head">
+              <h3>إدارة حسابات المراقبين (للقراءة فقط)</h3>
+              <span class="sub-label">تُطبق قواعد إخفاء الهوية عبر الجلسة تلقائياً عند التفعيل</span>
+            </div>
+            <div class="form-row-3">
+              <input type="text" id="roUsernameInput" class="form-input" value="viewer" placeholder="اسم المستخدم (مثل viewer)" />
+              <input type="password" id="roPasswordInput" class="form-input" placeholder="كلمة المرور (12 حرفاً على الأقل)" />
+              <button type="button" id="btnCreateReadonly" class="btn btn-primary btn-sm">حفظ حساب المراقب</button>
+            </div>
+            <div id="roStatusMsg" class="sub-label"></div>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>اسم المستخدم</th>
+                    <th>الدور والصلاحية</th>
+                    <th>إجراء</th>
+                  </tr>
+                </thead>
+                <tbody id="roUsersList"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="card admin-only">
+            <div class="card-head">
+              <h3>تغيير كلمة مرور حساب المدير</h3>
+              <span class="sub-label">تحديث آمن باستخدام PBKDF2-HMAC-SHA256 (50,000 تكرار)</span>
+            </div>
+            <div class="inline-form">
+              <input type="password" id="adminNewPassInput" class="form-input" placeholder="كلمة المرور الجديدة (12 حرفاً على الأقل)" />
+              <button type="button" id="btnChangeAdminPass" class="btn btn-primary btn-sm">تحديث كلمة مرور المدير</button>
+            </div>
+            <div id="adminPassStatusMsg" class="sub-label"></div>
+          </article>
+
+          <article class="card admin-only">
+            <div class="card-head">
+              <h3>المصادقة الثنائية لحساب المدير (TOTP 2FA)</h3>
+              <span class="status-pill pill-neutral" id="totpStatusBadge">--</span>
+            </div>
+            <div class="inline-form">
+              <button type="button" id="btnTotpSetup" class="btn btn-primary btn-sm">توليد مفتاح مصادقة ثنائية</button>
+              <button type="button" id="btnTotpDisable" class="btn btn-secondary btn-sm">تعطيل المصادقة الثنائية</button>
+            </div>
+            <div id="totpSetupPanel" class="inset-panel hidden">
+              <p class="sub-label">أضف هذا المفتاح في تطبيق المصادقة ثم أدخل الرمز السداسي لتأكيد التفعيل:</p>
+              <div class="kv-row"><span>المفتاح السري (Base32)</span><strong id="totpSecretDisplay" class="mono">--</strong></div>
+              <div class="inline-form">
+                <input type="text" id="totpVerifyInput" maxlength="6" inputmode="numeric" class="form-input mono" placeholder="الرمز السداسي (6 أرقام)" />
+                <button type="button" id="btnTotpEnable" class="btn btn-primary btn-sm">تفعيل الآن</button>
+              </div>
+            </div>
+          </article>
+
+          <article class="card admin-only">
+            <div class="card-head">
+              <h3>نظام التنبيهات الفورية (Telegram / ntfy)</h3>
+              <div class="inline-form">
+                <button type="button" id="btnTestAlerts" class="btn btn-secondary btn-sm">إرسال تنبيه اختباري</button>
+                <button type="button" id="btnSaveAlerts" class="btn btn-primary btn-sm">حفظ إعدادات التنبيهات</button>
+              </div>
+            </div>
+            <div class="form-row-2">
+              <div class="form-group">
+                <label><input type="checkbox" id="alertsTgEnabled" /> تفعيل تنبيهات Telegram</label>
+                <input type="password" id="alertsTgToken" class="form-input mono" placeholder="Bot Token (اتركه فارغاً للإبقاء على الحالي)" />
+                <input type="text" id="alertsTgChatId" class="form-input mono" placeholder="Chat ID" />
+              </div>
+              <div class="form-group">
+                <label><input type="checkbox" id="alertsNtfyEnabled" /> تفعيل تنبيهات ntfy</label>
+                <input type="text" id="alertsNtfyUrl" class="form-input mono" placeholder="رابط خادم ntfy (مثال: ntfy.sh/my-topic)" />
+                <div class="form-row-2">
+                  <input type="number" id="alertsCpuMax" class="form-input mono" value="78" placeholder="حد حرارة المعالج" />
+                  <input type="number" id="alertsRamMax" class="form-input mono" value="90" placeholder="حد الذاكرة %" />
+                </div>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead><tr><th>الوقت</th><th>المستوى</th><th>العنوان</th><th>الرسالة</th></tr></thead>
+                <tbody id="alertsHistoryBody"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="card admin-only">
+            <div class="card-head">
+              <h3>الحصص الشهرية وجدولة الإجراءات للأجهزة</h3>
+              <span class="sub-label">تحديد حصة شهرية أو جدولة حجب تلقائي عبر MAC</span>
+            </div>
+            <div class="form-row-2">
+              <div class="inset-panel">
+                <h4 class="sub-heading">تحديد حصة جهاز</h4>
+                <div class="inline-form">
+                  <input type="text" id="quotaMacInput" class="form-input mono" placeholder="MAC (aa:bb:cc:dd:ee:ff)" />
+                  <input type="number" id="quotaMbInput" class="form-input mono" placeholder="الحصة (MiB)" />
+                  <input type="number" id="quotaThrottleInput" class="form-input mono" placeholder="السرعة عند التجاوز (Kbps)" />
+                  <button type="button" id="btnSaveQuota" class="btn btn-primary btn-sm">حفظ الحصة</button>
+                </div>
+                <div id="quotasListText" class="sub-label mono"></div>
+              </div>
+              <div class="inset-panel">
+                <h4 class="sub-heading">جدولة حجب/تقييد جهاز</h4>
+                <div class="inline-form">
+                  <input type="text" id="schedMacInput" class="form-input mono" placeholder="MAC (aa:bb:cc:dd:ee:ff)" />
+                  <select id="schedActionSelect" class="form-select"><option value="block">حجب</option><option value="throttle">تقييد سرعة</option></select>
+                  <input type="text" id="schedStartInput" class="form-input mono" value="23:00" placeholder="من 23:00" />
+                  <input type="text" id="schedEndInput" class="form-input mono" value="07:00" placeholder="إلى 07:00" />
+                  <button type="button" id="btnSaveSchedule" class="btn btn-primary btn-sm">إضافة جدولة</button>
+                </div>
+                <div id="schedListText" class="sub-label mono"></div>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <!-- TAB 10: DIAGNOSTICS & AUDIT LOG -->
+        <section id="view-diagnostics" class="tab-view">
+          <div class="grid-2">
+            <article class="card">
+              <div class="card-head">
+                <h3>صحة المنصة والتقرير الدوري</h3>
+                <button type="button" id="btnRefreshReport" class="btn btn-secondary btn-sm">تحديث التقرير</button>
+              </div>
+              <div id="platformHealthList" class="kv-list"></div>
+              <div id="weeklyReportList" class="kv-list"></div>
+            </article>
+            <article class="card">
+              <div class="card-head">
+                <h3>التدقيق الأمني الذاتي للبوابة</h3>
+                <button type="button" id="btnRunSecurityAudit" class="btn btn-primary btn-sm">فحص الأمان الآن</button>
+              </div>
+              <div id="securityAuditList" class="kv-list"></div>
+            </article>
+          </div>
+          <article class="card">
+            <div class="card-head">
+              <h3>أدوات التشخيص الشبكي المقيدة (بدون غلاف أوامر شل)</h3>
+              <span class="sub-label">تنفيذ مباشر عبر معاملات مُتحقق منها فقط</span>
+            </div>
+            <div class="diag-bar">
+              <input type="text" id="diagTargetInput" class="form-input mono" value="1.1.1.1" placeholder="عنوان IP أو نطاق للفحص (مثل 1.1.1.1 أو cloudflare.com)" />
+              <input type="number" id="diagPortInput" class="form-input mono diag-port-input" min="1" max="65535" value="80" aria-label="منفذ TCP" />
+              <select id="diagQtypeSelect" class="form-select" aria-label="نوع سجل DNS">
+                <option value="A">A</option>
+                <option value="AAAA">AAAA</option>
+                <option value="MX">MX</option>
+                <option value="TXT">TXT</option>
+                <option value="NS">NS</option>
+                <option value="CNAME">CNAME</option>
+              </select>
+              <button type="button" id="btnDiagPing" class="btn btn-primary btn-sm">فحص Ping</button>
+              <button type="button" id="btnDiagTrace" class="btn btn-secondary btn-sm">تتبع المسار</button>
+              <button type="button" id="btnDiagNslookup" class="btn btn-secondary btn-sm">استعلام NSLookup</button>
+              <button type="button" id="btnDiagTcpProbe" class="btn btn-secondary btn-sm">فحص منفذ TCP</button>
+              <button type="button" id="btnDiagRoutes" class="btn btn-secondary btn-sm">جدول التوجيه و Conntrack</button>
+            </div>
+            <pre id="diagOutputPre" class="log-pre mono">اختر أداة التشخيص وأدخل العنوان المسموح للبدء.</pre>
+          </article>
+
+          <!-- Security Audit Log Panel (Replaces Removed Root Shell) -->
+          <article class="card">
+            <div class="card-head">
+              <h3>سجل التدقيق الأمني وسجلات النظام</h3>
+              <div class="inline-form">
+                <button type="button" id="btnExportAuditJson" class="btn btn-secondary btn-sm">تصدير سجل التدقيق JSON</button>
+                <button type="button" id="btnRefreshLogs" class="btn btn-secondary btn-sm">تحديث السجلات</button>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>الوقت</th>
+                    <th>المنفذ</th>
+                    <th>الإجراء</th>
+                    <th>الهدف</th>
+                    <th>النتيجة</th>
+                    <th>التفاصيل</th>
+                  </tr>
+                </thead>
+                <tbody id="auditEntriesBody"></tbody>
+              </table>
+            </div>
+            <div class="grid-2 logs-dual">
+              <div>
+                <h4 class="sub-heading">سجل النظام (syslog)</h4>
+                <pre id="syslogPre" class="log-pre mono"></pre>
+              </div>
+              <div>
+                <h4 class="sub-heading">سجل النواة (dmesg)</h4>
+                <pre id="dmesgPre" class="log-pre mono"></pre>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <!-- TAB: INTERACTIVE TOPOLOGY TREE -->
+        <section id="view-topology" class="tab-view">
+          <article class="card">
+            <div class="card-head">
+              <div class="lab-title-wrap">
+                <h3>شجرة مسارات الإنترنت والأجهزة الحية</h3>
+                <span id="topoModeBadge" class="status-pill pill-success">وضع المراقبة الحية</span>
+              </div>
+              <div class="stats-bar">
+                <div class="stat-item">السرعة الكلية: <span id="topoTotalSpeed" class="mono">--</span></div>
+                <div class="stat-item">الأجهزة النشطة: <span id="topoActiveDevices" class="mono">--</span></div>
+                <div class="mode-toggle" role="group" aria-label="وضع تشغيل الشجرة">
+                  <button type="button" id="btnTopoLive" class="btn btn-primary btn-sm">مراقبة حية</button>
+                  <button type="button" id="btnTopoSim" class="btn btn-secondary btn-sm">محاكاة المسارات</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="lab-toolbar">
+              <div class="lab-toolbar-group">
+                <input type="text" id="topoDeviceSearch" class="form-input form-input-sm" placeholder="ابحث عن جهاز بالاسم أو IP أو MAC..." />
+                <select id="topoDeviceFilter" class="form-select form-select-sm" aria-label="تصفية أجهزة الشجرة">
+                  <option value="all" selected>جميع الأجهزة</option>
+                  <option value="online">الأجهزة المتصلة فقط</option>
+                  <option value="blocked">الأجهزة المحجوبة</option>
+                  <option value="limited">محدودة السرعة</option>
+                </select>
+              </div>
+              <div class="lab-toolbar-group">
+                <div class="heat-legend" title="تدرج لون المسار حسب السرعة اللحظية">
+                  <span class="sub-label">السرعة:</span>
+                  <span class="sub-label mono">0</span>
+                  <span class="heat-bar" aria-hidden="true"></span>
+                  <span class="sub-label mono">20+ Mbps</span>
+                </div>
+                <button type="button" id="btnTopoZoomOut" class="btn btn-secondary btn-sm">تصغير -</button>
+                <span id="topoZoomLabel" class="mono sub-label">100%</span>
+                <button type="button" id="btnTopoZoomIn" class="btn btn-secondary btn-sm">تكبير +</button>
+                <button type="button" id="btnTopoZoomReset" class="btn btn-secondary btn-sm">ملاءمة العرض</button>
+                <button type="button" id="btnTopoResetLayout" class="btn btn-secondary btn-sm">إرجاع البطاقات</button>
+                <button type="button" id="btnTopoRefresh" class="btn btn-primary btn-sm">تحديث حي</button>
+              </div>
+            </div>
+
+            <div class="lab-workspace">
+              <div class="canvas-container" id="topo-canvas">
+                <div class="tree-stage" id="topo-stage">
+                  <svg class="svg-overlay" id="topo-svg"></svg>
+                  <div class="network-tree" id="topo-network-tree">
+                    <div class="tree-column" id="topo-col-wan"></div>
+                    <div class="tree-column" id="topo-col-router"></div>
+                    <div class="tree-column" id="topo-col-ports"></div>
+                    <div class="tree-column" id="topo-col-devices"></div>
+                  </div>
+                </div>
+              </div>
+              <aside class="lab-sidebar">
+                <section class="lab-panel">
+                  <h4 class="lab-sidebar-title">تفاصيل العقدة المختارة</h4>
+                  <div id="topoInspectorBox" class="inspector-box">
+                    <p class="sub-label">انقر على أي عقدة في الشجرة لعرض مسارها، بياناتها الحية، وإجراءاتها.</p>
+                  </div>
+                </section>
+                <section class="lab-panel lab-panel-log">
+                  <h4 class="lab-sidebar-title">سجل المسارات والعمليات</h4>
+                  <div class="log-box mono" id="topo-log-box"></div>
+                </section>
+              </aside>
+            </div>
+          </article>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- Command Palette Modal (Ctrl+K) -->
+  <div id="cmdPaletteModal" class="auth-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="cmdPaletteTitle">
+    <div class="confirm-card cmd-palette-card">
+      <div class="card-head">
+        <h2 id="cmdPaletteTitle">لوحة الأوامر والبحث السريع (Ctrl+K)</h2>
+        <button type="button" id="btnCloseCmdPalette" class="btn btn-secondary btn-sm">إغلاق</button>
+      </div>
+      <input type="text" id="cmdPaletteInput" class="form-input" placeholder="اكتب اسم قسم، أو جهاز، أو إجراء (مثل: الجدار، التوجيه، التقرير، DNS)..." />
+      <div id="cmdPaletteResults" class="cmd-palette-results"></div>
+    </div>
+  </div>
+
+  <!-- Toast Region -->
+  <div id="toastContainer" class="toast-container" aria-live="polite" aria-atomic="true"></div>
+
+  <script src="/pro/chart.umd.min.js"></script>
+  <script src="/pro/netchart.js"></script>
+  <script src="/pro/nms-i18n.js?v=9"></script>
+  <script src="/pro/app.js"></script>
+  <script src="/pro/noc-tools.js"></script>
+  <script src="/pro/noc-search.js"></script>
+  <script src="/pro/noc-topology.js"></script>
+</body>
+</html>

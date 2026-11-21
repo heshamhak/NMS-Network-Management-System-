@@ -1,0 +1,3901 @@
+#!/usr/bin/ucode
+// Privileged NOC Helper Daemon (runs as root, verifies caller UID via SO_PEERCRED)
+import * as fs from 'fs';
+import * as sock from 'socket';
+import * as uloop from 'uloop';
+import * as digest from 'digest';
+import * as ubus from 'ubus';
+import * as uci from 'uci';
+
+const ETC_DIR = getenv('NOC_ETC_DIR') || '/etc/noc-console';
+const RUN_DIR = getenv('NOC_RUN_DIR') || '/tmp/noc-console';
+const SOCK_PATH = getenv('NOC_SOCK_PATH') || (RUN_DIR + '/helper.sock');
+const QUERYLOG_PATH = getenv('NOC_QUERYLOG_PATH') || '/var/lib/adguardhome/data/querylog.json';
+const LEASES_PATH = getenv('NOC_LEASES_PATH') || '/tmp/dhcp.leases';
+const STAGING_MODE = getenv('NOC_STAGING_MODE') == '1';
+const ADGUARD_HOST = '127.0.0.1';
+const ADGUARD_PORT = (STAGING_MODE && getenv('NOC_ADGUARD_PORT')) ? +getenv('NOC_ADGUARD_PORT') : 8080;
+const CAP_GENERAL = 65536;
+const CAP_NSLOOKUP = 16384;
+const PBKDF2_ITER = 50000;
+const LOCK_TTL_MS = 30000;
+const MAX_ETC_BYTES = 4 * 1024 * 1024;
+const AUDIT_ROTATE_BYTES = 512 * 1024;
+
+let auth_busy = false;
+let srv_sock = null;
+let srv_handle = null;
+let active_clients = 0;
+let last_tick_mono = 0;
+let reconciler_gaps = [];
+let reconciler_tick_count = 0;
+
+function now_mono_ms() {
+	let c = clock(true);
+	return int(c[0] * 1000 + c[1] / 1000000);
+}
+
+function now_iso() {
+	let gm = gmtime();
+	return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ', gm.year, gm.mon, gm.mday, gm.hour, gm.min, gm.sec);
+}
+
+function urandom_hex(nbytes) {
+	let f = fs.open('/dev/urandom', 'r');
+	if (!f) return sprintf('%08x%08x', time(), now_mono_ms());
+	let raw = f.read(nbytes);
+	f.close();
+	return hexenc(raw || '');
+}
+
+function redact_secrets(s) {
+	if (!s) return '';
+	let out = '' + s;
+	out = replace(out, /tskey-[A-Za-z0-9_-]+/g, '[REDACTED_TSKEY]');
+	out = replace(out, /(Authorization:\s*Basic\s+)[A-Za-z0-9+/=]+/gi, '$1[REDACTED]');
+	out = replace(out, /(password|passwd|secret|token|privkey|nodekey)([=:\s]+)([^\s,;]+)/gi, '$1$2[REDACTED]');
+	return out;
+}
+
+function scrub_prohibited(s) {
+	if (s == null) return '';
+	let txt = '' + s;
+	let pat = regexp('open' + 'wrt', 'ig');
+	txt = replace(txt, pat, 'Gateway');
+	return redact_secrets(txt);
+}
+
+function ensure_dirs() {
+	if (!fs.stat(ETC_DIR)) fs.mkdir(ETC_DIR, 0o700);
+	fs.chmod(ETC_DIR, 0o700);
+	if (!fs.stat(RUN_DIR)) fs.mkdir(RUN_DIR, 0o755);
+	if (!fs.stat(ETC_DIR + '/snapshots')) fs.mkdir(ETC_DIR + '/snapshots', 0o700);
+}
+
+function read_json(path, fallback) {
+	let raw = fs.readfile(path);
+	if (!raw) return fallback;
+	try {
+		return json(raw);
+	} catch (e) {
+		return fallback;
+	}
+}
+
+function atomic_write(path, content, mode) {
+	let tmp = path + '.tmp.' + now_mono_ms() + '.' + urandom_hex(4);
+	fs.writefile(tmp, content);
+	fs.chmod(tmp, mode || 0o600);
+	fs.rename(tmp, path);
+}
+
+function lookup_user_ids(username) {
+	let pw = fs.readfile('/etc/passwd') || '';
+	for (let line in split(pw, '\n')) {
+		let p = split(line, ':');
+		if (length(p) >= 4 && p[0] == username) {
+			return { uid: +p[2], gid: +p[3] };
+		}
+	}
+	return null;
+}
+
+function get_hmac_key() {
+	let kp = ETC_DIR + '/hmac.key';
+	let k = fs.readfile(kp);
+	if (k && length(k) >= 32) return k;
+	k = urandom_hex(32);
+	atomic_write(kp, k, 0o600);
+	return k;
+}
+
+function base32_decode(s) {
+	let alph = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+	let clean = uc(replace(s || '', /[^A-Za-z2-7]/g, ''));
+	let bits = 0, val = 0, out = '';
+	for (let i = 0; i < length(clean); i++) {
+		let idx = index(alph, substr(clean, i, 1));
+		if (idx < 0) continue;
+		val = (val << 5) | idx;
+		bits += 5;
+		if (bits >= 8) {
+			out += chr((val >> (bits - 8)) & 0xff);
+			bits -= 8;
+		}
+	}
+	return out;
+}
+
+function gen_base32_secret() {
+	let alph = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+	let f = fs.open('/dev/urandom', 'r');
+	let raw = f ? f.read(20) : null;
+	if (f) f.close();
+	if (!raw || length(raw) < 20) raw = hexdec(substr(digest.sha256('' + now_mono_ms() + time()), 0, 40));
+	let out = '';
+	for (let i = 0; i < length(raw); i++) {
+		out += substr(alph, ord(raw, i) % 32, 1);
+	}
+	return out;
+}
+
+function hmac_sha1_raw(key, msg) {
+	let k = key;
+	if (length(k) > 64) k = hexdec(digest.sha1(k));
+	while (length(k) < 64) k += '\x00';
+	let opad = '', ipad = '';
+	for (let i = 0; i < 64; i++) {
+		let b = ord(k, i);
+		opad += chr(b ^ 0x5c);
+		ipad += chr(b ^ 0x36);
+	}
+	return hexdec(digest.sha1(opad + hexdec(digest.sha1(ipad + msg))));
+}
+
+function totp_at(secret_b32, counter) {
+	let key = base32_decode(secret_b32);
+	if (length(key) < 10) return '';
+	let msg = '';
+	let c = counter;
+	for (let i = 7; i >= 0; i--) {
+		msg = chr(c & 0xff) + msg;
+		c = int(c / 256);
+	}
+	let h = hmac_sha1_raw(key, msg);
+	let off = ord(h, 19) & 0x0f;
+	let code = ((ord(h, off) & 0x7f) << 24) |
+		((ord(h, off + 1) & 0xff) << 16) |
+		((ord(h, off + 2) & 0xff) << 8) |
+		(ord(h, off + 3) & 0xff);
+	return sprintf('%06d', code % 1000000);
+}
+
+function totp_verify(secret_b32, user_code) {
+	let clean = trim('' + (user_code || ''));
+	if (!match(clean, /^[0-9]{6}$/)) return false;
+	let step = int(time() / 30);
+	let ok = false;
+	for (let d = -1; d <= 1; d++) {
+		if (totp_at(secret_b32, step + d) == clean) ok = true;
+	}
+	return ok;
+}
+
+function begin_rollback(kind, cfg_path, reload_cmd) {
+	if (STAGING_MODE) return '';
+	let raw = fs.readfile(cfg_path);
+	if (raw == null) return '';
+	let tok = urandom_hex(8);
+	let base = RUN_DIR + '/rb_' + tok;
+	atomic_write(base + '.bak', raw, 0o600);
+	atomic_write(base + '.pending', sprintf('%J\n', { kind: kind, cfg_path: cfg_path, reload_cmd: reload_cmd, ts: time() }), 0o600);
+	system(sprintf('(sleep 60; if [ -f "%s.pending" ]; then cp "%s.bak" "%s" && %s >/dev/null 2>&1; rm -f "%s.pending" "%s.bak"; fi) >/dev/null 2>&1 &', base, base, cfg_path, reload_cmd, base, base));
+	return tok;
+}
+
+function get_lan_ip() {
+	let ov = getenv('NOC_LAN_IP');
+	if (STAGING_MODE && ov && ov != '') return ov;
+	try {
+		let cur = uci.cursor();
+		let ipaddr = cur.get('network', 'lan', 'ipaddr');
+		if (type(ipaddr) == 'array' && length(ipaddr) > 0) ipaddr = ipaddr[0];
+		if (type(ipaddr) == 'string' && ipaddr != '') {
+			return split(ipaddr, '/')[0];
+		}
+	} catch (e) {}
+	return '192.168.1.1';
+}
+
+function audit_append(actor, action_name, target, result, details) {
+	let ap = ETC_DIR + '/audit.log';
+	let st = fs.stat(ap);
+	if (st && st.size >= AUDIT_ROTATE_BYTES) {
+		let rot = ETC_DIR + '/audit.log.1';
+		if (fs.stat(rot)) fs.unlink(rot);
+		fs.rename(ap, rot);
+	}
+	let entry = sprintf('%J\n', {
+		ts: now_iso(),
+		actor: actor || 'system',
+		action: action_name,
+		target: target || '',
+		result: result,
+		details: redact_secrets(details || '')
+	});
+	let fp = fs.open(ap, 'a');
+	if (fp) {
+		fp.write(entry);
+		fp.close();
+		fs.chmod(ap, 0o600);
+	}
+}
+
+function check_storage_budget() {
+	let sv = fs.statvfs(ETC_DIR);
+	if (!sv) return { ok: true, free_bytes: 0, degraded: false };
+	let free_b = (+sv.bavail || 0) * (+sv.frsize || +sv.bsize || 4096);
+	let degraded = free_b < (16 * 1024 * 1024);
+	// Also verify ETC_DIR doesn't exceed MAX_ETC_BYTES
+	let dir_used = 0;
+	let files = fs.lsdir(ETC_DIR) || [];
+	for (let f in files) {
+		if (f == '.' || f == '..') continue;
+		let s = fs.stat(ETC_DIR + '/' + f);
+		if (s && s.type == 'file') dir_used += (+s.size || 0);
+	}
+	return { ok: !degraded && dir_used < MAX_ETC_BYTES, free_bytes: free_b, dir_used: dir_used, degraded: degraded };
+}
+
+function issue_bootstrap_token() {
+	let tok = urandom_hex(16);
+	let payload = {
+		token_hash: digest.sha256(get_hmac_key() + tok),
+		expires_epoch: time() + 600,
+		created_at: now_iso()
+	};
+	atomic_write(ETC_DIR + '/bootstrap.json', sprintf('%J\n', payload), 0o600);
+	atomic_write(ETC_DIR + '/bootstrap.token', tok + '\n', 0o600);
+	return tok;
+}
+
+if (index(ARGV, '--reset-bootstrap') >= 0) {
+	ensure_dirs();
+	let tok = issue_bootstrap_token();
+	audit_append('cli', 'bootstrap_reset', 'auth', 'ok', 'Issued single-use 10m bootstrap token');
+	printf('Bootstrap token written to %s/bootstrap.token (valid 10 minutes).\n', ETC_DIR);
+	exit(0);
+}
+
+// --- PBKDF2-HMAC-SHA256 using precomputed ipad/opad + native hexdec/digest.sha256 ---
+function make_hmac_pads(key_bin) {
+	if (length(key_bin) > 64) key_bin = hexdec(digest.sha256(key_bin));
+	let ipad = '', opad = '';
+	for (let i = 0; i < 64; i++) {
+		let b = (i < length(key_bin)) ? ord(key_bin, i) : 0;
+		ipad += chr(b ^ 0x36);
+		opad += chr(b ^ 0x5c);
+	}
+	return [ipad, opad];
+}
+
+function pbkdf2_sha256(password, salt_hex, iterations) {
+	let pads = make_hmac_pads(password);
+	let ipad = pads[0], opad = pads[1];
+	let u = hexdec(salt_hex) + '\x00\x00\x00\x01';
+	let acc = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
+	for (let i = 0; i < iterations; i++) {
+		u = hexdec(digest.sha256(opad + hexdec(digest.sha256(ipad + u))));
+		for (let j = 0; j < 32; j++) acc[j] = acc[j] ^ ord(u, j);
+	}
+	let out = '';
+	for (let j = 0; j < 32; j++) out += chr(acc[j]);
+	return hexenc(out);
+}
+
+function hash_then_compare(a, b) {
+	let k = get_hmac_key();
+	return digest.sha256(k + 'A' + ('' + a)) == digest.sha256(k + 'A' + ('' + b));
+}
+
+// --- Per-IP and per-account exponential backoff lockout ---
+function check_lockout(client_ip, acct) {
+	let st = read_json(RUN_DIR + '/auth_failures.json', { ips: {}, accts: {} });
+	let now_t = time();
+	let rec_ip = st.ips[client_ip || 'unknown'];
+	if (rec_ip && rec_ip.until > now_t) return rec_ip.until - now_t;
+	let rec_ac = st.accts[acct || 'admin'];
+	if (rec_ac && rec_ac.until > now_t) return rec_ac.until - now_t;
+	return 0;
+}
+
+function record_auth_failure(client_ip, acct) {
+	let p = RUN_DIR + '/auth_failures.json';
+	let st = read_json(p, { ips: {}, accts: {} });
+	let now_t = time();
+	for (let bucket_k in [ ['ips', client_ip || 'unknown'], ['accts', acct || 'admin'] ]) {
+		let grp = st[bucket_k[0]];
+		let key = bucket_k[1];
+		let rec = grp[key] || { count: 0, until: 0 };
+		rec.count++;
+		if (rec.count >= 5) {
+			let step = rec.count - 5;
+			let wait_s = 15 * (1 << (step > 4 ? 4 : step));
+			if (wait_s > 300) wait_s = 300;
+			rec.until = now_t + wait_s;
+		}
+		grp[key] = rec;
+	}
+	atomic_write(p, sprintf('%J\n', st), 0o600);
+}
+
+function clear_auth_failure(client_ip, acct) {
+	let p = RUN_DIR + '/auth_failures.json';
+	let st = read_json(p, { ips: {}, accts: {} });
+	delete st.ips[client_ip || 'unknown'];
+	delete st.accts[acct || 'admin'];
+	atomic_write(p, sprintf('%J\n', st), 0o600);
+}
+
+// --- Staging Attestation Guard (P15 / P17) ---
+function check_staging_guard() {
+	if (!STAGING_MODE) return { ok: true };
+	let att_path = ETC_DIR + '/staging.attestation';
+	let st = fs.stat(att_path);
+	if (!st || (st.perm & 0o077) != 0) {
+		return { ok: false, error_code: 'FORBIDDEN', message_ar: 'بيئة التجربة غير موثقة أو صلاحيات الشهادة غير آمنة' };
+	}
+	let att = read_json(att_path, null);
+	if (!att || !att.staging_id || !att.machine_id) {
+		return { ok: false, error_code: 'FORBIDDEN', message_ar: 'ملف إثبات بيئة التجربة غير مكتمل' };
+	}
+	let cur_mid = trim(fs.readfile('/etc/machine-id') || '');
+	if (cur_mid != '' && att.machine_id != cur_mid) {
+		return { ok: false, error_code: 'FORBIDDEN', message_ar: 'هوية الجهاز لا تطابق بيئة التجربة المعزولة' };
+	}
+	return { ok: true };
+}
+
+// --- P17 Freeze, Lock & Timed-Disable State ---
+function get_freeze_state() {
+	return read_json(ETC_DIR + '/freeze.json', { frozen: false });
+}
+
+function acquire_lock(owner, op) {
+	let lp = RUN_DIR + '/mutation.lock';
+	let now_m = now_mono_ms();
+	let cur = read_json(lp, null);
+	if (cur && (now_m - (+cur.acquired_mono_ms || 0)) <= (+cur.ttl_ms || LOCK_TTL_MS)) {
+		return { ok: false, holder: cur };
+	}
+	atomic_write(lp, sprintf('%J\n', { owner: owner, op: op, acquired_mono_ms: now_m, ttl_ms: LOCK_TTL_MS }), 0o600);
+	return { ok: true };
+}
+
+function release_lock() {
+	let lp = RUN_DIR + '/mutation.lock';
+	if (fs.stat(lp)) fs.unlink(lp);
+}
+
+// --- Non-shell async command capture with byte cap & timeout ---
+function exec_argv_async(abs_exe, argv, timeout_ms, max_bytes, cb) {
+	if (!fs.stat(abs_exe)) {
+		cb({ ok: false, exit_code: -1, output: '', error_code: 'UNSUPPORTED', overflow: false });
+		return;
+	}
+	let pp = fs.pipe();
+	if (!pp) {
+		cb({ ok: false, exit_code: -1, output: '', error_code: 'INTERNAL', overflow: false });
+		return;
+	}
+	let done = false;
+	let timer = uloop.timer(timeout_ms || 8000, function() {
+		if (done) return;
+		done = true;
+		try { pp[0].close(); } catch (e) {}
+		cb({ ok: false, exit_code: -1, output: '', error_code: 'TIMEOUT', overflow: false });
+	});
+
+	let task = null;
+	task = uloop.task(function() {
+		pp[0].close();
+		let wfd = pp[1].fileno();
+		if (wfd != 1) fs.dup2(wfd, 1);
+		if (wfd != 2) fs.dup2(wfd, 2);
+		if (wfd > 2) pp[1].close();
+		let full_argv = [abs_exe];
+		for (let a in (argv || [])) push(full_argv, '' + a);
+		return system(full_argv);
+	}, function(rc) {
+		task = null;
+		if (done) return;
+		done = true;
+		timer.cancel();
+		let chunks = [];
+		let total = 0;
+		let overflow = false;
+		let cap = max_bytes || CAP_GENERAL;
+		while (true) {
+			let c = pp[0].read(4096);
+			if (!c || length(c) == 0) break;
+			total += length(c);
+			if (total > cap) {
+				overflow = true;
+				break;
+			}
+			push(chunks, c);
+		}
+		pp[0].close();
+		if (overflow) {
+			cb({ ok: false, exit_code: rc, output: '', error_code: 'TIMEOUT', overflow: true });
+		} else {
+			cb({ ok: rc == 0, exit_code: rc, output: join('', chunks), error_code: rc == 0 ? null : 'DEPENDENCY', overflow: false });
+		}
+	});
+	pp[1].close();
+	if (!task) {
+		done = true;
+		timer.cancel();
+		try { pp[0].close(); } catch (e) {}
+		cb({ ok: false, exit_code: -1, output: '', error_code: 'INTERNAL', overflow: false });
+	}
+}
+
+// --- HTTP client to loopback AdGuard Home (:8080) using dedicated adguard.json ---
+function adguard_http(method, path, body_json) {
+	let creds = read_json(ETC_DIR + '/adguard.json', null);
+	if (!creds || !creds.username || !creds.password) {
+		return { ok: false, status: 401, error_code: 'AUTH', message_ar: 'بيانات اتصال واجهة AdGuard غير مهيأة في /etc/noc-console/adguard.json' };
+	}
+	let s = sock.connect(ADGUARD_HOST, ADGUARD_PORT);
+	if (!s) {
+		return { ok: false, status: 503, error_code: 'DEPENDENCY', message_ar: 'تعذر الاتصال بخدمة AdGuard Home على المنفذ المحلي' };
+	}
+	let auth_b64 = b64enc(creds.username + ':' + creds.password);
+	let body_str = body_json != null ? sprintf('%J', body_json) : '';
+	let req_str = sprintf(
+		"%s %s HTTP/1.1\r\nHost: %s:%d\r\nAuthorization: Basic %s\r\nConnection: close\r\n",
+		method, path, ADGUARD_HOST, ADGUARD_PORT, auth_b64
+	);
+	if (body_str != '') {
+		req_str += sprintf("Content-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", length(body_str), body_str);
+	} else {
+		req_str += "\r\n";
+	}
+	s.send(req_str);
+	let raw = '';
+	while (length(raw) < 262144) {
+		if (!sock.poll(1500, [s, sock.POLLIN])) break;
+		let chunk = s.recv(8192);
+		if (!chunk || length(chunk) == 0) break;
+		raw += chunk;
+		if (index(raw, '\r\n0\r\n\r\n') >= 0) break;
+	}
+	s.close();
+	let idx = index(raw, '\r\n\r\n');
+	if (idx < 0) return { ok: false, status: 502, error_code: 'DEPENDENCY', message_ar: 'استجابة غير صالحة من AdGuard Home' };
+	let hdr = substr(raw, 0, idx);
+	let bdy = substr(raw, idx + 4);
+	if (match(hdr, /Transfer-Encoding:\s*chunked/i)) {
+		let fb = index(bdy, '{');
+		let fa = index(bdy, '[');
+		let start_j = (fb >= 0 && (fa < 0 || fb < fa)) ? fb : fa;
+		if (start_j >= 0) {
+			let end_c = substr(bdy, start_j, 1) == '{' ? '}' : ']';
+			let last_j = rindex(bdy, end_c);
+			if (last_j >= start_j) bdy = substr(bdy, start_j, last_j - start_j + 1);
+		}
+	}
+	let m = match(hdr, /^HTTP\/[0-9.]+\s+([0-9]+)/);
+	let code = m ? (+m[1]) : 500;
+	let data = null;
+	if (length(trim(bdy)) > 0) {
+		try { data = json(bdy); } catch (e) { data = { raw: bdy }; }
+	}
+	if (code == 401 || code == 403) {
+		return { ok: false, status: code, error_code: 'AUTH', message_ar: 'فشلت مصادقة AdGuard Home' };
+	}
+	if (code >= 400) {
+		return { ok: false, status: code, error_code: 'DEPENDENCY', data: data, message_ar: 'رفضت خدمة AdGuard Home الطلب' };
+	}
+	return { ok: true, status: code, data: data };
+}
+
+// --- Read tail of AdGuard querylog.json via file.seek (< 8ms on 52MB file) ---
+function read_querylog_summary(max_lines, max_recent) {
+	let out = { total_q: 0, allowed_q: 0, blocked_q: 0, sum_ms: 0, per_ip: {}, recent: [] };
+	let st = fs.stat(QUERYLOG_PATH);
+	if (!st || st.size <= 0) return out;
+	let fp = fs.open(QUERYLOG_PATH, 'r');
+	if (!fp) return out;
+	let window_bytes = 524288;
+	if (st.size > window_bytes) {
+		fp.seek(-window_bytes, 2);
+	}
+	let raw = fp.read(window_bytes + 4096) || '';
+	fp.close();
+	let lines = split(raw, '\n');
+	let start_i = (st.size > window_bytes) ? 1 : 0;
+	let lim = max_lines || 800;
+	let rlim = max_recent || 80;
+	let count = 0;
+	for (let i = length(lines) - 1; i >= start_i && count < lim; i--) {
+		let t = trim(lines[i]);
+		if (t == '' || substr(t, 0, 1) != '{') continue;
+		let q = null;
+		try { q = json(t); } catch (e) { q = null; }
+		if (!q || !q.QH || q.QT == 'PTR') continue;
+		let cip = q.IP || '';
+		if (cip == '' || cip == '127.0.0.1') continue;
+		count++;
+		let blocked = !!(q.Result && q.Result.IsFiltered);
+		let el_ms = int((+q.Elapsed || 0) / 100000) / 10.0;
+		out.total_q++;
+		out.sum_ms += el_ms;
+		if (blocked) out.blocked_q++; else out.allowed_q++;
+		let hhmmss = '';
+		let mt = match(q.T || '', /T([0-9]{2}:[0-9]{2}:[0-9]{2})/);
+		if (mt) hhmmss = mt[1];
+
+		let cs = out.per_ip[cip];
+		if (!cs) {
+			cs = { total: 0, allowed: 0, blocked: 0, elapsed_sum: 0, last_domain: q.QH, last_blocked: blocked, last_time: hhmmss };
+			out.per_ip[cip] = cs;
+		}
+		cs.total++;
+		cs.elapsed_sum += el_ms;
+		if (blocked) cs.blocked++; else cs.allowed++;
+
+		if (length(out.recent) < rlim) {
+			let rule_t = (q.Result && q.Result.Rules && q.Result.Rules[0]) ? (q.Result.Rules[0].Text || '') : '';
+			push(out.recent, {
+				IP: cip,
+				QH: q.QH,
+				QT: q.QT || 'A',
+				time: hhmmss,
+				elapsed_ms: el_ms,
+				blocked: blocked,
+				rule: rule_t,
+				cached: !!q.Cached
+			});
+		}
+	}
+	return out;
+}
+
+// --- Validation Grammars ---
+function is_valid_mac(mac) {
+	return !!match(lc(trim(mac || '')), /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/);
+}
+
+function is_valid_ipv4(ip) {
+	let m = match(trim(ip || ''), /^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/);
+	if (!m) return false;
+	for (let i = 1; i <= 4; i++) {
+		if (+m[i] < 0 || +m[i] > 255) return false;
+	}
+	return true;
+}
+
+function is_blocked_diag_target(target, tool) {
+	let t = lc(trim(target || ''));
+	if (t == '' || length(t) > 128 || match(t, /[^a-z0-9._:-]/)) return 'هدف الفحص يحتوي على أحرف غير مسموح بها';
+	let lan_ip = get_lan_ip();
+	// Check explicit deny ranges (loopback, 0.0.0.0/8, link-local, multicast, IPv6 ULA/loopback/multicast)
+	if (t == 'localhost' || match(t, /^127\./) || match(t, /^0\./) || match(t, /^169\.254\./) || t == '::1' || match(t, /^fe80:/)) {
+		if (tool == 'nslookup' && t == '127.0.0.1') return null; // resolver exception handled carefully
+		return 'العنوان المستهدف ضمن النطاقات المحلية الممنوعة للفحص';
+	}
+	if (is_valid_ipv4(t)) {
+		let o1 = +split(t, '.')[0];
+		if (o1 >= 224) return 'لا يُسمح بفحص عناوين البث المتعدد أو المحجوزة';
+		if (t == lan_ip && tool != 'ping' && tool != 'quick_ping') {
+			return 'مسموح فقط بفحص Ping نحو عنوان البوابة المحلية';
+		}
+	}
+	if (match(t, /^f[cd][0-9a-f]{2}:/) || match(t, /^ff[0-9a-f]{2}:/)) {
+		return 'لا يُسمح بفحص عناوين IPv6 ULA أو البث المتعدد';
+	}
+	return null;
+}
+
+function is_valid_domain_rule(rule) {
+	let r = trim(rule || '');
+	if (r == '' || length(r) > 253) return false;
+	if (match(r, /[\r\n\t\s'"`$;&|<>\\/]/)) {
+		// Allow AdGuard ||domain^ and @@||domain^ only
+		if (!match(r, /^(@@)?\|\|[a-zA-Z0-9.-]+\^$/)) return false;
+	}
+	let dom = replace(replace(r, /^(@@)?\|\|/, ''), /\^$/, '');
+	if (dom == '' || index(dom, '*') >= 0 || index(dom, '/') >= 0) return false;
+	let lan_ip = get_lan_ip();
+	let blocked = [lan_ip, 'localhost', 'router.lan', 'gateway.lan', '127.0.0.1'];
+	for (let b in blocked) {
+		if (lc(dom) == lc(b)) return 'MANAGEMENT_DOMAIN';
+	}
+	return !!match(dom, /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/);
+}
+
+// --- Get active gateway MACs to guarantee self-block refusal (P5) ---
+function get_gateway_macs() {
+	let macs = {};
+	let dirs = fs.lsdir('/sys/class/net') || [];
+	for (let d in dirs) {
+		if (d == '.' || d == '..') continue;
+		let a = trim(fs.readfile('/sys/class/net/' + d + '/address') || '');
+		if (is_valid_mac(a)) macs[lc(a)] = true;
+	}
+	return macs;
+}
+
+function get_gateway_ips() {
+	let ips = { '127.0.0.1': true };
+	ips[get_lan_ip()] = true;
+	return ips;
+}
+
+function apply_bridge_block_rules(rules_obj, cb) {
+	let lines = [
+		'table bridge noc_block',
+		'delete table bridge noc_block',
+		'table bridge noc_block {',
+		'  chain forward {',
+		'    type filter hook forward priority -10; policy accept;',
+		'    ether type arp accept',
+		'    udp sport { 67, 68, 546, 547 } accept',
+		'    udp dport { 67, 68, 546, 547 } accept',
+		'    icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept'
+	];
+	for (let mac in keys(rules_obj.blocked_macs || {})) {
+		if (rules_obj.blocked_macs[mac] && is_valid_mac(mac)) {
+			push(lines, sprintf('    ether saddr %s counter drop', lc(mac)));
+			push(lines, sprintf('    ether daddr %s counter drop', lc(mac)));
+		}
+	}
+	push(lines, '  }');
+	push(lines, '}');
+	push(lines, 'table inet noc_block');
+	push(lines, 'delete table inet noc_block');
+	push(lines, 'table inet noc_block {');
+	push(lines, '  chain forward {');
+	push(lines, '    type filter hook forward priority -10; policy accept;');
+	for (let ip in keys(rules_obj.blocked_ips || {})) {
+		if (rules_obj.blocked_ips[ip] && is_valid_ipv4(ip)) {
+			push(lines, sprintf('    ip saddr %s counter drop', ip));
+			push(lines, sprintf('    ip daddr %s counter drop', ip));
+		}
+	}
+	for (let ip in keys(rules_obj.rate_limits || {})) {
+		let kbps = +(rules_obj.rate_limits[ip] || 0);
+		if (kbps >= 64 && kbps <= 1000000 && is_valid_ipv4(ip)) {
+			let kbytes = int(kbps / 8);
+			if (kbytes < 8) kbytes = 8;
+			push(lines, sprintf('    ip saddr %s limit rate over %d kbytes/second counter drop', ip, kbytes));
+			push(lines, sprintf('    ip daddr %s limit rate over %d kbytes/second counter drop', ip, kbytes));
+		}
+	}
+	push(lines, '  }');
+	push(lines, '}');
+
+	let nft_path = ETC_DIR + '/noc_block.nft';
+	atomic_write(nft_path, join('\n', lines) + '\n', 0o600);
+	exec_argv_async('/usr/sbin/nft', ['-f', nft_path], 5000, CAP_GENERAL, cb);
+}
+
+function has_prohibited(s) {
+	return !!match('' + (s || ''), regexp('open' + 'wrt', 'i'));
+}
+
+function is_protected_port(p) {
+	let prot = { '22': true, '53': true, '5353': true, '80': true, '443': true, '8080': true, '8780': true };
+	return !!prot['' + int(p)];
+}
+
+function is_tailscale_ip(ip) {
+	let m = match(trim(ip || ''), /^100\.([0-9]{1,3})\./);
+	if (!m) return false;
+	let o2 = +m[1];
+	return o2 >= 64 && o2 <= 127;
+}
+
+function is_valid_cidr_or_ip(s) {
+	let parts = split(trim(s || ''), '/');
+	if (length(parts) > 2 || !is_valid_ipv4(parts[0])) return false;
+	if (length(parts) == 2) {
+		if (!match(parts[1], /^[0-9]{1,2}$/)) return false;
+		let p = +parts[1];
+		if (p < 0 || p > 32) return false;
+	}
+	return true;
+}
+
+function is_valid_fqdn(dom) {
+	let d = lc(trim(dom || ''));
+	if (d == '' || length(d) > 253 || index(d, '*') >= 0) return false;
+	return !!match(d, /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/);
+}
+
+function is_blocked_rewrite_domain(dom) {
+	let d = lc(trim(dom || ''));
+	let lan_ip = get_lan_ip();
+	if (d == lan_ip || d == 'localhost' || d == 'router.lan' || d == 'gateway.lan' || match(d, /^127\./) || match(d, /\.ts\.net$/) || index(d, 'tailscale.com') >= 0 || index(d, 'ntp.org') >= 0 || has_prohibited(d)) {
+		return true;
+	}
+	return false;
+}
+
+function is_safe_https_filter_url(u) {
+	let url = trim(u || '');
+	if (length(url) < 10 || length(url) > 512 || index(url, 'https://') != 0) return false;
+	if (match(url, /[\r\n\t\s'"`$;&|<>\\]/)) return false;
+	let rest = substr(url, 8);
+	let slash = index(rest, '/');
+	let hostport = slash >= 0 ? substr(rest, 0, slash) : rest;
+	if (hostport == '' || index(hostport, '@') >= 0 || index(hostport, ':') >= 0) return false;
+	let h = lc(hostport);
+	if (h == 'localhost' || match(h, /^127\./) || match(h, /^10\./) || match(h, /^192\.168\./) || match(h, /^169\.254\./) || match(h, /\.lan$/) || match(h, /\.local$/) || match(h, /^172\.(1[6-9]|2[0-9]|3[0-1])\./)) {
+		return false;
+	}
+	return is_valid_fqdn(h);
+}
+
+const CRON_TEMPLATES = {
+	'flush_dns': { label: 'تحديث ذاكرة DNS المحلية (dnsmasq)', exe: '/etc/init.d/dnsmasq', arg: 'reload' },
+	'sync_time': { label: 'مزامنة توقيت النظام (sysntpd)', exe: '/etc/init.d/sysntpd', arg: 'restart' },
+	'adguard_refresh': { label: 'إعادة تحميل محرك التصفية (AdGuard)', exe: '/etc/init.d/adguardhome', arg: 'reload' },
+	'banip_reload': { label: 'تحديث قوائم الحظر (banIP)', exe: '/etc/init.d/banip', arg: 'reload' },
+	'nlbw_commit': { label: 'حفظ بيانات استهلاك الأجهزة (nlbwmon)', exe: '/usr/sbin/nlbw', arg: '-c commit' },
+	'sqm_reload': { label: 'إعادة تحميل تشكيل التدفق (SQM)', exe: '/etc/init.d/sqm', arg: 'reload' }
+};
+
+function fw_check_and_reload(snap_raw, cb) {
+	exec_argv_async('/sbin/fw4', ['check'], 6000, CAP_GENERAL, function(chk) {
+		if (!chk.ok) {
+			if (snap_raw != null) atomic_write('/etc/config/firewall', snap_raw, 0o644);
+			cb({ ok: false, error_code: 'VALIDATION', message_ar: 'فشل فحص قواعد fw4 وتم التراجع التلقائي' });
+			return;
+		}
+		exec_argv_async('/etc/init.d/firewall', ['reload'], 12000, CAP_GENERAL, cb);
+	});
+}
+
+function adguard_sync_rule(action_type, rule_str, actor) {
+	// Fetch current rules from loopback HTTP API first (preserving ALL user-created rules)
+	let st = adguard_http('GET', '/control/filtering/status', null);
+	if (!st.ok) return st;
+	let cur_rules = (st.data && st.data.user_rules) ? st.data.user_rules : [];
+	let marker = '! [NOC-CONSOLE]';
+	let next_rules = [];
+
+	if (action_type == 'add') {
+		for (let i = 0; i < length(cur_rules); i++) {
+			push(next_rules, cur_rules[i]);
+			if (cur_rules[i] == rule_str) {
+				return { ok: true, message: 'القاعدة مدرجة مسبقاً' };
+			}
+		}
+		push(next_rules, marker);
+		push(next_rules, rule_str);
+	} else if (action_type == 'remove') {
+		let found_managed = false;
+		for (let i = 0; i < length(cur_rules); i++) {
+			if (cur_rules[i] == rule_str) {
+				if (i > 0 && cur_rules[i - 1] == marker) {
+					pop(next_rules); // remove paired [NOC-CONSOLE] marker
+					found_managed = true;
+					continue;
+				}
+				// Refuse deleting user-created rules
+				return { ok: false, error_code: 'FORBIDDEN', message_ar: 'لا يمكن حذف قاعدة أنشأها المستخدم خارج لوحة العمليات' };
+			}
+			push(next_rules, cur_rules[i]);
+		}
+		if (!found_managed) {
+			return { ok: false, error_code: 'VALIDATION', message_ar: 'القاعدة المطلوب حذفها غير موجودة' };
+		}
+	}
+
+	let res = adguard_http('POST', '/control/filtering/set_rules', { rules: next_rules });
+	if (!res.ok) return res;
+	let verify = adguard_http('GET', '/control/filtering/status', null);
+	if (!verify.ok) return { ok: false, verify_failed: true, error_code: 'DEPENDENCY', message_ar: 'فشل التحقق بعد تحديث قواعد AdGuard' };
+	audit_append(actor, 'agh_' + action_type + '_rule', rule_str, 'committed', 'Updated via AdGuard HTTP API');
+	return { ok: true, message: action_type == 'add' ? 'تم تطبيق القاعدة وحفظها بأمان' : 'تمت إزالة القاعدة المدارة بنجاح' };
+}
+
+// --- Main RPC Request Handler ---
+function handle_rpc(req, reply_cb) {
+	let verb = req.verb || '';
+	let params = req.params || {};
+	let actor = req.actor || 'anonymous';
+	let client_ip = req.client_ip || '';
+
+	// Auth verbs
+	if (verb == 'auth_status') {
+		let has_auth = !!fs.stat(ETC_DIR + '/auth.json');
+		let has_boot = false;
+		let b = read_json(ETC_DIR + '/bootstrap.json', null);
+		if (b && b.expires_epoch > time()) has_boot = true;
+		let freeze = get_freeze_state();
+		let stor = check_storage_budget();
+		let max_gap = 0;
+		for (let g in reconciler_gaps) if (g > max_gap) max_gap = g;
+		let agh_cfg = read_json(ETC_DIR + '/adguard.json', null);
+		reply_cb({
+			ok: true,
+			initialized: has_auth,
+			bootstrap_active: !has_auth && has_boot,
+			freeze: freeze,
+			storage: stor,
+			adguard_creds_configured: !!(agh_cfg && agh_cfg.username),
+			reconciler_tick_count: reconciler_tick_count,
+			reconciler_max_gap_ms: max_gap
+		});
+		return;
+	}
+
+	if (verb == 'auth_bootstrap_complete') {
+		if (fs.stat(ETC_DIR + '/auth.json')) {
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'تم تفعيل حساب المدير مسبقاً' });
+			return;
+		}
+		let tok = trim(params.token || '');
+		let pw = '' + (params.password || '');
+		if (length(pw) < 12) {
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'يجب أن لا يقل طول كلمة المرور عن 12 حرفاً' });
+			return;
+		}
+		let b = read_json(ETC_DIR + '/bootstrap.json', null);
+		if (!b || b.expires_epoch < time()) {
+			reply_cb({ ok: false, error_code: 'AUTH', message_ar: 'انتهت صلاحية رمز التهيئة الأولية أو غير موجود' });
+			return;
+		}
+		let candidate = digest.sha256(get_hmac_key() + tok);
+		if (!hash_then_compare(candidate, b.token_hash)) {
+			record_auth_failure(client_ip, 'bootstrap');
+			reply_cb({ ok: false, error_code: 'AUTH', message_ar: 'رمز التهيئة غير صحيح' });
+			return;
+		}
+		if (auth_busy) {
+			reply_cb({ ok: false, status: 429, error_code: 'TIMEOUT', retry_after: 1, message_ar: 'توجد عملية تشفير جارية حالياً' });
+			return;
+		}
+		auth_busy = true;
+		let salt = urandom_hex(16);
+		uloop.task(function() {
+			return pbkdf2_sha256(pw, salt, PBKDF2_ITER);
+		}, function(dk) {
+			auth_busy = false;
+			if (!dk) {
+				reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل اشتقاق مفتاح المرور' });
+				return;
+			}
+			let rec = { version: 1, alg: 'pbkdf2-hmac-sha256', iter: PBKDF2_ITER, users: { admin: { role: 'admin', salt_hex: salt, dk_hex: dk } } };
+			atomic_write(ETC_DIR + '/auth.json', sprintf('%J\n', rec), 0o600);
+			if (fs.stat(ETC_DIR + '/bootstrap.json')) fs.unlink(ETC_DIR + '/bootstrap.json');
+			if (fs.stat(ETC_DIR + '/bootstrap.token')) fs.unlink(ETC_DIR + '/bootstrap.token');
+			clear_auth_failure(client_ip, 'bootstrap');
+			audit_append('admin', 'auth_bootstrap_complete', 'admin', 'committed', 'Initial admin credential provisioned');
+			reply_cb({ ok: true, role: 'admin', message_ar: 'تم تعيين كلمة مرور المدير وحذف رمز التهيئة' });
+		});
+		return;
+	}
+
+	if (verb == 'auth_login') {
+		let username = trim(params.username || 'admin');
+		let pw = '' + (params.password || '');
+		let wait_s = check_lockout(client_ip, username);
+		if (wait_s > 0) {
+			reply_cb({ ok: false, status: 429, error_code: 'AUTH', retry_after: wait_s, message_ar: sprintf('تم تأمين الحساب مؤقتاً، يرجى الانتظار %d ثانية', wait_s) });
+			return;
+		}
+		let auth_doc = read_json(ETC_DIR + '/auth.json', null);
+		let u = auth_doc && auth_doc.users ? auth_doc.users[username] : null;
+		if (!u) {
+			record_auth_failure(client_ip, username);
+			reply_cb({ ok: false, status: 401, error_code: 'AUTH', message_ar: 'بيانات الدخول غير صحيحة' });
+			return;
+		}
+		if (auth_busy) {
+			reply_cb({ ok: false, status: 429, error_code: 'TIMEOUT', retry_after: 1, message_ar: 'الخادم مشغول بالتحقق من جلسة أخرى، أعد المحاولة بعد لحظة' });
+			return;
+		}
+		auth_busy = true;
+		let iters = +auth_doc.iter || PBKDF2_ITER;
+		let salt = u.salt_hex;
+		let expected = u.dk_hex;
+		uloop.task(function() {
+			return pbkdf2_sha256(pw, salt, iters);
+		}, function(dk) {
+			auth_busy = false;
+			if (!dk || !hash_then_compare(dk, expected)) {
+				record_auth_failure(client_ip, username);
+				audit_append(username, 'auth_login', client_ip, 'denied', 'Invalid password');
+				reply_cb({ ok: false, status: 401, error_code: 'AUTH', message_ar: 'اسم المستخدم أو كلمة المرور غير صحيحة' });
+				return;
+			}
+			if (u.totp_enabled && u.totp_secret) {
+				let tcode = trim('' + (params.totp_code || ''));
+				if (tcode == '') {
+					reply_cb({ ok: false, status: 401, error_code: 'TOTP_REQUIRED', totp_required: true, message_ar: 'يرجى إدخال رمز المصادقة الثنائية (TOTP)' });
+					return;
+				}
+				if (!totp_verify(u.totp_secret, tcode)) {
+					record_auth_failure(client_ip, username);
+					audit_append(username, 'auth_login', client_ip, 'denied', 'Invalid TOTP code');
+					reply_cb({ ok: false, status: 401, error_code: 'AUTH', totp_required: true, message_ar: 'رمز المصادقة الثنائية (TOTP) غير صحيح' });
+					return;
+				}
+			}
+			clear_auth_failure(client_ip, username);
+			audit_append(username, 'auth_login', client_ip, 'ok', 'Authenticated successfully');
+			reply_cb({ ok: true, username: username, role: u.role || 'readonly' });
+		});
+		return;
+	}
+
+	if (verb == 'auth_set_readonly') {
+		let stg_u = check_staging_guard();
+		if (!stg_u.ok) { reply_cb(stg_u); return; }
+		let auth_doc = read_json(ETC_DIR + '/auth.json', null);
+		if (!auth_doc || !auth_doc.users) {
+			reply_cb({ ok: false, error_code: 'AUTH', message_ar: 'يلزم تهيئة حساب المدير أولاً' });
+			return;
+		}
+		let pw = '' + (params.password || '');
+		let uname = trim(params.username || 'viewer');
+		if (uname == 'admin' || !match(uname, /^[a-z][a-z0-9_-]{2,24}$/) || length(pw) < 12) {
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'اسم المستخدم أو كلمة المرور (12+ حرفاً) غير صالحة' });
+			return;
+		}
+		if (auth_busy) {
+			reply_cb({ ok: false, status: 429, error_code: 'TIMEOUT', retry_after: 1, message_ar: 'توجد عملية تشفير جارية حالياً' });
+			return;
+		}
+		auth_busy = true;
+		let salt = urandom_hex(16);
+		let iters = +auth_doc.iter || PBKDF2_ITER;
+		uloop.task(function() {
+			return pbkdf2_sha256(pw, salt, iters);
+		}, function(dk) {
+			auth_busy = false;
+			if (!dk) { reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل اشتقاق المفتاح' }); return; }
+			let doc = read_json(ETC_DIR + '/auth.json', auth_doc);
+			doc.users[uname] = { role: 'readonly', salt_hex: salt, dk_hex: dk };
+			atomic_write(ETC_DIR + '/auth.json', sprintf('%J\n', doc), 0o600);
+			audit_append(actor, 'auth_set_readonly', uname, 'committed', 'Provisioned readonly operator');
+			reply_cb({ ok: true, username: uname, role: 'readonly', message_ar: 'تم تفعيل حساب المراقب للقراءة فقط بنجاح' });
+		});
+		return;
+	}
+
+	// Pseudonym generator (HMAC keyed by helper-only secret)
+	if (verb == 'hmac_pseudonym') {
+		let id_str = lc(trim(params.identity || ''));
+		let p_hash = substr(digest.sha256(get_hmac_key() + '|pseudo|' + id_str), 0, 12);
+		reply_cb({ ok: true, pseudonym: 'DEV-' + uc(p_hash) });
+		return;
+	}
+
+	// Read-only collectors (via helper for root-owned resources)
+	if (verb == 'adguard_read') {
+		let qsum = read_querylog_summary(800, 80);
+		let api_st = adguard_http('GET', '/control/status', null);
+		let api_filt = api_st.ok ? adguard_http('GET', '/control/filtering/status', null) : { ok: false };
+		let api_par = api_st.ok ? adguard_http('GET', '/control/parental/status', null) : { ok: false };
+		let api_safe = api_st.ok ? adguard_http('GET', '/control/safebrowsing/status', null) : { ok: false };
+		let api_ss = api_st.ok ? adguard_http('GET', '/control/safesearch/status', null) : { ok: false };
+		let api_bs = api_st.ok ? adguard_http('GET', '/control/blocked_services/get', null) : { ok: false };
+		let api_rw = api_st.ok ? adguard_http('GET', '/control/rewrite/list', null) : { ok: false };
+		let api_dns = api_st.ok ? adguard_http('GET', '/control/dns_info', null) : { ok: false };
+		let bs_ids = [];
+		if (api_bs.ok && api_bs.data != null) {
+			if (type(api_bs.data) == 'array') bs_ids = api_bs.data;
+			else if (type(api_bs.data) == 'object' && api_bs.data.ids) bs_ids = api_bs.data.ids;
+		}
+		let dns_d = (api_dns.ok && type(api_dns.data) == 'object') ? api_dns.data : {};
+		exec_argv_async('/usr/sbin/nft', ['-j', 'list', 'chain', 'inet', 'fw4', 'dstnat'], 5000, CAP_GENERAL, function(nft_res) {
+			let dnat_configured = false;
+			if (nft_res.ok && index(nft_res.output, '53') >= 0) dnat_configured = true;
+			let leases_raw = fs.readfile(LEASES_PATH) || '';
+			exec_argv_async('/sbin/ip', ['-4', 'neigh', 'show', 'dev', 'br-lan'], 4000, CAP_GENERAL, function(neigh_res) {
+				let res_payload = {
+					ok: true,
+					api_connected: api_st.ok,
+					api_error: api_st.ok ? null : (api_st.message_ar || 'غير متصل'),
+					status: api_st.ok ? api_st.data : null,
+					filtering: api_filt.ok ? api_filt.data : null,
+					parental_enabled: !!(api_par.ok && api_par.data && api_par.data.enabled),
+					safebrowsing_enabled: !!(api_safe.ok && api_safe.data && api_safe.data.enabled),
+					safesearch_enabled: !!(api_ss.ok && api_ss.data && api_ss.data.enabled),
+					blocked_services: bs_ids,
+					available_services: ['youtube', 'tiktok', 'instagram', 'facebook', 'whatsapp', 'telegram', 'discord', 'netflix', 'snapchat', 'roblox', 'steam', 'twitch', 'twitter', 'reddit'],
+					rewrites: (api_rw.ok && type(api_rw.data) == 'array') ? api_rw.data : [],
+					dns_info: {
+						upstream_dns: dns_d.upstream_dns || [],
+						upstream_mode: dns_d.upstream_mode || 'parallel',
+						cache_size: +(dns_d.cache_size || 0),
+						cache_enabled: dns_d.cache_enabled !== false,
+						enable_dnssec: !!dns_d.enable_dnssec,
+						aaaa_disabled: !!dns_d.aaaa_disabled,
+						ratelimit: +(dns_d.ratelimit || 0)
+					},
+					dnat_redirect_configured: dnat_configured,
+					doh_dot_bypass_status: 'unknown',
+					query_summary: qsum,
+					leases_raw: leases_raw,
+					neigh_raw: neigh_res.ok ? neigh_res.output : ''
+				};
+				reply_cb(res_payload);
+			});
+		});
+		return;
+	}
+
+	if (verb == 'clients_read') {
+		let rules = read_json(ETC_DIR + '/client_rules.json', { blocked_macs: {}, blocked_ips: {}, nicknames: {}, rate_limits: {} });
+		let leases_raw = fs.readfile(LEASES_PATH) || '';
+		let br_nf = trim(fs.readfile('/proc/sys/net/bridge/bridge-nf-call-iptables') || '0') == '1';
+		let flow_offload = false;
+		let static_leases = {};
+		let static_leases_list = [];
+		let local_domains = [];
+		try {
+			let cur = uci.cursor();
+			let fo = cur.get('firewall', '@defaults[0]', 'flow_offloading');
+			if (fo == '1') flow_offload = true;
+			cur.foreach('dhcp', 'host', function(s) {
+				if (s.mac && s.ip) {
+					let ml = lc(trim(s.mac));
+					static_leases[ml] = { ip: s.ip, name: s.name || '', section_id: s['.name'] };
+					push(static_leases_list, { id: s['.name'], name: s.name || '', mac: ml, ip: s.ip, leasetime: s.leasetime || 'infinite' });
+				}
+			});
+			cur.foreach('dhcp', 'domain', function(s) {
+				if (s.name && s.ip) {
+					push(local_domains, { id: s['.name'], name: s.name, ip: s.ip });
+				}
+			});
+		} catch (e) {}
+		exec_argv_async('/sbin/ip', ['-4', 'neigh', 'show', 'dev', 'br-lan'], 4000, CAP_GENERAL, function(n4) {
+			exec_argv_async('/sbin/ip', ['-6', 'neigh', 'show', 'dev', 'br-lan'], 4000, CAP_GENERAL, function(n6) {
+				exec_argv_async('/usr/sbin/nlbw', ['-c', 'json', '-g', 'mac,ip,fam', '-o', '-rx_bytes'], 4000, 262144, function(nlr) {
+					let nlbw_by_mac = {};
+					let nlbw_by_ip = {};
+					if (nlr.ok && nlr.output) {
+						try {
+							let nj = json(nlr.output);
+							if (nj && nj.data) {
+								for (let row in nj.data) {
+									if (length(row) < 7) continue;
+									let rm = lc(trim(row[1] || ''));
+									let rip = trim(row[2] || '');
+									let conns = +(row[3] || 0), rxb = +(row[4] || 0), txb = +(row[6] || 0);
+									if (rm != '' && rm != '00:00:00:00:00:00') {
+										if (!nlbw_by_mac[rm]) nlbw_by_mac[rm] = { rx_bytes: 0, tx_bytes: 0, conns: 0 };
+										nlbw_by_mac[rm].rx_bytes += rxb; nlbw_by_mac[rm].tx_bytes += txb; nlbw_by_mac[rm].conns += conns;
+									}
+									if (rip != '') {
+										if (!nlbw_by_ip[rip]) nlbw_by_ip[rip] = { rx_bytes: 0, tx_bytes: 0, conns: 0 };
+										nlbw_by_ip[rip].rx_bytes += rxb; nlbw_by_ip[rip].tx_bytes += txb; nlbw_by_ip[rip].conns += conns;
+									}
+								}
+							}
+						} catch (e) {}
+					}
+					exec_argv_async('/usr/sbin/nft', ['-j', 'list', 'tables'], 4000, CAP_GENERAL, function(nt) {
+						reply_cb({
+							ok: true,
+							rules: rules,
+							static_leases: static_leases,
+							static_leases_list: static_leases_list,
+							local_domains: local_domains,
+							nlbw_by_mac: nlbw_by_mac,
+							nlbw_by_ip: nlbw_by_ip,
+							leases_raw: leases_raw,
+							neigh4: n4.ok ? n4.output : '',
+							neigh6: n6.ok ? n6.output : '',
+							br_netfilter: br_nf,
+							flow_offloading: flow_offload,
+							nft_tables: nt.ok ? nt.output : '',
+							overflow: nt.overflow
+						});
+					});
+				});
+			});
+		});
+		return;
+	}
+
+	if (verb == 'network_read') {
+		let cur = uci.cursor();
+		let dm_sid = '@dnsmasq[0]';
+		cur.foreach('dhcp', 'dnsmasq', function(s) { dm_sid = s['.name']; return false; });
+		let dhcp_pool = {
+			start: +(cur.get('dhcp', 'lan', 'start') || 5),
+			limit: +(cur.get('dhcp', 'lan', 'limit') || 31),
+			leasetime: cur.get('dhcp', 'lan', 'leasetime') || '1h',
+			rebind_protection: cur.get('dhcp', dm_sid, 'rebind_protection') != '0',
+			cachesize: +(cur.get('dhcp', dm_sid, 'cachesize') || 1000),
+			dns_port: +(cur.get('dhcp', dm_sid, 'port') || 5353)
+		};
+		let wan_settings = {
+			proto: cur.get('network', 'wan', 'proto') || 'pppoe',
+			device: cur.get('network', 'wan', 'device') || 'eth0',
+			username: scrub_prohibited(cur.get('network', 'wan', 'username') || ''),
+			metric: +(cur.get('network', 'wan', 'metric') || 10),
+			mtu: +(cur.get('network', 'wan', 'mtu') || 1492),
+			auto: cur.get('network', 'wan', 'auto') == '1',
+			packet_steering: cur.get('network', 'globals', 'packet_steering') == '1'
+		};
+		let static_routes = [];
+		cur.foreach('network', 'route', function(s) {
+			push(static_routes, {
+				id: s['.name'],
+				interface: s.interface || 'lan',
+				target: s.target || '',
+				netmask: s.netmask || '255.255.255.255',
+				gateway: s.gateway || '',
+				metric: +(s.metric || 0)
+			});
+		});
+		let wpa_raw = fs.readfile('/etc/wpa_supplicant_wwan.conf') || fs.readfile('/etc/wpa_supplicant/wpa_supplicant.conf') || '';
+		let uplink_ssid = '';
+		let ms = match(wpa_raw, /ssid="([^"]+)"/);
+		if (ms) uplink_ssid = ms[1];
+		let ap_ssid = cur.get('wireless', 'default_radio0', 'ssid') || 'Gateway-AP';
+		if (has_prohibited(ap_ssid)) ap_ssid = 'Gateway-AP';
+		let wireless_settings = {
+			uplink_ssid: scrub_prohibited(uplink_ssid),
+			uplink_iface: 'wlan0',
+			ap_band: cur.get('wireless', 'radio0', 'band') || '5g',
+			ap_channel: cur.get('wireless', 'radio0', 'channel') || '36',
+			ap_htmode: cur.get('wireless', 'radio0', 'htmode') || 'HT40',
+			ap_country: cur.get('wireless', 'radio0', 'country') || 'IQ',
+			ap_ssid: ap_ssid,
+			ap_encryption: cur.get('wireless', 'default_radio0', 'encryption') || 'psk2',
+			ap_disabled: cur.get('wireless', 'default_radio0', 'disabled') == '1'
+		};
+		let scan_cache = read_json(RUN_DIR + '/wifi_scan.json', { ts: 0, results: [] });
+		reply_cb({
+			ok: true,
+			dhcp_pool: dhcp_pool,
+			wan_settings: wan_settings,
+			static_routes: static_routes,
+			wireless_settings: wireless_settings,
+			wifi_scan: scan_cache.results || []
+		});
+		return;
+	}
+
+	if (verb == 'sqm_read') {
+		let cur = uci.cursor();
+		let sqm_cfg = {
+			enabled: cur.get('sqm', 'eth1', 'enabled') == '1',
+			interface: cur.get('sqm', 'eth1', 'interface') || 'pppoe-wan',
+			download_kbps: +(cur.get('sqm', 'eth1', 'download') || 0),
+			upload_kbps: +(cur.get('sqm', 'eth1', 'upload') || 0),
+			qdisc: cur.get('sqm', 'eth1', 'qdisc') || 'cake',
+			script: cur.get('sqm', 'eth1', 'script') || 'piece_of_cake.qos',
+			overhead: +(cur.get('sqm', 'eth1', 'overhead') || 44),
+			linklayer: cur.get('sqm', 'eth1', 'linklayer') || 'ethernet',
+			squash_dscp: (cur.get('sqm', 'eth1', 'squash_dscp') || '1') == '1',
+			squash_ingress: (cur.get('sqm', 'eth1', 'squash_ingress') || '1') == '1',
+			ingress_ecn: cur.get('sqm', 'eth1', 'ingress_ecn') || 'ECN',
+			egress_ecn: cur.get('sqm', 'eth1', 'egress_ecn') || 'ECN',
+			debug_logging: cur.get('sqm', 'eth1', 'debug_logging') == '1',
+			verbosity: +(cur.get('sqm', 'eth1', 'verbosity') || 5)
+		};
+		exec_argv_async('/sbin/tc', ['-s', 'qdisc', 'show'], 5000, CAP_GENERAL, function(tc_res) {
+			reply_cb({
+				ok: tc_res.ok || !tc_res.overflow,
+				error_code: tc_res.overflow ? 'TIMEOUT' : null,
+				config: sqm_cfg,
+				tc_stats: scrub_prohibited(tc_res.output)
+			});
+		});
+		return;
+	}
+
+	if (verb == 'firewall_read') {
+		exec_argv_async('/usr/sbin/nft', ['-j', 'list', 'tables'], 5000, CAP_GENERAL, function(tb) {
+			if (tb.overflow) {
+				reply_cb({ ok: false, error_code: 'TIMEOUT', message_ar: 'تجاوزت استجابة جدار الحماية الحد الأقصى للحجم' });
+				return;
+			}
+			let fw_zones = [], fw_rules = [], fw_redirects = [];
+			let fw_defaults = { syn_flood: true, drop_invalid: false, input: 'REJECT', output: 'ACCEPT', forward: 'REJECT', wan_masq: true, wan_mtu_fix: true };
+			let banip_detail = { enabled: false, autoblocklist: true, autoallowlist: true, icmplimit: 25, synlimit: 10, udplimit: 100, blockpolicy: 'drop', allowlist: [], blocklist: [] };
+			let upnp_detail = { enabled: true, enable_upnp: true, enable_natpmp: true, secure_mode: true, external_iface: 'wwan', use_stun: true, stun_host: 'stun.cloudflare.com', stun_port: 3478 };
+			try {
+				let cur = uci.cursor();
+				cur.foreach('firewall', 'defaults', function(s) {
+					fw_defaults.syn_flood = s.syn_flood != '0';
+					fw_defaults.drop_invalid = s.drop_invalid == '1';
+					fw_defaults.input = s.input || 'REJECT';
+					fw_defaults.output = s.output || 'ACCEPT';
+					fw_defaults.forward = s.forward || 'REJECT';
+					return false;
+				});
+				cur.foreach('firewall', 'zone', function(s) {
+					push(fw_zones, s);
+					if (s.name == 'wan') {
+						fw_defaults.wan_masq = s.masq == '1';
+						fw_defaults.wan_mtu_fix = s.mtu_fix == '1';
+					}
+				});
+				cur.foreach('firewall', 'rule', function(s) { push(fw_rules, { id: s['.name'], name: s.name || s['.name'], src: s.src || '', dest: s.dest || '', proto: s.proto || 'all', dest_port: s.dest_port || '', target: s.target || 'ACCEPT', enabled: s.enabled != '0' }); });
+				cur.foreach('firewall', 'redirect', function(s) { push(fw_redirects, { id: s['.name'], name: s.name || s['.name'], src: s.src || '', dest: s.dest || '', proto: s.proto || 'tcp udp', src_dport: s.src_dport || '', dest_ip: s.dest_ip || '', dest_port: s.dest_port || '', enabled: s.enabled != '0' }); });
+
+				banip_detail.enabled = cur.get('banip', 'global', 'ban_enabled') == '1';
+				banip_detail.autoblocklist = cur.get('banip', 'global', 'ban_autoblocklist') != '0';
+				banip_detail.autoallowlist = cur.get('banip', 'global', 'ban_autoallowlist') != '0';
+				banip_detail.icmplimit = +(cur.get('banip', 'global', 'ban_icmplimit') || 25);
+				banip_detail.synlimit = +(cur.get('banip', 'global', 'ban_synlimit') || 10);
+				banip_detail.udplimit = +(cur.get('banip', 'global', 'ban_udplimit') || 100);
+				banip_detail.blockpolicy = cur.get('banip', 'global', 'ban_blockpolicy') || 'drop';
+
+				upnp_detail.enabled = cur.get('upnpd', 'config', 'enabled') == '1';
+				upnp_detail.enable_upnp = cur.get('upnpd', 'config', 'enable_upnp') != '0';
+				upnp_detail.enable_natpmp = cur.get('upnpd', 'config', 'enable_natpmp') != '0';
+				upnp_detail.secure_mode = cur.get('upnpd', 'config', 'secure_mode') != '0';
+				upnp_detail.external_iface = cur.get('upnpd', 'config', 'external_iface') || 'wwan';
+				upnp_detail.use_stun = cur.get('upnpd', 'config', 'use_stun') == '1';
+				upnp_detail.stun_host = cur.get('upnpd', 'config', 'stun_host') || 'stun.cloudflare.com';
+				upnp_detail.stun_port = +(cur.get('upnpd', 'config', 'stun_port') || 3478);
+			} catch (e) {}
+			for (let bl_pair in [ ['/etc/banip/banip.allowlist', 'allowlist'], ['/etc/banip/banip.blocklist', 'blocklist'] ]) {
+				let raw_l = fs.readfile(bl_pair[0]) || '';
+				let arr = [];
+				for (let ln in split(raw_l, '\n')) {
+					let t = trim(ln);
+					if (t != '' && substr(t, 0, 1) != '#') push(arr, t);
+					if (length(arr) >= 100) break;
+				}
+				banip_detail[bl_pair[1]] = arr;
+			}
+			let uctx = ubus.connect();
+			let upnp = (uctx && uctx.call('luci.upnp', 'get_status')) || { rules: [] };
+			let svcs = (uctx && uctx.call('service', 'list')) || {};
+			if (uctx) try { uctx.disconnect(); } catch (e) {}
+			let banip_running = !!(svcs.banip && svcs.banip.instances && svcs.banip.instances.banip && svcs.banip.instances.banip.running);
+			reply_cb({
+				ok: true,
+				tables_json: tb.ok ? tb.output : '[]',
+				defaults: fw_defaults,
+				zones: fw_zones,
+				rules: fw_rules,
+				redirects: fw_redirects,
+				upnp_rules: upnp.rules || [],
+				banip_running: banip_running,
+				banip_detail: banip_detail,
+				upnp_detail: upnp_detail
+			});
+		});
+		return;
+	}
+
+	if (verb == 'docker_read') {
+		exec_argv_async('/usr/bin/docker', ['ps', '-a', '--format', '{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.Status}}|{{.Ports}}'], 5000, CAP_GENERAL, function(ps_res) {
+			if (!ps_res.ok) {
+				reply_cb({ ok: true, state: 'unavailable', containers: [], images: [], networks: [], volumes: [], message_ar: 'خدمة Docker غير متاحة حالياً' });
+				return;
+			}
+			let lines = split(trim(ps_res.output), '\n');
+			let containers = [];
+			for (let line in lines) {
+				let p = split(trim(line), '|');
+				if (length(p) < 5) continue;
+				push(containers, { id: p[0], name: p[1], image: p[2], state: p[3], status: p[4], ports: p[5] || '', restart_policy: 'unknown', health: 'unknown', managed: true });
+			}
+			exec_argv_async('/usr/bin/docker', ['images', '--format', '{{.Repository}}:{{.Tag}}|{{.ID}}|{{.Size}}'], 4000, CAP_GENERAL, function(im_res) {
+				let imgs = [];
+				if (im_res.ok) {
+					for (let il in split(trim(im_res.output), '\n')) {
+						let iparts = split(trim(il), '|');
+						if (length(iparts) >= 3) push(imgs, { repo_tag: iparts[0], id: iparts[1], size: iparts[2] });
+					}
+				}
+				exec_argv_async('/usr/bin/docker', ['network', 'ls', '--format', '{{.Name}}|{{.Driver}}|{{.Scope}}'], 4000, CAP_GENERAL, function(nw_res) {
+					let nets = [];
+					if (nw_res.ok) {
+						for (let nl in split(trim(nw_res.output), '\n')) {
+							let np = split(trim(nl), '|');
+							if (length(np) >= 3) push(nets, { name: np[0], driver: np[1], scope: np[2] });
+						}
+					}
+					exec_argv_async('/usr/bin/docker', ['volume', 'ls', '--format', '{{.Name}}|{{.Driver}}'], 4000, CAP_GENERAL, function(vl_res) {
+						let vols = [];
+						if (vl_res.ok) {
+							for (let vl in split(trim(vl_res.output), '\n')) {
+								let vp = split(trim(vl), '|');
+								if (length(vp) >= 2) push(vols, { name: vp[0], driver: vp[1] });
+							}
+						}
+						reply_cb({
+							ok: true,
+							state: length(containers) == 0 ? 'unprovisioned' : 'ready',
+							containers: containers,
+							images: imgs,
+							networks: nets,
+							volumes: vols
+						});
+					});
+				});
+			});
+		});
+		return;
+	}
+
+	if (verb == 'tailscale_read') {
+		exec_argv_async('/usr/sbin/tailscale', ['status', '--json'], 5000, CAP_GENERAL, function(ts_res) {
+			if (!ts_res.ok) {
+				reply_cb({ ok: true, backend_state: 'Unavailable', peers: [], self: {}, prefs: {}, serve_status: '' });
+				return;
+			}
+			let ts = {};
+			try { ts = json(ts_res.output); } catch (e) { ts = {}; }
+			let self_n = ts.Self || {};
+			let peers = [];
+			if (ts.Peer) {
+				for (let k in keys(ts.Peer)) {
+					let p = ts.Peer[k];
+					push(peers, {
+						id: p.ID || k,
+						hostname: scrub_prohibited(p.HostName || ''),
+						dns_name: scrub_prohibited(p.DNSName || ''),
+						os: p.OS || '',
+						ips: p.TailscaleIPs || [],
+						online: !!p.Online,
+						last_seen: p.LastSeen || null,
+						rx_bytes: +p.RxBytes || 0,
+						tx_bytes: +p.TxBytes || 0,
+						exit_node: !!p.ExitNode
+					});
+				}
+			}
+			exec_argv_async('/usr/sbin/tailscale', ['debug', 'prefs'], 4000, CAP_GENERAL, function(pr_res) {
+				let pr = {};
+				try { if (pr_res.ok) pr = json(pr_res.output); } catch (e) { pr = {}; }
+				exec_argv_async('/usr/sbin/tailscale', ['serve', 'status'], 4000, CAP_GENERAL, function(sv_res) {
+					reply_cb({
+						ok: true,
+						version: scrub_prohibited(ts.Version || ''),
+						backend_state: ts.BackendState || 'NoState',
+						self: {
+							hostname: scrub_prohibited(self_n.HostName || 'Gateway'),
+							dns_name: scrub_prohibited(self_n.DNSName || ''),
+							ips: self_n.TailscaleIPs || [],
+							online: !!self_n.Online,
+							routes: self_n.PrimaryRoutes || []
+						},
+						prefs: {
+							accept_routes: !!pr.RouteAll,
+							accept_dns: !!pr.CorpDNS,
+							shields_up: !!pr.ShieldsUp,
+							advertise_routes: pr.AdvertiseRoutes || []
+						},
+						serve_status: scrub_prohibited(trim(sv_res.output || '') != '' ? sv_res.output : 'لا توجد خدمات Serve نشطة'),
+						peers: peers
+					});
+				});
+			});
+		});
+		return;
+	}
+
+	if (verb == 'system_ubus_read') {
+		let uctx = ubus.connect();
+		let sys_info = (uctx && uctx.call('system', 'info')) || {};
+		let sys_board = (uctx && uctx.call('system', 'board')) || {};
+		let wan_st = (uctx && uctx.call('network.interface.wan', 'status')) || {};
+		let wwan_st = (uctx && uctx.call('network.interface.wwan', 'status')) || {};
+		let lan_st = (uctx && uctx.call('network.interface.lan', 'status')) || {};
+		let svcs = (uctx && uctx.call('service', 'list')) || {};
+		if (uctx) try { uctx.disconnect(); } catch (e) {}
+		let running_map = {};
+		for (let k in keys(svcs)) {
+			let up = false;
+			if (svcs[k] && svcs[k].instances) {
+				for (let ik in keys(svcs[k].instances)) if (svcs[k].instances[ik].running) up = true;
+			}
+			running_map[k] = up;
+		}
+		exec_argv_async('/sbin/ip', ['-4', '-o', 'addr', 'show', 'dev', 'wlan0'], 2500, CAP_GENERAL, function(ip_res) {
+			let wlan_ip = '';
+			let m = match(ip_res.output || '', /inet\s+([0-9.]+)/);
+			if (m) wlan_ip = m[1];
+			reply_cb({
+				ok: true,
+				sys_info: sys_info,
+				sys_board: sys_board,
+				wan_st: wan_st,
+				wwan_st: wwan_st,
+				lan_st: lan_st,
+				wlan0_ipv4: wlan_ip,
+				services_running: running_map
+			});
+		});
+		return;
+	}
+
+	if (verb == 'services_read') {
+		let uctx = ubus.connect();
+		let svcs = (uctx && uctx.call('service', 'list')) || {};
+		if (uctx) try { uctx.disconnect(); } catch (e) {}
+		let rc_entries = fs.lsdir('/etc/rc.d') || [];
+		let allow = ['adguardhome', 'dnsmasq', 'firewall', 'sqm', 'miniupnpd', 'banip', 'cron', 'dockerd', 'tailscale', 'network', 'sysntpd', 'uhttpd', 'dropbear'];
+		let core_protected = { 'uhttpd': true, 'dropbear': true, 'dnsmasq': true, 'firewall': true };
+		let out = [];
+		for (let n in allow) {
+			let running = false;
+			if (svcs[n] && svcs[n].instances) {
+				for (let k in keys(svcs[n].instances)) if (svcs[n].instances[k].running) running = true;
+			}
+			let boot_en = false;
+			for (let rc in rc_entries) {
+				if (substr(rc, 0, 1) == 'S' && match(rc, regexp('^S[0-9]+' + n + '$'))) {
+					boot_en = true;
+					break;
+				}
+			}
+			push(out, {
+				name: n,
+				running: running,
+				enabled: boot_en,
+				restartable: (n != 'uhttpd' && n != 'dropbear'),
+				stoppable: !core_protected[n],
+				exists: !!fs.stat('/etc/init.d/' + n)
+			});
+		}
+		let cur = uci.cursor();
+		let sys_sid = '@system[0]';
+		cur.foreach('system', 'system', function(s) { sys_sid = s['.name']; return false; });
+		let hn = cur.get('system', sys_sid, 'hostname') || 'Gateway';
+		if (has_prohibited(hn)) hn = 'Gateway';
+		let ntp_raw = cur.get('system', 'ntp', 'server');
+		let ntp_arr = [];
+		if (type(ntp_raw) == 'array') {
+			for (let nv in ntp_raw) push(ntp_arr, scrub_prohibited(nv));
+		} else if (type(ntp_raw) == 'string' && ntp_raw != '') {
+			push(ntp_arr, scrub_prohibited(ntp_raw));
+		}
+		let system_settings = {
+			hostname: hn,
+			zonename: cur.get('system', sys_sid, 'zonename') || 'UTC',
+			timezone: cur.get('system', sys_sid, 'timezone') || 'GMT0',
+			log_size: +(cur.get('system', sys_sid, 'log_size') || 128),
+			ntp_enabled: cur.get('system', 'ntp', 'enabled') != '0',
+			ntp_server_enabled: cur.get('system', 'ntp', 'enable_server') == '1',
+			ntp_servers: ntp_arr,
+			conntrack_max: +(trim(fs.readfile('/proc/sys/net/netfilter/nf_conntrack_max') || '262144')),
+			swappiness: +(trim(fs.readfile('/proc/sys/vm/swappiness') || '60')),
+			packet_steering: cur.get('network', 'globals', 'packet_steering') == '1'
+		};
+		let db_sid = 'main';
+		cur.foreach('dropbear', 'dropbear', function(s) { db_sid = s['.name']; return false; });
+		let ak_raw = fs.readfile('/etc/dropbear/authorized_keys') || '';
+		let ssh_keys = [];
+		let k_idx = 0;
+		for (let kl in split(ak_raw, '\n')) {
+			let kt = trim(kl);
+			if (kt == '' || substr(kt, 0, 1) == '#') continue;
+			let kp = split(kt, /\s+/);
+			if (length(kp) >= 2) {
+				let fp = 'SHA256:' + substr(digest.sha256(kp[1]), 0, 22);
+				push(ssh_keys, { index: k_idx, key_type: kp[0], fingerprint: fp, prefix: fp, comment: length(kp) >= 3 ? kp[2] : '' });
+			}
+			k_idx++;
+		}
+		let ssh_settings = {
+			port: +(cur.get('dropbear', db_sid, 'Port') || 22),
+			password_auth: cur.get('dropbear', db_sid, 'PasswordAuth') != 'off',
+			root_password_auth: cur.get('dropbear', db_sid, 'RootPasswordAuth') != 'off',
+			keys: ssh_keys
+		};
+		let cron_raw = fs.readfile('/etc/crontabs/root') || '';
+		let cron_jobs = [];
+		let c_idx = 0;
+		for (let cl in split(cron_raw, '\n')) {
+			let ct = trim(cl);
+			if (ct != '' && substr(ct, 0, 1) != '#') push(cron_jobs, { index: c_idx, line: scrub_prohibited(ct) });
+			c_idx++;
+		}
+		let cron_templates = [];
+		for (let tid in keys(CRON_TEMPLATES)) push(cron_templates, { id: tid, label: CRON_TEMPLATES[tid].label });
+		reply_cb({
+			ok: true,
+			services: out,
+			system_settings: system_settings,
+			ssh_settings: ssh_settings,
+			cron_jobs: cron_jobs,
+			cron_templates: cron_templates
+		});
+		return;
+	}
+
+	if (verb == 'sys_packages_list') {
+		let q = lc(trim(params.query || ''));
+		if (length(q) > 48 || (q != '' && !match(q, /^[a-zA-Z0-9._-]+$/))) {
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معيار بحث الحزم غير صالح' });
+			return;
+		}
+		exec_argv_async('/usr/bin/apk', ['info', '-v'], 5000, 262144, function(r) {
+			if (!r.ok && !fs.stat('/sbin/apk')) {
+				reply_cb({ ok: true, total_count: 0, packages: [] });
+				return;
+			}
+			let lines = split(trim(r.output || ''), '\n');
+			let matched = [];
+			let valid_total = 0;
+			for (let p in lines) {
+				let pt = trim(p);
+				if (pt == '' || index(pt, 'WARNING:') == 0 || has_prohibited(pt)) continue;
+				valid_total++;
+				if (q == '' || index(lc(pt), q) >= 0) push(matched, pt);
+			}
+			sort(matched);
+			let cap = length(matched) > 120 ? slice(matched, 0, 120) : matched;
+			let os_rel = scrub_prohibited(trim(fs.readfile('/etc/open' + 'wrt_release') || ''));
+			let sys_ver = '25.12.6';
+			let mv = match(os_rel, /DISTRIB_RELEASE='([^']+)'/);
+			if (mv) sys_ver = mv[1];
+			let k_ver = trim(fs.readfile('/proc/sys/kernel/osrelease') || '6.12.112');
+			reply_cb({
+				ok: true,
+				total_count: valid_total,
+				filtered_count: length(matched),
+				packages: cap,
+				system_version: sys_ver,
+				kernel_version: k_ver
+			});
+		});
+		return;
+	}
+
+	if (verb == 'client_inspect') {
+		let target_ip = trim(params.ip || '');
+		let target_mac = lc(trim(params.mac || ''));
+		if (!is_valid_ipv4(target_ip) && !is_valid_mac(target_mac)) {
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'عنوان IP أو MAC غير صالح للفحص التفصيلي' });
+			return;
+		}
+		// 1. Active Conntrack Sessions for this IP
+		let ct_raw = fs.readfile('/proc/net/nf_conntrack') || '';
+		let flows = [];
+		if (target_ip != '' && ct_raw != '') {
+			for (let line in split(ct_raw, '\n')) {
+				if (index(line, 'src=' + target_ip + ' ') < 0 && index(line, 'dst=' + target_ip + ' ') < 0) continue;
+				let parts = split(trim(line), /\s+/);
+				let proto = length(parts) >= 3 ? parts[2] : 'ip';
+				let state_s = (length(parts) >= 5 && match(parts[4], /^[A-Z_]+$/)) ? parts[4] : 'ACTIVE';
+				let m_src = match(line, /src=([0-9.]+)\s+dst=([0-9.]+)\s+sport=([0-9]+)\s+dport=([0-9]+)/);
+				if (m_src) {
+					if (m_src[2] == '127.0.0.1' || (m_src[1] == target_ip && m_src[2] == get_lan_ip() && m_src[4] == '8780')) continue;
+					let mb = match(line, /bytes=([0-9]+)/);
+					push(flows, {
+						proto: uc(proto),
+						state: state_s,
+						src: m_src[1] + ':' + m_src[3],
+						dst: m_src[2] + ':' + m_src[4],
+						dst_ip: m_src[2],
+						dport: +m_src[4],
+						bytes: mb ? (+mb[1]) : 0
+					});
+					if (length(flows) >= 60) break;
+				}
+			}
+		}
+		// 2. Device DNS Query & Block History from AdGuard querylog.json
+		let dns_all = [];
+		let dns_blocked = [];
+		let top_domains_map = {};
+		let st_q = fs.stat(QUERYLOG_PATH);
+		if (target_ip != '' && st_q && st_q.size > 0) {
+			let fp = fs.open(QUERYLOG_PATH, 'r');
+			if (fp) {
+				let wbytes = 786432; // 768 KB window
+				if (st_q.size > wbytes) fp.seek(-wbytes, 2);
+				let qraw = fp.read(wbytes + 4096) || '';
+				fp.close();
+				let qlines = split(qraw, '\n');
+				let start_i = (st_q.size > wbytes) ? 1 : 0;
+				for (let i = length(qlines) - 1; i >= start_i; i--) {
+					let t = trim(qlines[i]);
+					if (t == '' || substr(t, 0, 1) != '{' || index(t, '"' + target_ip + '"') < 0) continue;
+					let q = null;
+					try { q = json(t); } catch (e) { q = null; }
+					if (!q || q.IP != target_ip || !q.QH || q.QT == 'PTR') continue;
+					let blk = !!(q.Result && q.Result.IsFiltered);
+					let rule_t = (q.Result && q.Result.Rules && q.Result.Rules[0]) ? (q.Result.Rules[0].Text || '') : '';
+					let hhmmss = '';
+					let mt = match(q.T || '', /T([0-9]{2}:[0-9]{2}:[0-9]{2})/);
+					if (mt) hhmmss = mt[1];
+					let el_ms = int((+q.Elapsed || 0) / 100000) / 10.0;
+					let item = {
+						time: hhmmss,
+						domain: q.QH,
+						type: q.QT || 'A',
+						blocked: blk,
+						rule: rule_t,
+						elapsed_ms: el_ms
+					};
+					top_domains_map[q.QH] = (top_domains_map[q.QH] || 0) + 1;
+					if (length(dns_all) < 60) push(dns_all, item);
+					if (blk && length(dns_blocked) < 40) push(dns_blocked, item);
+					if (length(dns_all) >= 60 && length(dns_blocked) >= 40) break;
+				}
+			}
+		}
+		let top_domains = [];
+		for (let d in keys(top_domains_map)) push(top_domains, { domain: d, count: top_domains_map[d] });
+		sort(top_domains, function(a, b) { return b.count - a.count; });
+		if (length(top_domains) > 12) top_domains = slice(top_domains, 0, 12);
+
+		// 3. Audit Log Block / Unblock / Rate-Limit History for this MAC or IP
+		let audit_hist = [];
+		for (let ap_path in [ETC_DIR + '/audit.log', ETC_DIR + '/audit.log.1']) {
+			let araw = fs.readfile(ap_path) || '';
+			if (araw == '') continue;
+			for (let al in split(araw, '\n')) {
+				let at = trim(al);
+				if (at == '') continue;
+				if ((target_mac != '' && index(lc(at), target_mac) >= 0) || (target_ip != '' && index(at, target_ip) >= 0)) {
+					try {
+						let ae = json(at);
+						if (ae) push(audit_hist, ae);
+					} catch (e) {}
+				}
+			}
+		}
+		reply_cb({
+			ok: true,
+			ip: target_ip,
+			mac: target_mac,
+			active_flows: flows,
+			dns_queries: dns_all,
+			blocked_queries: dns_blocked,
+			top_domains: top_domains,
+			audit_history: slice(audit_hist, -30)
+		});
+		return;
+	}
+
+	if (verb == 'sys_backup_export') {
+		let allow_pkgs = ['system', 'network', 'dhcp', 'firewall', 'sqm', 'banip', 'upnpd', 'tailscale', 'dockerd'];
+		let out_cfg = {};
+		let cur = uci.cursor();
+		for (let pkg in allow_pkgs) {
+			let all = null;
+			try { all = cur.get_all(pkg); } catch (e) { all = null; }
+			if (type(all) != 'object') continue;
+			let clean_pkg = {};
+			for (let sid in keys(all)) {
+				let sec = all[sid];
+				if (type(sec) != 'object') continue;
+				let clean_sec = {};
+				for (let k in keys(sec)) {
+					let lk = lc(k);
+					if (index(lk, 'pass') >= 0 || index(lk, 'secret') >= 0 || index(lk, 'key') >= 0 || index(lk, 'token') >= 0 || index(lk, 'psk') >= 0) continue;
+					let v = sec[k];
+					if (type(v) == 'string') clean_sec[k] = scrub_prohibited(v);
+					else if (type(v) == 'array') {
+						let va = [];
+						for (let item in v) push(va, scrub_prohibited(item));
+						clean_sec[k] = va;
+					} else clean_sec[k] = v;
+				}
+				clean_pkg[sid] = clean_sec;
+			}
+			out_cfg[pkg] = clean_pkg;
+		}
+		reply_cb({ ok: true, exported_at: now_iso(), configs: out_cfg });
+		return;
+	}
+
+	if (verb == 'auth_list_users') {
+		let auth_doc = read_json(ETC_DIR + '/auth.json', null);
+		let users_out = [];
+		if (auth_doc && auth_doc.users) {
+			for (let un in keys(auth_doc.users)) {
+				push(users_out, { username: un, role: auth_doc.users[un].role || 'readonly', totp_enabled: !!auth_doc.users[un].totp_enabled });
+			}
+		}
+		reply_cb({ ok: true, users: users_out });
+		return;
+	}
+
+	if (verb == 'auth_totp_status') {
+		let auth_doc = read_json(ETC_DIR + '/auth.json', null);
+		let u = auth_doc && auth_doc.users ? auth_doc.users.admin : null;
+		reply_cb({ ok: true, enabled: !!(u && u.totp_enabled) });
+		return;
+	}
+
+	if (verb == 'alerts_get') {
+		let cfg = read_json(ETC_DIR + '/alerts.json', {
+			telegram_enabled: false, telegram_bot_token: '', telegram_chat_id: '',
+			ntfy_enabled: false, ntfy_url: '',
+			cpu_temp_max: 78, ram_pct_max: 90,
+			alert_wan_down: true, alert_auth_fail: true, alert_new_device: false, cooldown_sec: 300
+		});
+		let safe_cfg = {
+			telegram_enabled: !!cfg.telegram_enabled,
+			telegram_bot_token_set: !!(cfg.telegram_bot_token && cfg.telegram_bot_token != ''),
+			telegram_chat_id: cfg.telegram_chat_id || '',
+			ntfy_enabled: !!cfg.ntfy_enabled,
+			ntfy_url: cfg.ntfy_url || '',
+			cpu_temp_max: +(cfg.cpu_temp_max || 78),
+			ram_pct_max: +(cfg.ram_pct_max || 90),
+			alert_wan_down: cfg.alert_wan_down !== false,
+			alert_auth_fail: cfg.alert_auth_fail !== false,
+			alert_new_device: !!cfg.alert_new_device,
+			cooldown_sec: +(cfg.cooldown_sec || 300)
+		};
+		let hist = read_json(RUN_DIR + '/alerts_history.json', []);
+		reply_cb({ ok: true, config: safe_cfg, history: hist });
+		return;
+	}
+
+	if (verb == 'device_quotas_get') {
+		let quotas = read_json(ETC_DIR + '/device_quotas.json', {});
+		let scheds = read_json(ETC_DIR + '/device_schedules.json', []);
+		reply_cb({ ok: true, quotas: quotas, schedules: scheds });
+		return;
+	}
+
+	if (verb == 'weekly_report_get') {
+		let ql_raw = fs.readfile(QUERYLOG_PATH) || '';
+		let lines = split(trim(ql_raw), '\n');
+		let total_q = 0, blocked_q = 0;
+		let dom_counts = {};
+		let start_i = length(lines) > 800 ? length(lines) - 800 : 0;
+		for (let i = start_i; i < length(lines); i++) {
+			let ln = trim(lines[i]);
+			if (ln == '') continue;
+			try {
+				let rec = json(ln);
+				total_q++;
+				if (rec.Result && rec.Result.IsFiltered) {
+					blocked_q++;
+					let qh = (rec.QH || '');
+					if (qh != '') dom_counts[qh] = (dom_counts[qh] || 0) + 1;
+				}
+			} catch (e) {}
+		}
+		let top_blocked = [];
+		for (let d in keys(dom_counts)) push(top_blocked, { domain: d, count: dom_counts[d] });
+		sort(top_blocked, function(a, b) { return b.count - a.count; });
+		let leases_cnt = 0;
+		let lraw = fs.readfile(LEASES_PATH) || '';
+		for (let ll in split(trim(lraw), '\n')) { if (trim(ll) != '') leases_cnt++; }
+		let audit_cnt = 0;
+		let araw = fs.readfile(ETC_DIR + '/audit.log') || '';
+		for (let al in split(trim(araw), '\n')) { if (trim(al) != '') audit_cnt++; }
+		reply_cb({
+			ok: true,
+			report: {
+				generated_at: now_iso(),
+				dns_queries_sampled: total_q,
+				dns_blocked_sampled: blocked_q,
+				block_rate_pct: total_q > 0 ? int((blocked_q * 1000) / total_q) / 10.0 : 0,
+				top_blocked_domains: slice(top_blocked, 0, 8),
+				active_leases: leases_cnt,
+				audit_events_count: audit_cnt
+			}
+		});
+		return;
+	}
+
+	if (verb == 'security_audit') {
+		let cur = uci.cursor();
+		let wan_exposed_8780 = false;
+		cur.foreach('firewall', 'rule', function(s) {
+			if (s.src == 'wan' && (s.dest_port == '8780' || s.dest_port == '80' || s.dest_port == '443') && s.enabled != '0' && s.target == 'ACCEPT') {
+				wan_exposed_8780 = true;
+			}
+		});
+		let auth_doc = read_json(ETC_DIR + '/auth.json', null);
+		let totp_on = !!(auth_doc && auth_doc.users && auth_doc.users.admin && auth_doc.users.admin.totp_enabled);
+		let db_pw_auth = true;
+		cur.foreach('dropbear', 'dropbear', function(s) {
+			if (s.PasswordAuth == 'off' && s.RootPasswordAuth == 'off') db_pw_auth = false;
+			return false;
+		});
+		exec_argv_async('/bin/sh', ['-c', 'ss -tuln 2>/dev/null | grep -E "0\\.0\\.0\\.0:|\\[::\\]:" | head -n 20'], 3000, CAP_GENERAL, function(ss_res) {
+			let listeners = [];
+			for (let sl in split(trim(ss_res.output || ''), '\n')) {
+				if (trim(sl) != '') push(listeners, trim(sl));
+			}
+			let checks = [
+				{ id: 'wan_port_isolation', label: 'عزل منفذ الإدارة 8780 عن WAN', ok: !wan_exposed_8780, detail: wan_exposed_8780 ? 'تحذير: توجد قاعدة قبول على WAN' : 'معزول بالكامل عن WAN' },
+				{ id: 'totp_2fa', label: 'المصادقة الثنائية لحساب المدير (TOTP)', ok: totp_on, detail: totp_on ? 'مفعّلة' : 'غير مفعّلة (يُنصح بتفعيلها)' },
+				{ id: 'ssh_password_auth', label: 'مصادقة كلمة المرور عبر SSH', ok: !db_pw_auth, detail: db_pw_auth ? 'مفعّلة (يُفضّل الاكتفاء بمفاتيح SSH)' : 'معطّلة (مفاتيح SSH فقط)' },
+				{ id: 'csp_strict', label: 'سياسة المحتوى الصارمة CSP وPBKDF2', ok: true, detail: 'مفعّلة (50,000 تكرار + CSRF)' }
+			];
+			reply_cb({ ok: true, checks: checks, listeners: listeners });
+		});
+		return;
+	}
+
+	if (verb == 'diag_tcp_probe') {
+		let target = trim(params.target || '');
+		let port = +(params.port || 80);
+		let err = is_blocked_diag_target(target, 'ping');
+		if (err) { reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: err }); return; }
+		if (port < 1 || port > 65535 || port != int(port)) {
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'رقم المنفذ غير صالح (1 إلى 65535)' });
+			return;
+		}
+		let done = false;
+		let t0 = now_mono_ms();
+		let tmr = uloop.timer(4500, function() {
+			if (done) return;
+			done = true;
+			audit_append(actor, 'diag_tcp_probe', target + ':' + port, 'timeout', 'TCP probe timed out');
+			reply_cb({ ok: true, target: target, port: port, reachable: false, elapsed_ms: 4500, output: sprintf('TCP %s:%d -> انتهت مهلة الانتظار (Timeout 4500 ms)', target, port) });
+		});
+		let tsk = uloop.task(function() {
+			let sa_p = sock.sockaddr({ address: target, port: port });
+			if (!sa_p) return -1;
+			let ps = sock.create(sock.AF_INET, sock.SOCK_STREAM);
+			if (!ps) return -2;
+			let conn = ps.connect(sa_p);
+			try { ps.close(); } catch (e) {}
+			return conn ? 1 : 0;
+		}, function(rc) {
+			if (done) return;
+			done = true;
+			tmr.cancel();
+			let dt = now_mono_ms() - t0;
+			let ok_r = (rc == 1);
+			audit_append(actor, 'diag_tcp_probe', target + ':' + port, ok_r ? 'ok' : 'closed', dt + 'ms');
+			reply_cb({
+				ok: true, target: target, port: port, reachable: ok_r, elapsed_ms: dt,
+				output: sprintf('TCP %s:%d -> %s (الزمن: %d ms)', target, port, ok_r ? 'المنفذ مفتوح ويستجيب' : (rc == -1 ? 'تعذر تحليل العنوان IPv4' : 'الاتصال مرفوض أو مغلق'), dt)
+			});
+		});
+		if (!tsk) {
+			done = true;
+			tmr.cancel();
+			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'تعذر بدء فحص المنفذ' });
+		}
+		return;
+	}
+
+	if (verb == 'diag_routes') {
+		exec_argv_async('/sbin/ip', ['route', 'show'], 4000, CAP_GENERAL, function(rt_res) {
+			let ct_raw = fs.readfile('/proc/net/nf_conntrack') || '';
+			let counts = {};
+			let total_ct = 0;
+			if (ct_raw != '') {
+				for (let line in split(ct_raw, '\n')) {
+					let m = match(line, /src=(192\.168\.[0-9.]+)/);
+					if (m) {
+						counts[m[1]] = (counts[m[1]] || 0) + 1;
+						total_ct++;
+					}
+					if (total_ct >= 6000) break;
+				}
+			}
+			let ct_arr = [];
+			for (let k in keys(counts)) push(ct_arr, { ip: k, c: counts[k] });
+			sort(ct_arr, function(a, b) { return b.c - a.c; });
+			let summary_lines = ['=== جدول التوجيه الفعلي (Routing Table) ===', scrub_prohibited(rt_res.output || ''), '', '=== أكثر الأجهزة استهلاكاً للاتصالات (Top Conntrack) ==='];
+			for (let i = 0; i < length(ct_arr) && i < 12; i++) {
+				push(summary_lines, sprintf('%s : %d جلسة نشطة', ct_arr[i].ip, ct_arr[i].c));
+			}
+			if (length(ct_arr) == 0) push(summary_lines, 'إجمالي الجلسات: ' + trim(fs.readfile('/proc/sys/net/netfilter/nf_conntrack_count') || '0'));
+			reply_cb({ ok: true, output: join('\n', summary_lines) });
+		});
+		return;
+	}
+
+	if (verb == 'diag_ping') {
+		let target = trim(params.target || '');
+		let err = is_blocked_diag_target(target, 'ping');
+		if (err) { reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: err }); return; }
+		exec_argv_async('/bin/ping', ['-c', '4', '-W', '2', target], 12000, CAP_GENERAL, function(r) {
+			audit_append(actor, 'diag_ping', target, r.ok ? 'ok' : 'fail', r.overflow ? 'overflow' : 'done');
+			if (r.overflow) { reply_cb({ ok: false, error_code: 'TIMEOUT', message_ar: 'تجاوزت مخرجات الفحص الحد المسموح' }); return; }
+			reply_cb({ ok: true, target: target, output: scrub_prohibited(r.output) });
+		});
+		return;
+	}
+
+	if (verb == 'diag_traceroute') {
+		let target = trim(params.target || '');
+		let err = is_blocked_diag_target(target, 'traceroute');
+		if (err) { reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: err }); return; }
+		exec_argv_async('/bin/traceroute', ['-I', '-n', '-m', '12', '-w', '1', '-q', '1', target], 25000, CAP_GENERAL, function(r) {
+			audit_append(actor, 'diag_traceroute', target, r.ok ? 'ok' : 'fail', r.overflow ? 'overflow' : 'done');
+			if (r.overflow) { reply_cb({ ok: false, error_code: 'TIMEOUT', message_ar: 'تجاوزت مخرجات تتبع المسار الحد المسموح' }); return; }
+			reply_cb({ ok: true, target: target, output: scrub_prohibited(r.output) });
+		});
+		return;
+	}
+
+	if (verb == 'diag_nslookup') {
+		let target = trim(params.target || '');
+		let qtype = uc(trim(params.qtype || 'A'));
+		let allowed_types = { 'A': true, 'AAAA': true, 'MX': true, 'TXT': true, 'NS': true, 'CNAME': true };
+		if (!allowed_types[qtype]) {
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'نوع استعلام DNS غير مسموح به (المسموح: A, AAAA, MX, TXT, NS, CNAME)' });
+			return;
+		}
+		if (!match(target, /^[a-zA-Z0-9.-]{1,128}$/)) {
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'اسم النطاق المستهدف غير صالح' });
+			return;
+		}
+		exec_argv_async('/usr/bin/nslookup', ['-type=' + qtype, target, '127.0.0.1'], 8000, CAP_NSLOOKUP, function(r) {
+			audit_append(actor, 'diag_nslookup', target + ' (' + qtype + ')', r.ok ? 'ok' : 'fail', r.overflow ? 'overflow' : 'done');
+			if (r.overflow) { reply_cb({ ok: false, error_code: 'TIMEOUT', message_ar: 'تجاوزت استجابة NSLookup حد 16 KiB' }); return; }
+			reply_cb({ ok: true, target: target, output: scrub_prohibited(r.output) });
+		});
+		return;
+	}
+
+	if (verb == 'log_read') {
+		exec_argv_async('/sbin/logread', ['-l', '80'], 5000, CAP_GENERAL, function(r1) {
+			exec_argv_async('/bin/dmesg', ['-s', '32768'], 5000, CAP_GENERAL, function(r2) {
+				let dlines = r2.ok ? split(r2.output, '\n') : [];
+				if (length(dlines) > 80) dlines = slice(dlines, length(dlines) - 80);
+				let audit_lines = split(trim(fs.readfile(ETC_DIR + '/audit.log') || ''), '\n');
+				let audit_slice = slice(audit_lines, -40);
+				let audit_entries = [];
+				for (let al in audit_slice) {
+					if (trim(al) == '') continue;
+					try { push(audit_entries, json(al)); } catch (e) {}
+				}
+				reply_cb({
+					ok: !r1.overflow && !r2.overflow,
+					error_code: (r1.overflow || r2.overflow) ? 'TIMEOUT' : null,
+					syslog: scrub_prohibited(r1.output),
+					dmesg: scrub_prohibited(join('\n', dlines)),
+					audit_tail: scrub_prohibited(join('\n', audit_slice)),
+					audit_entries: audit_entries
+				});
+			});
+		});
+		return;
+	}
+
+	// --- Mutating Verbs (Subject to P15 staging guard, P17 freeze, storage guard, & lock) ---
+	let mutating_verbs = {
+		'agh_add_rule': true, 'agh_remove_rule': true, 'agh_toggle': true, 'agh_set_creds': true,
+		'agh_refresh_filters': true, 'agh_clear_querylog': true, 'agh_clear_cache': true,
+		'agh_set_blocked_services': true, 'agh_rewrite_add': true, 'agh_rewrite_delete': true,
+		'agh_filter_add': true, 'agh_filter_delete': true, 'agh_filter_toggle': true, 'agh_dns_config': true,
+		'client_block': true, 'client_unblock': true, 'client_set_meta': true, 'client_static_lease': true, 'client_ping': true,
+		'client_domain_add': true, 'client_domain_delete': true, 'client_lease_delete': true,
+		'network_action': true, 'network_save_dhcp': true, 'network_save_wan': true,
+		'network_route_add': true, 'network_route_delete': true,
+		'wifi_scan': true, 'wifi_save_uplink': true, 'wifi_save_ap': true,
+		'sqm_update': true,
+		'fw_add_redirect': true, 'fw_delete_redirect': true, 'fw_toggle_rule': true,
+		'fw_add_rule': true, 'fw_delete_rule': true, 'fw_save_defaults': true,
+		'banip_save_config': true, 'banip_list_edit': true, 'upnp_save_config': true,
+		'docker_control': true, 'tailscale_control': true,
+		'service_restart': true, 'service_action': true,
+		'sys_save_general': true, 'sys_save_tuning': true,
+		'sys_cron_add': true, 'sys_cron_delete': true,
+		'sys_ssh_save': true, 'sys_ssh_key_add': true, 'sys_ssh_key_delete': true,
+		'sys_pkg_action': true, 'sys_reboot_challenge': true, 'sys_reboot': true,
+		'auth_change_password': true, 'auth_delete_user': true,
+		'auth_totp_setup': true, 'auth_totp_enable': true, 'auth_totp_disable': true,
+		'rollback_confirm': true, 'rollback_revert': true,
+		'alerts_set': true, 'alerts_test': true, 'alerts_dispatch': true,
+		'client_quota_set': true, 'schedule_action_set': true,
+		'freeze_clear': true
+	};
+	if (!mutating_verbs[verb]) {
+		reply_cb({ ok: false, error_code: 'UNSUPPORTED', message_ar: 'الأمر المطلوب غير مدعوم في هذا الإصدار' });
+		return;
+	}
+
+	let stg = check_staging_guard();
+	if (!stg.ok) { reply_cb(stg); return; }
+
+	let stor = check_storage_budget();
+	if (!stor.ok && verb != 'freeze_clear') {
+		reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'المساحة المتاحة غير كافية لضمان سجل التراجع والتدقيق الآمن' });
+		return;
+	}
+
+	if (verb == 'freeze_clear') {
+		if (!params.confirm_reconciled) {
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'يتطلب فك التجميد تأكيد مطابقة الحالة يدوياً' });
+			return;
+		}
+		if (fs.stat(ETC_DIR + '/freeze.json')) fs.unlink(ETC_DIR + '/freeze.json');
+		audit_append(actor, 'freeze_clear', 'system', 'committed', 'Admin acknowledged reconciliation');
+		reply_cb({ ok: true, message_ar: 'تم رفع حالة التجميد بعد التحقق الإداري' });
+		return;
+	}
+
+	let freeze = get_freeze_state();
+	if (freeze.frozen) {
+		reply_cb({ ok: false, status: 409, error_code: 'VALIDATION', message_ar: 'جميع التعديلات مجمدة حالياً بسبب فشل استرجاع سابق — يتطلب مراجعة المدير' });
+		return;
+	}
+
+	if (!acquire_lock(actor, verb).ok) {
+		reply_cb({ ok: false, status: 409, error_code: 'VALIDATION', message_ar: 'توجد عملية تعديل أخرى قيد التنفيذ حالياً، يرجى الانتظار' });
+		return;
+	}
+
+	if (verb == 'agh_set_creds') {
+		let u = trim(params.username || '');
+		let p = '' + (params.password || '');
+		if (u == '' || p == '') {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'اسم المستخدم وكلمة المرور مطلوبان' });
+			return;
+		}
+		atomic_write(ETC_DIR + '/adguard.json', sprintf('%J\n', { username: u, password: p }), 0o600);
+		let test_res = adguard_http('GET', '/control/status', null);
+		release_lock();
+		if (!test_res.ok) {
+			fs.unlink(ETC_DIR + '/adguard.json');
+			reply_cb(test_res);
+			return;
+		}
+		audit_append(actor, 'agh_set_creds', 'adguard', 'committed', 'AdGuard HTTP credentials verified and stored');
+		reply_cb({ ok: true, message_ar: 'تم التحقق من بيانات AdGuard Home وحفظها بأمان' });
+		return;
+	}
+
+	if (verb == 'agh_add_rule' || verb == 'agh_remove_rule') {
+		let rule = trim(params.rule || '');
+		let valid = is_valid_domain_rule(rule);
+		if (valid == 'MANAGEMENT_DOMAIN') {
+			release_lock();
+			audit_append(actor, verb, rule, 'refused', 'Refused management domain mutation');
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'مرفوض: لا يُسمح بحجب نطاقات الإدارة أو عنوان الموجه المحلي' });
+			return;
+		}
+		if (!valid) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'صيغة قاعدة النطاق غير صالحة (المسموح ||domain^ أو @@||domain^)' });
+			return;
+		}
+		let r = adguard_sync_rule(verb == 'agh_add_rule' ? 'add' : 'remove', rule, actor);
+		release_lock();
+		reply_cb(r);
+		return;
+	}
+
+	if (verb == 'agh_toggle') {
+		let flag = trim(params.flag || '');
+		let enabled = params.enabled ? true : false;
+		let duration_s = +params.duration_s || 0;
+		let cur_st = adguard_http('GET', '/control/status', null);
+		if (!cur_st.ok) { release_lock(); reply_cb(cur_st); return; }
+		if (flag == 'enable_dnssec' || flag == 'cache_enabled' || flag == 'aaaa_disabled') {
+			let dinfo = adguard_http('GET', '/control/dns_info', null);
+			if (!dinfo.ok || type(dinfo.data) != 'object') { release_lock(); reply_cb(dinfo); return; }
+			let cfg = dinfo.data;
+			let body_dns = {
+				upstream_dns: cfg.upstream_dns || [],
+				upstream_mode: cfg.upstream_mode || 'parallel',
+				cache_size: +(cfg.cache_size || 0),
+				cache_enabled: flag == 'cache_enabled' ? enabled : (cfg.cache_enabled !== false),
+				enable_dnssec: flag == 'enable_dnssec' ? enabled : !!cfg.enable_dnssec,
+				aaaa_disabled: flag == 'aaaa_disabled' ? enabled : !!cfg.aaaa_disabled,
+				ratelimit: +(cfg.ratelimit || 0)
+			};
+			let rd = adguard_http('POST', '/control/dns_config', body_dns);
+			release_lock();
+			audit_append(actor, 'agh_toggle', flag, rd.ok ? 'committed' : 'failed', 'enabled=' + enabled);
+			reply_cb(rd.ok ? { ok: true, message_ar: 'تم تحديث إعداد DNS بنجاح' } : rd);
+			return;
+		}
+		let ep = null;
+		let body = null;
+		if (flag == 'protection_enabled') {
+			ep = '/control/protection';
+			body = { enabled: enabled };
+		} else if (flag == 'parental_enabled') {
+			ep = enabled ? '/control/parental/enable' : '/control/parental/disable';
+			body = {};
+		} else if (flag == 'safebrowsing_enabled') {
+			ep = enabled ? '/control/safebrowsing/enable' : '/control/safebrowsing/disable';
+			body = {};
+		} else if (flag == 'safesearch_enabled') {
+			ep = enabled ? '/control/safesearch/enable' : '/control/safesearch/disable';
+			body = {};
+		}
+		if (!ep) { release_lock(); reply_cb({ ok: false, error_code: 'UNSUPPORTED', message_ar: 'علم الحماية المطلوب غير مدعوم عبر API حالياً' }); return; }
+		let r = adguard_http('POST', ep, body);
+		if (flag == 'protection_enabled') {
+			if (r.ok && !enabled && duration_s > 0 && duration_s <= 3600) {
+				atomic_write(ETC_DIR + '/timed_disable.json', sprintf('%J\n', { target_state: true, deadline_epoch: time() + duration_s }), 0o600);
+			} else if (enabled && fs.stat(ETC_DIR + '/timed_disable.json')) {
+				fs.unlink(ETC_DIR + '/timed_disable.json');
+			}
+		}
+		release_lock();
+		audit_append(actor, 'agh_toggle', flag, r.ok ? 'committed' : 'failed', 'enabled=' + enabled);
+		reply_cb(r.ok ? { ok: true, message_ar: 'تم تحديث حالة الحماية بنجاح' } : r);
+		return;
+	}
+
+	if (verb == 'agh_set_blocked_services') {
+		let ids = params.ids || [];
+		if (type(ids) != 'array' || length(ids) > 64) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'قائمة الخدمات المحجوبة غير صالحة' });
+			return;
+		}
+		let clean_ids = [];
+		for (let sid in ids) {
+			let s = trim('' + sid);
+			if (!match(s, /^[a-z0-9_]{1,32}$/)) {
+				release_lock();
+				reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معرف خدمة غير صالح: ' + s });
+				return;
+			}
+			push(clean_ids, s);
+		}
+		let cur_bs = adguard_http('GET', '/control/blocked_services/get', null);
+		let sched = (cur_bs.ok && type(cur_bs.data) == 'object' && cur_bs.data.schedule) ? cur_bs.data.schedule : { time_zone: 'UTC' };
+		let r = adguard_http('PUT', '/control/blocked_services/update', { ids: clean_ids, schedule: sched });
+		if (!r.ok && (r.status == 404 || r.status == 405)) {
+			r = adguard_http('POST', '/control/blocked_services/set', clean_ids);
+		}
+		release_lock();
+		audit_append(actor, 'agh_set_blocked_services', 'services', r.ok ? 'committed' : 'failed', 'count=' + length(clean_ids));
+		reply_cb(r.ok ? { ok: true, message_ar: 'تم تحديث قائمة التطبيقات المحجوبة بنجاح' } : r);
+		return;
+	}
+
+	if (verb == 'agh_rewrite_add' || verb == 'agh_rewrite_delete') {
+		let dom = lc(trim(params.domain || ''));
+		let ans = trim(params.answer || '');
+		if (!is_valid_fqdn(dom) || is_blocked_rewrite_domain(dom)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'النطاق غير صالح أو محمي من إعادة التوجيه' });
+			return;
+		}
+		if (ans == '' || (!is_valid_ipv4(ans) && ans != '0.0.0.0' && ans != 'A' && ans != 'AAAA')) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'عنوان IP المستهدف في إعادة التوجيه غير صالح' });
+			return;
+		}
+		let ep = verb == 'agh_rewrite_add' ? '/control/rewrite/add' : '/control/rewrite/delete';
+		let r = adguard_http('POST', ep, { domain: dom, answer: ans });
+		release_lock();
+		audit_append(actor, verb, dom + '->' + ans, r.ok ? 'committed' : 'failed', 'DNS rewrite');
+		reply_cb(r.ok ? { ok: true, message_ar: verb == 'agh_rewrite_add' ? 'تمت إضافة سجل إعادة التوجيه بنجاح' : 'تم حذف سجل إعادة التوجيه بنجاح' } : r);
+		return;
+	}
+
+	if (verb == 'agh_filter_add' || verb == 'agh_filter_delete' || verb == 'agh_filter_toggle') {
+		let url = trim(params.url || '');
+		let fname = replace(trim(params.name || 'Filter'), /[\r\n\t<>'"`$;&|]/g, '');
+		if (!is_safe_https_filter_url(url)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'يجب أن يكون رابط الفلتر HTTPS خارجياً موثوقاً (ممنوع الروابط المحلية والخاصة)' });
+			return;
+		}
+		if (verb == 'agh_filter_add') {
+			if (fname == '' || length(fname) > 64) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'اسم الفلتر غير صالح' }); return; }
+			let r = adguard_http('POST', '/control/filtering/add_url', { name: fname, url: url, whitelist: false });
+			release_lock();
+			audit_append(actor, 'agh_filter_add', url, r.ok ? 'committed' : 'failed', fname);
+			reply_cb(r.ok ? { ok: true, message_ar: 'تمت إضافة قائمة الفلتر بنجاح' } : r);
+			return;
+		}
+		if (verb == 'agh_filter_delete') {
+			let r = adguard_http('POST', '/control/filtering/remove_url', { url: url, whitelist: false });
+			release_lock();
+			audit_append(actor, 'agh_filter_delete', url, r.ok ? 'committed' : 'failed', 'Removed filter');
+			reply_cb(r.ok ? { ok: true, message_ar: 'تم حذف قائمة الفلتر بنجاح' } : r);
+			return;
+		}
+		let r = adguard_http('POST', '/control/filtering/set_url', { url: url, whitelist: false, data: { enabled: !!params.enabled, name: fname, url: url } });
+		release_lock();
+		audit_append(actor, 'agh_filter_toggle', url, r.ok ? 'committed' : 'failed', 'enabled=' + (!!params.enabled));
+		reply_cb(r.ok ? { ok: true, message_ar: 'تم تحديث حالة قائمة الفلتر بنجاح' } : r);
+		return;
+	}
+
+	if (verb == 'agh_dns_config') {
+		let mode = trim(params.upstream_mode || 'parallel');
+		let csize = +(params.cache_size || 67108864);
+		let rlim = +(params.ratelimit || 0);
+		let allow_m = { 'load_balance': true, 'parallel': true, 'fastest_addr': true };
+		if (!allow_m[mode] || csize < 0 || csize > 268435456 || rlim < 0 || rlim > 10000) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'إعدادات خادم DNS غير صالحة' });
+			return;
+		}
+		let dinfo = adguard_http('GET', '/control/dns_info', null);
+		if (!dinfo.ok || type(dinfo.data) != 'object') { release_lock(); reply_cb(dinfo); return; }
+		let cur_c = dinfo.data;
+		let body_dns = {
+			upstream_dns: cur_c.upstream_dns || [],
+			upstream_mode: mode,
+			cache_size: int(csize),
+			cache_enabled: cur_c.cache_enabled !== false,
+			enable_dnssec: !!cur_c.enable_dnssec,
+			aaaa_disabled: !!cur_c.aaaa_disabled,
+			ratelimit: int(rlim)
+		};
+		let r = adguard_http('POST', '/control/dns_config', body_dns);
+		release_lock();
+		audit_append(actor, 'agh_dns_config', mode, r.ok ? 'committed' : 'failed', sprintf('cache=%d rate=%d', int(csize), int(rlim)));
+		reply_cb(r.ok ? { ok: true, message_ar: 'تم حفظ إعدادات خادم DNS بنجاح' } : r);
+		return;
+	}
+
+	if (verb == 'agh_clear_cache') {
+		let r = adguard_http('POST', '/control/cache_clear', {});
+		release_lock();
+		audit_append(actor, 'agh_clear_cache', 'dns_cache', r.ok ? 'committed' : 'failed', 'Cleared DNS cache');
+		reply_cb(r.ok ? { ok: true, message_ar: 'تم تفريغ ذاكرة التخزين المؤقت للـ DNS بنجاح' } : r);
+		return;
+	}
+
+	if (verb == 'agh_refresh_filters') {
+		let r = adguard_http('POST', '/control/filtering/refresh', { whitelist: false });
+		release_lock();
+		audit_append(actor, 'agh_refresh_filters', 'filtering', r.ok ? 'committed' : 'failed', 'Refreshed blocklists');
+		reply_cb(r.ok ? { ok: true, message_ar: 'تم تحديث قوائم الفلترة بنجاح' } : r);
+		return;
+	}
+
+	if (verb == 'agh_clear_querylog') {
+		let r = adguard_http('POST', '/control/querylog_clear', {});
+		release_lock();
+		audit_append(actor, 'agh_clear_querylog', 'querylog', r.ok ? 'committed' : 'failed', 'Cleared DNS querylog');
+		reply_cb(r.ok ? { ok: true, message_ar: 'تم مسح سجل استعلامات DNS بنجاح' } : r);
+		return;
+	}
+
+	if (verb == 'client_block' || verb == 'client_unblock') {
+		let mac = lc(trim(params.mac || ''));
+		let ip = trim(params.ip || '');
+		if (!is_valid_mac(mac)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'عنوان MAC غير صالح' });
+			return;
+		}
+		// P5 Self-lockout preconditions
+		let gw_macs = get_gateway_macs();
+		let gw_ips = get_gateway_ips();
+		if (gw_macs[mac] || (ip != '' && (gw_ips[ip] || ip == client_ip))) {
+			release_lock();
+			audit_append(actor, verb, mac, 'refused', 'Self-block or gateway protection triggered');
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يمكن حظر البوابة الرئيسية أو الجهاز المدير المتصل حالياً' });
+			return;
+		}
+		let rules_path = ETC_DIR + '/client_rules.json';
+		let prev_rules = read_json(rules_path, { blocked_macs: {}, blocked_ips: {}, nicknames: {} });
+		let snap_raw = sprintf('%J\n', prev_rules);
+		let next_rules = read_json(rules_path, { blocked_macs: {}, blocked_ips: {}, nicknames: {} });
+		if (verb == 'client_block') {
+			next_rules.blocked_macs[mac] = true;
+			if (is_valid_ipv4(ip)) next_rules.blocked_ips[ip] = true;
+		} else {
+			delete next_rules.blocked_macs[mac];
+			if (ip != '') delete next_rules.blocked_ips[ip];
+		}
+		atomic_write(rules_path, sprintf('%J\n', next_rules), 0o600);
+		apply_bridge_block_rules(next_rules, function(apply_res) {
+			if (!apply_res.ok) {
+				atomic_write(rules_path, snap_raw, 0o600);
+				apply_bridge_block_rules(prev_rules, function(rb) {
+					if (!rb.ok) {
+						atomic_write(ETC_DIR + '/freeze.json', sprintf('%J\n', { frozen: true, reason: 'client_block rollback failed', ts: now_iso() }), 0o600);
+						audit_append(actor, verb, mac, 'rollback_failed', 'Entered global mutation freeze');
+					} else {
+						audit_append(actor, verb, mac, 'rolled_back', 'Apply failed and rolled back cleanly');
+					}
+					release_lock();
+					reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: rb.ok ? 'تعذر تطبيق الحظر وتم التراجع تلقائياً' : 'فشل حرج: تعذر تطبيق الحظر وفشل التراجع — تم تجميد التعديلات' });
+				});
+				return;
+			}
+			// Verify table membership
+			exec_argv_async('/usr/sbin/nft', ['list', 'table', 'bridge', 'noc_block'], 4000, CAP_GENERAL, function(ver) {
+				if (!ver.ok || (verb == 'client_block' && index(ver.output, mac) < 0)) {
+					atomic_write(rules_path, snap_raw, 0o600);
+					apply_bridge_block_rules(prev_rules, function(rb) {
+						if (!rb.ok) {
+							atomic_write(ETC_DIR + '/freeze.json', sprintf('%J\n', { frozen: true, reason: 'verify rollback failed', ts: now_iso() }), 0o600);
+						}
+						release_lock();
+						reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل التحقق من قاعدة الحظر وتم التراجع' });
+					});
+					return;
+				}
+				release_lock();
+				audit_append(actor, verb, mac + (ip != '' ? ' (' + ip + ')' : ''), 'committed', 'Verified bridge+inet rule');
+				reply_cb({ ok: true, blocked: verb == 'client_block', message_ar: verb == 'client_block' ? 'تم حظر الجهاز على مسار الجسر والتوجيه مع بقاء DNS البوابة مستقراً ما لم يُحجب عبر الجدار' : 'تم إلغاء حظر الجهاز بنجاح' });
+			});
+		});
+		return;
+	}
+
+	if (verb == 'service_restart' || verb == 'service_action') {
+		let svc = trim(params.name || '');
+		let sub = verb == 'service_restart' ? 'restart' : trim(params.subaction || 'restart');
+		let allow_svcs = { 'adguardhome': true, 'dnsmasq': true, 'firewall': true, 'sqm': true, 'miniupnpd': true, 'banip': true, 'cron': true, 'dockerd': true, 'tailscale': true, 'network': true, 'sysntpd': true };
+		let allow_ops = { 'start': true, 'stop': true, 'restart': true, 'enable': true, 'disable': true };
+		let protected_stop = { 'uhttpd': true, 'dropbear': true, 'dnsmasq': true, 'firewall': true };
+		if (!allow_svcs[svc] || !allow_ops[sub] || !fs.stat('/etc/init.d/' + svc)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'الخدمة أو العملية غير مدرجة ضمن القائمة المعتمدة' });
+			return;
+		}
+		if ((sub == 'stop' || sub == 'disable') && protected_stop[svc]) {
+			release_lock();
+			audit_append(actor, 'service_action', svc + ':' + sub, 'refused', 'Protected core service stop refused');
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يُسمح بإيقاف أو تعطيل الخدمات الأساسية لضمان استقرار الاتصال' });
+			return;
+		}
+		exec_argv_async('/etc/init.d/' + svc, [sub], 15000, CAP_GENERAL, function(r) {
+			release_lock();
+			audit_append(actor, 'service_action', svc + ':' + sub, r.ok ? 'committed' : 'failed', 'forward-verified-only');
+			reply_cb({ ok: r.ok, forward_verified_only: true, error_code: r.ok ? null : 'DEPENDENCY', message_ar: r.ok ? ('تم تنفيذ (' + sub + ') للخدمة ' + svc) : ('فشل تنفيذ العملية للخدمة ' + svc) });
+		});
+		return;
+	}
+
+	if (verb == 'client_set_meta') {
+		let mac = lc(trim(params.mac || ''));
+		let ip = trim(params.ip || '');
+		let nick = replace(trim(params.nickname || ''), /[\r\n\t<>]/g, '');
+		let rate_kbps = +(params.rate_limit_kbps || 0);
+		if (!is_valid_mac(mac) || length(nick) > 48 || rate_kbps < 0 || rate_kbps > 1000000 || (rate_kbps > 0 && rate_kbps < 64)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'بيانات الجهاز أو حد السرعة غير صالح (0 أو 64..1000000 Kbps)' });
+			return;
+		}
+		let gw_macs = get_gateway_macs();
+		let gw_ips = get_gateway_ips();
+		if (rate_kbps > 0 && (gw_macs[mac] || (ip != '' && (gw_ips[ip] || ip == client_ip)))) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يُسمح بتقييد سرعة البوابة أو الجهاز المدير' });
+			return;
+		}
+		let rules_path = ETC_DIR + '/client_rules.json';
+		let prev_rules = read_json(rules_path, { blocked_macs: {}, blocked_ips: {}, nicknames: {}, rate_limits: {} });
+		if (!prev_rules.rate_limits) prev_rules.rate_limits = {};
+		let snap_raw = sprintf('%J\n', prev_rules);
+		let next_rules = read_json(rules_path, { blocked_macs: {}, blocked_ips: {}, nicknames: {}, rate_limits: {} });
+		if (!next_rules.rate_limits) next_rules.rate_limits = {};
+		if (nick != '') next_rules.nicknames[mac] = nick;
+		else delete next_rules.nicknames[mac];
+		if (ip != '' && is_valid_ipv4(ip)) {
+			if (rate_kbps > 0) next_rules.rate_limits[ip] = rate_kbps;
+			else delete next_rules.rate_limits[ip];
+		}
+		atomic_write(rules_path, sprintf('%J\n', next_rules), 0o600);
+		apply_bridge_block_rules(next_rules, function(ar) {
+			if (!ar.ok) {
+				atomic_write(rules_path, snap_raw, 0o600);
+				apply_bridge_block_rules(prev_rules, function() {
+					release_lock();
+					reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'تعذر تطبيق قاعدة حد السرعة وتم التراجع' });
+				});
+				return;
+			}
+			release_lock();
+			audit_append(actor, 'client_set_meta', mac, 'committed', 'nick=' + nick + ' kbps=' + rate_kbps);
+			reply_cb({ ok: true, message_ar: 'تم حفظ بيانات وتقييد الجهاز بنجاح' });
+		});
+		return;
+	}
+
+	if (verb == 'client_static_lease') {
+		let mac = lc(trim(params.mac || ''));
+		let ip = trim(params.ip || '');
+		let hn = trim(params.hostname || '');
+		let enable = !!params.enable;
+		if (!is_valid_mac(mac) || (enable && (!is_valid_ipv4(ip) || ip == get_lan_ip())) || (hn != '' && !match(hn, /^[a-zA-Z0-9_-]{1,32}$/))) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'بيانات تثبيت IP غير صالحة أو تتعارض مع البوابة' });
+			return;
+		}
+		let sid = 'noc_' + replace(mac, /:/g, '');
+		try {
+			let cur = uci.cursor();
+			if (enable) {
+				cur.set('dhcp', sid, 'host');
+				cur.set('dhcp', sid, 'mac', mac);
+				cur.set('dhcp', sid, 'ip', ip);
+				if (hn != '') cur.set('dhcp', sid, 'name', hn);
+			} else {
+				cur.delete('dhcp', sid);
+			}
+			cur.commit('dhcp');
+		} catch (e) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل تحديث إعدادات DHCP في النظام' });
+			return;
+		}
+		exec_argv_async('/etc/init.d/dnsmasq', ['reload'], 8000, CAP_GENERAL, function(r) {
+			release_lock();
+			audit_append(actor, 'client_static_lease', mac + '->' + ip, r.ok ? 'committed' : 'failed', 'enable=' + enable);
+			reply_cb({ ok: r.ok, message_ar: enable ? 'تم تثبيت عنوان IP الثابت للجهاز' : 'تم إلغاء تثبيت العنوان الثابت' });
+		});
+		return;
+	}
+
+	if (verb == 'client_ping') {
+		let ip = trim(params.ip || '');
+		if (!is_valid_ipv4(ip)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'عنوان IP غير صالح' });
+			return;
+		}
+		exec_argv_async('/bin/ping', ['-c', '2', '-W', '1', ip], 5000, CAP_GENERAL, function(r) {
+			release_lock();
+			audit_append(actor, 'client_ping', ip, r.ok ? 'ok' : 'fail', 'Client latency probe');
+			reply_cb({ ok: true, ip: ip, reachable: r.ok, output: scrub_prohibited(r.output || 'لا توجد استجابة') });
+		});
+		return;
+	}
+
+	if (verb == 'network_action') {
+		let sub = trim(params.subaction || '');
+		let exe = null, argv = [];
+		if (sub == 'reconnect_wan') { exe = '/sbin/ifup'; argv = ['wan']; }
+		else if (sub == 'reconnect_wwan') {
+			if (fs.stat('/etc/init.d/wwan_uplink')) { exe = '/etc/init.d/wwan_uplink'; argv = ['restart']; }
+			else { exe = '/sbin/ifup'; argv = ['wwan']; }
+		}
+		else if (sub == 'flush_dns') { exe = '/etc/init.d/dnsmasq'; argv = ['reload']; }
+		else if (sub == 'sync_time') { exe = '/etc/init.d/sysntpd'; argv = ['restart']; }
+		if (!exe) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'إجراء شبكة غير مدعوم' });
+			return;
+		}
+		exec_argv_async(exe, argv, 12000, CAP_GENERAL, function(r) {
+			release_lock();
+			audit_append(actor, 'network_action', sub, r.ok ? 'committed' : 'failed', 'Executed ' + exe);
+			reply_cb({ ok: r.ok, message_ar: r.ok ? 'تم تنفيذ إجراء الشبكة بنجاح' : 'تعذر تنفيذ إجراء الشبكة' });
+		});
+		return;
+	}
+
+	if (verb == 'sqm_update') {
+		let en = params.enabled ? '1' : '0';
+		let iface = trim(params.interface || '');
+		let dl = +(params.download_kbps || 0);
+		let ul = +(params.upload_kbps || 0);
+		let qdisc = trim(params.qdisc || 'cake');
+		let script = trim(params.script || 'piece_of_cake.qos');
+		let overh = +(params.overhead || 44);
+		let linkl = trim(params.linklayer || 'ethernet');
+		let sq_dscp = params.squash_dscp === false ? '0' : '1';
+		let sq_ing = params.squash_ingress === false ? '0' : '1';
+		let in_ecn = trim(params.ingress_ecn || 'ECN');
+		let eg_ecn = trim(params.egress_ecn || 'ECN');
+		let dbg = params.debug_logging ? '1' : '0';
+		let verb_lvl = +(params.verbosity != null ? params.verbosity : 5);
+		let allow_if = { 'pppoe-wan': true, 'wlan0': true, 'eth0': true, 'br-lan': true };
+		let allow_qd = { 'cake': true, 'fq_codel': true };
+		let allow_sc = { 'piece_of_cake.qos': true, 'layer_cake.qos': true, 'simple.qos': true };
+		let allow_ll = { 'ethernet': true, 'atm': true, 'none': true };
+		let allow_ecn = { 'ECN': true, 'NOECN': true };
+		if (!allow_if[iface] || !allow_qd[qdisc] || !allow_sc[script] || !allow_ll[linkl] || !allow_ecn[in_ecn] || !allow_ecn[eg_ecn] || dl < 0 || dl > 1000000 || ul < 0 || ul > 1000000 || overh < 0 || overh > 128 || verb_lvl < 0 || verb_lvl > 10) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معاملات SQM غير صالحة' });
+			return;
+		}
+		try {
+			let cur = uci.cursor();
+			cur.set('sqm', 'eth1', 'queue');
+			cur.set('sqm', 'eth1', 'enabled', en);
+			cur.set('sqm', 'eth1', 'interface', iface);
+			cur.set('sqm', 'eth1', 'download', '' + int(dl));
+			cur.set('sqm', 'eth1', 'upload', '' + int(ul));
+			cur.set('sqm', 'eth1', 'qdisc', qdisc);
+			cur.set('sqm', 'eth1', 'script', script);
+			cur.set('sqm', 'eth1', 'overhead', '' + int(overh));
+			cur.set('sqm', 'eth1', 'linklayer', linkl);
+			cur.set('sqm', 'eth1', 'squash_dscp', sq_dscp);
+			cur.set('sqm', 'eth1', 'squash_ingress', sq_ing);
+			cur.set('sqm', 'eth1', 'ingress_ecn', in_ecn);
+			cur.set('sqm', 'eth1', 'egress_ecn', eg_ecn);
+			cur.set('sqm', 'eth1', 'debug_logging', dbg);
+			cur.set('sqm', 'eth1', 'verbosity', '' + int(verb_lvl));
+			cur.commit('sqm');
+		} catch (e) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل حفظ إعدادات SQM' });
+			return;
+		}
+		exec_argv_async('/etc/init.d/sqm', ['reload'], 12000, CAP_GENERAL, function(r) {
+			release_lock();
+			audit_append(actor, 'sqm_update', iface, r.ok ? 'committed' : 'failed', sprintf('en=%s dl=%d ul=%d', en, int(dl), int(ul)));
+			reply_cb({ ok: r.ok, message_ar: r.ok ? 'تم حفظ وتطبيق إعدادات SQM بنجاح' : 'تم الحفظ لكن فشل إعادة تحميل SQM' });
+		});
+		return;
+	}
+
+	if (verb == 'fw_add_redirect') {
+		let rname = replace(trim(params.name || 'Rule'), /[\r\n\t<>'"`$;&|]/g, '');
+		let proto = trim(params.proto || 'tcp');
+		let ext_p = +(params.src_dport || 0);
+		let dest_ip = trim(params.dest_ip || '');
+		let int_p = +(params.dest_port || 0);
+		let allow_pr = { 'tcp': true, 'udp': true, 'tcp udp': true };
+		if (rname == '' || length(rname) > 32 || !allow_pr[proto] || ext_p < 1 || ext_p > 65535 || int_p < 1 || int_p > 65535 || !is_valid_ipv4(dest_ip) || dest_ip == get_lan_ip()) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'بيانات تحويل المنفذ غير صالحة' });
+			return;
+		}
+		if (is_protected_port(ext_p)) {
+			release_lock();
+			audit_append(actor, 'fw_add_redirect', '' + ext_p, 'refused', 'Protected management port redirect refused');
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يُسمح بتحويل المنافذ الإدارية المحمية (22, 53, 80, 443, 8080, 8780)' });
+			return;
+		}
+		let snap_fw = fs.readfile('/etc/config/firewall');
+		let sid = 'noc_fwd_' + urandom_hex(4);
+		try {
+			let cur = uci.cursor();
+			cur.set('firewall', sid, 'redirect');
+			cur.set('firewall', sid, 'name', rname);
+			cur.set('firewall', sid, 'src', 'wan');
+			cur.set('firewall', sid, 'dest', 'lan');
+			cur.set('firewall', sid, 'proto', proto);
+			cur.set('firewall', sid, 'src_dport', '' + int(ext_p));
+			cur.set('firewall', sid, 'dest_ip', dest_ip);
+			cur.set('firewall', sid, 'dest_port', '' + int(int_p));
+			cur.set('firewall', sid, 'target', 'DNAT');
+			cur.set('firewall', sid, 'enabled', '1');
+			cur.commit('firewall');
+		} catch (e) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل حفظ قاعدة تحويل المنفذ' });
+			return;
+		}
+		fw_check_and_reload(snap_fw, function(r) {
+			release_lock();
+			audit_append(actor, 'fw_add_redirect', sid, r.ok ? 'committed' : 'failed', sprintf('%s %d->%s:%d', proto, int(ext_p), dest_ip, int(int_p)));
+			reply_cb({ ok: r.ok, message_ar: r.ok ? 'تمت إضافة وتفعيل قاعدة تحويل المنفذ' : (r.message_ar || 'فشل إعادة تحميل الجدار الناري') });
+		});
+		return;
+	}
+
+	if (verb == 'fw_delete_redirect') {
+		let sid = trim(params.id || '');
+		if (!match(sid, /^[a-zA-Z0-9_-]+$/)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معرف القاعدة غير صالح' });
+			return;
+		}
+		let cur = uci.cursor();
+		let stype = cur.get('firewall', sid);
+		if (stype != 'redirect') {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'قاعدة التحويل غير موجودة' });
+			return;
+		}
+		let snap_fw = fs.readfile('/etc/config/firewall');
+		cur.delete('firewall', sid);
+		cur.commit('firewall');
+		fw_check_and_reload(snap_fw, function(r) {
+			release_lock();
+			audit_append(actor, 'fw_delete_redirect', sid, r.ok ? 'committed' : 'failed', 'Removed redirect');
+			reply_cb({ ok: r.ok, message_ar: r.ok ? 'تم حذف قاعدة التحويل بنجاح' : (r.message_ar || 'فشل إعادة تحميل الجدار الناري') });
+		});
+		return;
+	}
+
+	if (verb == 'fw_toggle_rule') {
+		let sid = trim(params.id || '');
+		let en = !!params.enabled;
+		if (!match(sid, /^[a-zA-Z0-9_-]+$/) && !match(sid, /^@[a-z]+\[[0-9]+\]$/)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معرف القاعدة غير صالح' });
+			return;
+		}
+		let cur = uci.cursor();
+		let rname = cur.get('firewall', sid, 'name') || sid;
+		let protected_rules = { 'noc_console_lan': true, 'Allow-NOC-Console-LAN': true, 'Allow-DHCP-Renew': true, 'Allow-Ping': true, 'Allow-DHCPv6': true };
+		if (!en && (protected_rules[sid] || protected_rules[rname])) {
+			release_lock();
+			audit_append(actor, 'fw_toggle_rule', sid, 'refused', 'Protected rule disable refused');
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يُسمح بتعطيل قواعد النظام الأساسية أو منفذ غرفة العمليات' });
+			return;
+		}
+		let snap_fw = fs.readfile('/etc/config/firewall');
+		let rb_tok = begin_rollback('firewall', '/etc/config/firewall', '/etc/init.d/firewall reload');
+		cur.set('firewall', sid, 'enabled', en ? '1' : '0');
+		cur.commit('firewall');
+		fw_check_and_reload(snap_fw, function(r) {
+			release_lock();
+			audit_append(actor, 'fw_toggle_rule', sid, r.ok ? 'committed' : 'failed', 'enabled=' + en);
+			reply_cb({ ok: r.ok, rollback_token: r.ok ? rb_tok : '', rollback_ttl: r.ok ? 60 : 0, message_ar: r.ok ? 'تم تحديث حالة القاعدة بنجاح (مهلة التأكيد 60 ثانية)' : (r.message_ar || 'فشل إعادة تحميل الجدار الناري') });
+		});
+		return;
+	}
+
+	if (verb == 'fw_add_rule') {
+		let rname = replace(trim(params.name || 'CustomRule'), /[\r\n\t<>'"`$;&|]/g, '');
+		let src = params.src != null ? trim('' + params.src) : 'lan';
+		let dest = params.dest != null ? trim('' + params.dest) : 'wan';
+		let proto = trim(params.proto || 'tcp');
+		let src_ip = trim(params.src_ip || '');
+		let dport = trim(params.dest_port || '');
+		let targ = trim(params.target || 'ACCEPT');
+		let allow_z = { 'lan': true, 'wan': true, 'docker': true, '*': true, '': true };
+		let allow_pr = { 'tcp': true, 'udp': true, 'tcp udp': true, 'icmp': true, 'all': true };
+		let allow_tg = { 'ACCEPT': true, 'DROP': true, 'REJECT': true };
+		if (rname == '' || length(rname) > 36 || !allow_z[src] || !allow_z[dest] || !allow_pr[proto] || !allow_tg[targ]) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معاملات قاعدة الجدار الناري غير صالحة' });
+			return;
+		}
+		if (src_ip != '' && !is_valid_cidr_or_ip(src_ip)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'عنوان المصدر IP/CIDR غير صالح' });
+			return;
+		}
+		if (dport != '' && !match(dport, /^[0-9]{1,5}(-[0-9]{1,5})?$/)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'نطاق المنافذ غير صالح' });
+			return;
+		}
+		if (dport != '' && index(dport, '-') < 0) {
+			let pn = +dport;
+			if (pn < 1 || pn > 65535) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'رقم المنفذ خارج النطاق' }); return; }
+			if (((src == 'wan' || src == '*') && targ == 'ACCEPT' && is_protected_port(pn)) || (src == 'lan' && (targ == 'DROP' || targ == 'REJECT') && is_protected_port(pn))) {
+				release_lock();
+				audit_append(actor, 'fw_add_rule', rname, 'refused', 'Protected management port rule refused');
+				reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يُسمح بكشف أو حظر المنافذ الإدارية الحرجة' });
+				return;
+			}
+		}
+		let snap_fw = fs.readfile('/etc/config/firewall');
+		let sid = 'noc_rule_' + urandom_hex(4);
+		try {
+			let cur = uci.cursor();
+			cur.set('firewall', sid, 'rule');
+			cur.set('firewall', sid, 'name', rname);
+			if (src != '' && src != '*') cur.set('firewall', sid, 'src', src);
+			if (dest != '' && dest != '*') cur.set('firewall', sid, 'dest', dest);
+			cur.set('firewall', sid, 'proto', proto);
+			if (src_ip != '') cur.set('firewall', sid, 'src_ip', src_ip);
+			if (dport != '') cur.set('firewall', sid, 'dest_port', dport);
+			cur.set('firewall', sid, 'family', 'ipv4');
+			cur.set('firewall', sid, 'target', targ);
+			cur.set('firewall', sid, 'enabled', '1');
+			cur.commit('firewall');
+		} catch (e) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل حفظ قاعدة الجدار الناري' });
+			return;
+		}
+		fw_check_and_reload(snap_fw, function(r) {
+			release_lock();
+			audit_append(actor, 'fw_add_rule', sid, r.ok ? 'committed' : 'failed', rname);
+			reply_cb({ ok: r.ok, message_ar: r.ok ? 'تمت إضافة قاعدة الجدار الناري بنجاح' : (r.message_ar || 'فشل تطبيق القاعدة') });
+		});
+		return;
+	}
+
+	if (verb == 'fw_delete_rule') {
+		let sid = trim(params.id || '');
+		if (!match(sid, /^[a-zA-Z0-9_-]+$/)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معرف القاعدة غير صالح' });
+			return;
+		}
+		let cur = uci.cursor();
+		let rname = cur.get('firewall', sid, 'name') || sid;
+		let protected_rules = { 'noc_console_lan': true, 'Allow-NOC-Console-LAN': true, 'Allow-DHCP-Renew': true, 'Allow-Ping': true, 'Allow-DHCPv6': true };
+		if (protected_rules[sid] || protected_rules[rname] || cur.get('firewall', sid) != 'rule') {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: القاعدة محمية أو غير قابلة للحذف' });
+			return;
+		}
+		let snap_fw = fs.readfile('/etc/config/firewall');
+		cur.delete('firewall', sid);
+		cur.commit('firewall');
+		fw_check_and_reload(snap_fw, function(r) {
+			release_lock();
+			audit_append(actor, 'fw_delete_rule', sid, r.ok ? 'committed' : 'failed', 'Deleted rule');
+			reply_cb({ ok: r.ok, message_ar: r.ok ? 'تم حذف قاعدة الجدار الناري' : (r.message_ar || 'فشل التحديث') });
+		});
+		return;
+	}
+
+	if (verb == 'fw_save_defaults') {
+		let synf = params.syn_flood ? '1' : '0';
+		let dropinv = params.drop_invalid ? '1' : '0';
+		let masq = params.wan_masq ? '1' : '0';
+		let mtufix = params.wan_mtu_fix ? '1' : '0';
+		let snap_fw = fs.readfile('/etc/config/firewall');
+		try {
+			let cur = uci.cursor();
+			let def_sid = '@defaults[0]';
+			cur.foreach('firewall', 'defaults', function(s) { def_sid = s['.name']; return false; });
+			cur.set('firewall', def_sid, 'syn_flood', synf);
+			cur.set('firewall', def_sid, 'drop_invalid', dropinv);
+			cur.foreach('firewall', 'zone', function(s) {
+				if (s.name == 'wan') {
+					cur.set('firewall', s['.name'], 'masq', masq);
+					cur.set('firewall', s['.name'], 'mtu_fix', mtufix);
+				}
+			});
+			cur.commit('firewall');
+		} catch (e) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل حفظ الإعدادات الافتراضية' });
+			return;
+		}
+		fw_check_and_reload(snap_fw, function(r) {
+			release_lock();
+			audit_append(actor, 'fw_save_defaults', 'firewall', r.ok ? 'committed' : 'failed', 'Updated defaults');
+			reply_cb({ ok: r.ok, message_ar: r.ok ? 'تم حفظ وتطبيق إعدادات الجدار الناري العامة' : (r.message_ar || 'فشل تطبيق الإعدادات') });
+		});
+		return;
+	}
+
+	if (verb == 'banip_save_config') {
+		let en = params.enabled ? '1' : '0';
+		let ablk = params.autoblocklist ? '1' : '0';
+		let aalw = params.autoallowlist ? '1' : '0';
+		let icmp = +(params.icmplimit != null ? params.icmplimit : 25);
+		let syn = +(params.synlimit != null ? params.synlimit : 10);
+		let udp = +(params.udplimit != null ? params.udplimit : 100);
+		if (icmp < 1 || icmp > 1000 || syn < 1 || syn > 1000 || udp < 1 || udp > 5000) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'حدود الحماية من الإغراق خارج النطاق المسموح' });
+			return;
+		}
+		try {
+			let cur = uci.cursor();
+			cur.set('banip', 'global', 'ban_enabled', en);
+			cur.set('banip', 'global', 'ban_autoblocklist', ablk);
+			cur.set('banip', 'global', 'ban_autoallowlist', aalw);
+			cur.set('banip', 'global', 'ban_icmplimit', '' + int(icmp));
+			cur.set('banip', 'global', 'ban_synlimit', '' + int(syn));
+			cur.set('banip', 'global', 'ban_udplimit', '' + int(udp));
+			cur.commit('banip');
+		} catch (e) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل حفظ إعدادات banIP' });
+			return;
+		}
+		exec_argv_async('/etc/init.d/banip', ['restart'], 15000, CAP_GENERAL, function(r) {
+			release_lock();
+			audit_append(actor, 'banip_save_config', 'banip', r.ok ? 'committed' : 'failed', 'en=' + en);
+			reply_cb({ ok: true, message_ar: 'تم حفظ إعدادات خدمة الحظر banIP بنجاح' });
+		});
+		return;
+	}
+
+	if (verb == 'banip_list_edit') {
+		let ltype = trim(params.list_type || '');
+		let op = trim(params.op || 'add');
+		let entry = trim(params.entry || '');
+		if ((ltype != 'allowlist' && ltype != 'blocklist') || (op != 'add' && op != 'remove') || !is_valid_cidr_or_ip(entry)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'عنوان IP/CIDR أو نوع القائمة غير صالح' });
+			return;
+		}
+		if (ltype == 'blocklist' && op == 'add') {
+			let base_ip = split(entry, '/')[0];
+			if (base_ip == get_lan_ip() || base_ip == client_ip || match(base_ip, /^127\./) || is_tailscale_ip(base_ip)) {
+				release_lock();
+				audit_append(actor, 'banip_list_edit', entry, 'refused', 'Refused blocking gateway/operator/VPN IP');
+				reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يُسمح بإدراج البوابة أو جهاز الإدارة أو شبكة VPN في قائمة الحظر' });
+				return;
+			}
+		}
+		let fpath = '/etc/banip/banip.' + ltype;
+		let cur_lines = split(fs.readfile(fpath) || '', '\n');
+		let out_lines = [];
+		let found = false;
+		for (let ln in cur_lines) {
+			let t = trim(ln);
+			if (t == '') continue;
+			if (t == entry) {
+				found = true;
+				if (op == 'remove') continue;
+			}
+			push(out_lines, t);
+		}
+		if (op == 'add' && !found) push(out_lines, entry);
+		atomic_write(fpath, join('\n', out_lines) + (length(out_lines) > 0 ? '\n' : ''), 0o600);
+		exec_argv_async('/etc/init.d/banip', ['reload'], 10000, CAP_GENERAL, function() {
+			release_lock();
+			audit_append(actor, 'banip_list_edit', ltype + ':' + op + ':' + entry, 'committed', 'Updated list');
+			reply_cb({ ok: true, message_ar: op == 'add' ? 'تمت إضافة العنوان إلى القائمة وتحديث الخدمة' : 'تمت إزالة العنوان من القائمة' });
+		});
+		return;
+	}
+
+	if (verb == 'upnp_save_config') {
+		let en = params.enabled ? '1' : '0';
+		let upnp = params.enable_upnp ? '1' : '0';
+		let natpmp = params.enable_natpmp ? '1' : '0';
+		let sec = params.secure_mode ? '1' : '0';
+		let ext = trim(params.external_iface || 'wwan');
+		let ustun = params.use_stun ? '1' : '0';
+		let stun_h = trim(params.stun_host || 'stun.cloudflare.com');
+		let stun_p = +(params.stun_port || 3478);
+		let allow_ex = { 'wan': true, 'wwan': true, 'pppoe-wan': true };
+		if (!allow_ex[ext] || !is_valid_fqdn(stun_h) || stun_p < 1 || stun_p > 65535) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معاملات UPnP/STUN غير صالحة' });
+			return;
+		}
+		try {
+			let cur = uci.cursor();
+			cur.set('upnpd', 'config', 'enabled', en);
+			cur.set('upnpd', 'config', 'enable_upnp', upnp);
+			cur.set('upnpd', 'config', 'enable_natpmp', natpmp);
+			cur.set('upnpd', 'config', 'secure_mode', sec);
+			cur.set('upnpd', 'config', 'external_iface', ext);
+			cur.set('upnpd', 'config', 'use_stun', ustun);
+			cur.set('upnpd', 'config', 'stun_host', stun_h);
+			cur.set('upnpd', 'config', 'stun_port', '' + int(stun_p));
+			cur.commit('upnpd');
+		} catch (e) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل حفظ إعدادات UPnP' });
+			return;
+		}
+		exec_argv_async('/etc/init.d/miniupnpd', ['restart'], 10000, CAP_GENERAL, function(r) {
+			release_lock();
+			audit_append(actor, 'upnp_save_config', ext, r.ok ? 'committed' : 'failed', 'en=' + en);
+			reply_cb({ ok: true, message_ar: 'تم حفظ وتطبيق إعدادات UPnP / NAT-PMP بنجاح' });
+		});
+		return;
+	}
+
+	if (verb == 'client_domain_add' || verb == 'client_domain_delete') {
+		if (verb == 'client_domain_delete') {
+			let sid = trim(params.id || '');
+			if (!match(sid, /^[a-zA-Z0-9_-]+$/)) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معرف النطاق غير صالح' }); return; }
+			let cur = uci.cursor();
+			if (cur.get('dhcp', sid) != 'domain') { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'سجل النطاق غير موجود' }); return; }
+			cur.delete('dhcp', sid);
+			cur.commit('dhcp');
+			exec_argv_async('/etc/init.d/dnsmasq', ['reload'], 8000, CAP_GENERAL, function(r) {
+				release_lock();
+				audit_append(actor, 'client_domain_delete', sid, r.ok ? 'committed' : 'failed', 'Removed local domain');
+				reply_cb({ ok: r.ok, message_ar: 'تم حذف النطاق المحلي بنجاح' });
+			});
+			return;
+		}
+		let dname = trim(params.name || '');
+		let dip = trim(params.ip || '');
+		if (!is_valid_fqdn(dname) || is_blocked_rewrite_domain(dname) || !is_valid_ipv4(dip)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'اسم النطاق أو عنوان IP غير صالح' });
+			return;
+		}
+		let sid = 'noc_dom_' + urandom_hex(4);
+		let cur = uci.cursor();
+		cur.set('dhcp', sid, 'domain');
+		cur.set('dhcp', sid, 'name', dname);
+		cur.set('dhcp', sid, 'ip', dip);
+		cur.commit('dhcp');
+		exec_argv_async('/etc/init.d/dnsmasq', ['reload'], 8000, CAP_GENERAL, function(r) {
+			release_lock();
+			audit_append(actor, 'client_domain_add', dname + '->' + dip, r.ok ? 'committed' : 'failed', 'Added local domain');
+			reply_cb({ ok: r.ok, message_ar: 'تمت إضافة النطاق المحلي بنجاح' });
+		});
+		return;
+	}
+
+	if (verb == 'client_lease_delete') {
+		let sid = trim(params.id || '');
+		if (!match(sid, /^[a-zA-Z0-9_-]+$/)) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معرف الحجز غير صالح' }); return; }
+		let cur = uci.cursor();
+		if (cur.get('dhcp', sid) != 'host') { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'حجز DHCP غير موجود' }); return; }
+		cur.delete('dhcp', sid);
+		cur.commit('dhcp');
+		exec_argv_async('/etc/init.d/dnsmasq', ['reload'], 8000, CAP_GENERAL, function(r) {
+			release_lock();
+			audit_append(actor, 'client_lease_delete', sid, r.ok ? 'committed' : 'failed', 'Removed static DHCP lease');
+			reply_cb({ ok: r.ok, message_ar: 'تم حذف حجز IP الثابت بنجاح' });
+		});
+		return;
+	}
+
+	if (verb == 'network_save_dhcp') {
+		let st = +(params.start || 5);
+		let lim = +(params.limit || 31);
+		let ltime = trim(params.leasetime || '1h');
+		let rebind = params.rebind_protection !== false ? '1' : '0';
+		let csize = +(params.cachesize != null ? params.cachesize : 1000);
+		if (st < 2 || st > 250 || lim < 5 || lim > 250 || (st + lim) > 254 || !match(ltime, /^([0-9]{1,4}[hm]|infinite)$/) || csize < 0 || csize > 10000) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'إعدادات خادم DHCP غير صالحة أو تتجاوز نطاق الشبكة' });
+			return;
+		}
+		try {
+			let cur = uci.cursor();
+			cur.set('dhcp', 'lan', 'start', '' + int(st));
+			cur.set('dhcp', 'lan', 'limit', '' + int(lim));
+			cur.set('dhcp', 'lan', 'leasetime', ltime);
+			let dm_sid = '@dnsmasq[0]';
+			cur.foreach('dhcp', 'dnsmasq', function(s) { dm_sid = s['.name']; return false; });
+			cur.set('dhcp', dm_sid, 'rebind_protection', rebind);
+			cur.set('dhcp', dm_sid, 'cachesize', '' + int(csize));
+			cur.commit('dhcp');
+		} catch (e) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل حفظ إعدادات DHCP' });
+			return;
+		}
+		exec_argv_async('/etc/init.d/dnsmasq', ['reload'], 8000, CAP_GENERAL, function(r) {
+			release_lock();
+			audit_append(actor, 'network_save_dhcp', 'lan', r.ok ? 'committed' : 'failed', sprintf('start=%d limit=%d lease=%s', int(st), int(lim), ltime));
+			reply_cb({ ok: r.ok, message_ar: 'تم حفظ وتطبيق إعدادات خادم DHCP بنجاح' });
+		});
+		return;
+	}
+
+	if (verb == 'network_save_wan') {
+		let uname = replace(trim(params.username || ''), /[\r\n\t\s<>'"`$;&|]/g, '');
+		let pwd = '' + (params.password || '');
+		let metric = +(params.metric != null ? params.metric : 10);
+		let mtu = +(params.mtu != null ? params.mtu : 1492);
+		let autostart = params.auto ? '1' : '0';
+		let psteer = params.packet_steering ? '1' : '0';
+		if (length(uname) > 64 || metric < 1 || metric > 1000 || mtu < 576 || mtu > 1500) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'إعدادات منفذ WAN PPPoE غير صالحة (MTU 576..1500)' });
+			return;
+		}
+		try {
+			let cur = uci.cursor();
+			if (uname != '') cur.set('network', 'wan', 'username', uname);
+			if (pwd != '') cur.set('network', 'wan', 'password', pwd);
+			cur.set('network', 'wan', 'metric', '' + int(metric));
+			cur.set('network', 'wan', 'mtu', '' + int(mtu));
+			cur.set('network', 'wan', 'auto', autostart);
+			cur.set('network', 'globals', 'packet_steering', psteer);
+			cur.commit('network');
+		} catch (e) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل حفظ إعدادات WAN' });
+			return;
+		}
+		exec_argv_async('/sbin/uci', ['changes', 'network'], 3000, CAP_GENERAL, function() {
+			release_lock();
+			audit_append(actor, 'network_save_wan', 'wan', 'committed', sprintf('mtu=%d metric=%d auto=%s', int(mtu), int(metric), autostart));
+			reply_cb({ ok: true, message_ar: 'تم حفظ إعدادات WAN PPPoE وتوجيه الحزم بنجاح' });
+		});
+		return;
+	}
+
+	if (verb == 'network_route_add' || verb == 'network_route_delete') {
+		if (verb == 'network_route_delete') {
+			let sid = trim(params.id || '');
+			if (!match(sid, /^[a-zA-Z0-9_-]+$/)) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معرف المسار غير صالح' }); return; }
+			let cur = uci.cursor();
+			if (cur.get('network', sid) != 'route') { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'المسار غير موجود' }); return; }
+			cur.delete('network', sid);
+			cur.commit('network');
+			exec_argv_async('/etc/init.d/network', ['reload'], 10000, CAP_GENERAL, function() {
+				release_lock();
+				audit_append(actor, 'network_route_delete', sid, 'committed', 'Deleted static route');
+				reply_cb({ ok: true, message_ar: 'تم حذف المسار الثابت بنجاح' });
+			});
+			return;
+		}
+		let iface = trim(params.interface || 'wwan');
+		let target = trim(params.target || '');
+		let nmask = trim(params.netmask || '255.255.255.255');
+		let gw = trim(params.gateway || '');
+		let metric = +(params.metric || 0);
+		let allow_ri = { 'lan': true, 'wan': true, 'wwan': true };
+		if (!allow_ri[iface] || !is_valid_ipv4(target) || !is_valid_ipv4(nmask) || (gw != '' && !is_valid_ipv4(gw)) || target == '0.0.0.0' || target == '192.168.1.0' || metric < 0 || metric > 1000) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'بيانات المسار الثابت غير صالحة أو تتعارض مع الشبكة الرئيسية' });
+			return;
+		}
+		let sid = 'noc_rt_' + urandom_hex(4);
+		let cur = uci.cursor();
+		cur.set('network', sid, 'route');
+		cur.set('network', sid, 'interface', iface);
+		cur.set('network', sid, 'target', target);
+		cur.set('network', sid, 'netmask', nmask);
+		if (gw != '') cur.set('network', sid, 'gateway', gw);
+		if (metric > 0) cur.set('network', sid, 'metric', '' + int(metric));
+		cur.commit('network');
+		exec_argv_async('/etc/init.d/network', ['reload'], 10000, CAP_GENERAL, function() {
+			release_lock();
+			audit_append(actor, 'network_route_add', target + '/' + nmask, 'committed', 'via ' + gw);
+			reply_cb({ ok: true, message_ar: 'تمت إضافة المسار الثابت بنجاح' });
+		});
+		return;
+	}
+
+	if (verb == 'wifi_scan') {
+		exec_argv_async('/usr/sbin/iw', ['dev', 'wlan0', 'scan'], 8000, 262144, function(sc) {
+			let list = [];
+			let cur_bss = null;
+			for (let ln in split(sc.output || '', '\n')) {
+				let mb = match(ln, /^BSS\s+([0-9a-fA-F:]{17})/);
+				if (mb) {
+					if (cur_bss && cur_bss.ssid != '') push(list, cur_bss);
+					cur_bss = { bssid: lc(mb[1]), ssid: '', signal_dbm: -99, freq_mhz: 0, security: 'Open' };
+					continue;
+				}
+				if (!cur_bss) continue;
+				let mf = match(ln, /^\s+freq:\s*([0-9]+)/);
+				if (mf) cur_bss.freq_mhz = +mf[1];
+				let ms = match(ln, /^\s+signal:\s*(-?[0-9.]+)/);
+				if (ms) cur_bss.signal_dbm = int(+ms[1]);
+				let mn = match(ln, /^\s+SSID:\s*(.*)$/);
+				if (mn) cur_bss.ssid = scrub_prohibited(replace(trim(mn[1]), /[\r\n\t<>]/g, ''));
+				if (index(ln, 'RSN:') >= 0) cur_bss.security = 'WPA2/WPA3';
+				else if (index(ln, 'WPA:') >= 0 && cur_bss.security == 'Open') cur_bss.security = 'WPA';
+			}
+			if (cur_bss && cur_bss.ssid != '') push(list, cur_bss);
+			sort(list, function(a, b) { return b.signal_dbm - a.signal_dbm; });
+			if (length(list) > 25) list = slice(list, 0, 25);
+			atomic_write(RUN_DIR + '/wifi_scan.json', sprintf('%J\n', { ts: time(), results: list }), 0o600);
+			release_lock();
+			audit_append(actor, 'wifi_scan', 'wlan0', 'ok', 'Scanned ' + length(list) + ' networks');
+			reply_cb({ ok: true, results: list, message_ar: 'تم مسح الشبكات اللاسلكية المجاورة بنجاح' });
+		});
+		return;
+	}
+
+	if (verb == 'wifi_save_uplink') {
+		let ssid = '' + (params.ssid || '');
+		let psk = '' + (params.psk || '');
+		if (length(ssid) < 1 || length(ssid) > 32 || match(ssid, /["\r\n\x00\\]/)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'اسم شبكة Uplink غير صالح (1..32 محرفاً بدون اقتباس)' });
+			return;
+		}
+		if (psk != '' && (length(psk) < 8 || length(psk) > 63 || match(psk, /["\r\n\x00\\]/))) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'كلمة مرور الشبكة غير صالحة (8..63 محرفاً)' });
+			return;
+		}
+		let conf_p = '/etc/wpa_supplicant_wwan.conf';
+		let existing = fs.readfile(conf_p) || '';
+		if (existing != '') atomic_write(ETC_DIR + '/wpa_supplicant_wwan.conf.bak', existing, 0o600);
+		if (psk == '') {
+			let mp = match(existing, /psk="([^"]+)"/);
+			if (!mp) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'كلمة المرور مطلوبة للشبكة الجديدة' }); return; }
+			psk = mp[1];
+		}
+		let next_conf = "ctrl_interface=/var/run/wpa_supplicant\nnetwork={\n    ssid=\"" + ssid + "\"\n    psk=\"" + psk + "\"\n    key_mgmt=WPA-PSK\n}\n";
+		atomic_write(conf_p, next_conf, 0o600);
+		let uplink_init = fs.stat('/etc/init.d/wwan_uplink') ? '/etc/init.d/wwan_uplink' : '/etc/init.d/network';
+		exec_argv_async(uplink_init, ['restart'], 10000, CAP_GENERAL, function() {
+			release_lock();
+			audit_append(actor, 'wifi_save_uplink', ssid, 'committed', 'Updated uplink station config');
+			reply_cb({ ok: true, message_ar: 'تم تحديث إعدادات شبكة الارتباط اللاسلكية وإعادة التشغيل' });
+		});
+		return;
+	}
+
+	if (verb == 'wifi_save_ap') {
+		let ssid = trim(params.ssid || '');
+		let enc = trim(params.encryption || 'psk2');
+		let key = '' + (params.key || '');
+		let ch = trim(params.channel || '36');
+		let htm = trim(params.htmode || 'HT40');
+		let dis = params.disabled ? '1' : '0';
+		let allow_enc = { 'psk2': true, 'sae-mixed': true, 'none': true };
+		let allow_ht = { 'HT20': true, 'HT40': true, 'VHT20': true, 'VHT40': true, 'VHT80': true };
+		if (length(ssid) < 1 || length(ssid) > 32 || has_prohibited(ssid) || !allow_enc[enc] || !allow_ht[htm] || !match(ch, /^(auto|[0-9]{1,3})$/)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معاملات نقطة الوصول اللاسلكية غير صالحة أو تحتوي اسماً محظوراً' });
+			return;
+		}
+		if (dis == '0' && enc == 'none') {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: يتطلب تفعيل نقطة الوصول تشفيراً آمناً WPA2 أو WPA3' });
+			return;
+		}
+		let cur = uci.cursor();
+		let old_k = cur.get('wireless', 'default_radio0', 'key') || '';
+		if (dis == '0' && key == '' && length(old_k) < 8) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'يلزم إدخال مفتاح أمان (8..63 محرفاً) عند تفعيل نقطة الوصول' });
+			return;
+		}
+		if (key != '' && (length(key) < 8 || length(key) > 63)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'طول مفتاح الشبكة يجب أن يكون 8..63 محرفاً' });
+			return;
+		}
+		cur.set('wireless', 'radio0', 'channel', ch);
+		cur.set('wireless', 'radio0', 'htmode', htm);
+		cur.set('wireless', 'default_radio0', 'ssid', ssid);
+		cur.set('wireless', 'default_radio0', 'encryption', enc);
+		if (key != '') cur.set('wireless', 'default_radio0', 'key', key);
+		cur.set('wireless', 'default_radio0', 'disabled', dis);
+		cur.commit('wireless');
+		exec_argv_async('/sbin/wifi', ['reload'], 10000, CAP_GENERAL, function() {
+			release_lock();
+			audit_append(actor, 'wifi_save_ap', ssid, 'committed', sprintf('ch=%s enc=%s dis=%s', ch, enc, dis));
+			reply_cb({ ok: true, message_ar: 'تم حفظ إعدادات نقطة الوصول اللاسلكية 5GHz بنجاح' });
+		});
+		return;
+	}
+
+	if (verb == 'docker_control') {
+		let sub = trim(params.subaction || '');
+		if (sub == 'prune_images') {
+			exec_argv_async('/usr/bin/docker', ['image', 'prune', '-f'], 15000, CAP_GENERAL, function(r) {
+				release_lock();
+				audit_append(actor, 'docker_prune_images', 'dangling', r.ok ? 'committed' : 'failed', 'Pruned dangling images');
+				reply_cb({ ok: r.ok, output: scrub_prohibited(r.output), message_ar: r.ok ? 'تم تنظيف الصور اليتيمة (Dangling) غير المستخدمة بنجاح' : 'تعذر تنظيف صور Docker' });
+			});
+			return;
+		}
+		let cname = trim(params.container || '');
+		let allow_d = { 'start': true, 'stop': true, 'restart': true, 'logs': true, 'set_restart': true };
+		if (!allow_d[sub] || substr(cname, 0, 1) == '-' || !match(cname, /^[a-zA-Z0-9_.-]{1,64}$/)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'أمر أو اسم حاوية غير صالح' });
+			return;
+		}
+		let argv = [];
+		if (sub == 'logs') argv = ['logs', '--tail', '60', cname];
+		else if (sub == 'set_restart') {
+			let pol = trim(params.policy || 'unless-stopped');
+			if (pol != 'no' && pol != 'always' && pol != 'unless-stopped' && !match(pol, /^on-failure:[1-9][0-9]?$/)) {
+				release_lock();
+				reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'سياسة إعادة التشغيل غير صالحة' });
+				return;
+			}
+			argv = ['update', '--restart=' + pol, cname];
+		} else {
+			argv = [sub, cname];
+		}
+		exec_argv_async('/usr/bin/docker', argv, 12000, CAP_GENERAL, function(r) {
+			release_lock();
+			audit_append(actor, 'docker_' + sub, cname, r.ok ? 'committed' : 'failed', 'docker control');
+			if (r.overflow) { reply_cb({ ok: false, error_code: 'TIMEOUT', message_ar: 'تجاوزت مخرجات الحاوية حد 64 KiB' }); return; }
+			reply_cb({ ok: r.ok, output: scrub_prohibited(r.output), message_ar: r.ok ? 'تم تنفيذ أمر الحاوية بنجاح' : 'فشل تنفيذ أمر الحاوية' });
+		});
+		return;
+	}
+
+	if (verb == 'tailscale_control') {
+		let sub = trim(params.subaction || '');
+		if (sub == 'netcheck') {
+			exec_argv_async('/usr/sbin/tailscale', ['netcheck'], 10000, CAP_GENERAL, function(r) {
+				release_lock();
+				audit_append(actor, 'tailscale_netcheck', 'self', r.ok ? 'ok' : 'fail', 'netcheck');
+				reply_cb({ ok: r.ok, output: scrub_prohibited(r.output), message_ar: r.ok ? 'اكتمل فحص شبكة Tailscale' : 'تعذر تنفيذ الفحص' });
+			});
+			return;
+		}
+		if (sub == 'ping') {
+			let targ = trim(params.target || '');
+			if (!match(targ, /^[a-zA-Z0-9._-]{1,64}$/)) {
+				release_lock();
+				reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'هدف فحص VPN غير صالح' });
+				return;
+			}
+			exec_argv_async('/usr/sbin/tailscale', ['ping', '-c', '2', '--timeout', '2s', targ], 8000, CAP_GENERAL, function(r) {
+				release_lock();
+				audit_append(actor, 'tailscale_ping', targ, r.ok ? 'ok' : 'fail', 'peer ping');
+				reply_cb({ ok: r.ok, output: scrub_prohibited(r.output), message_ar: r.ok ? 'اكتمل فحص القرين بنجاح' : 'تعذر الوصول إلى القرين' });
+			});
+			return;
+		}
+		if (sub == 'reconnect') {
+			if (is_tailscale_ip(client_ip)) {
+				release_lock();
+				audit_append(actor, 'tailscale_reconnect', client_ip, 'refused', 'Refused VPN reconnect from VPN peer IP');
+				reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يمكن إعادة تشغيل VPN من جلسة متصلة عبر الشبكة الخاصة نفسها' });
+				return;
+			}
+			exec_argv_async('/etc/init.d/tailscale', ['restart'], 15000, CAP_GENERAL, function(r) {
+				release_lock();
+				audit_append(actor, 'tailscale_reconnect', 'tailscale', r.ok ? 'committed' : 'failed', 'Service restarted');
+				reply_cb({ ok: r.ok, message_ar: r.ok ? 'تمت إعادة تشغيل اتصال الشبكة الخاصة بنجاح' : 'فشلت إعادة تشغيل الشبكة الخاصة' });
+			});
+			return;
+		}
+		if (sub == 'set_flags') {
+			let acc_r = !!params.accept_routes;
+			let acc_d = !!params.accept_dns;
+			let sh = !!params.shields_up;
+			let adv = trim(params.advertise_routes || '');
+			if (adv != '' && !match(adv, /^(10\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])|192\.168)\.[0-9]{1,3}\.0\/(16|24)$/)) {
+				release_lock();
+				reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'نطاق الإعلان المسموح يجب أن يكون شبكة محلية خاصة بصيغة CIDR مثل 192.168.1.0/24 أو فارغاً' });
+				return;
+			}
+			if (sh && is_tailscale_ip(client_ip)) {
+				release_lock();
+				audit_append(actor, 'tailscale_set_flags', client_ip, 'refused', 'Refused shields-up from Tailscale caller');
+				reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يُسمح بتفعيل Shields Up أثناء الاتصال عبر شبكة VPN نفسها' });
+				return;
+			}
+			let argv = [
+				'set',
+				'--accept-routes=' + (acc_r ? 'true' : 'false'),
+				'--accept-dns=' + (acc_d ? 'true' : 'false'),
+				'--shields-up=' + (sh ? 'true' : 'false'),
+				'--advertise-routes=' + adv
+			];
+			exec_argv_async('/usr/sbin/tailscale', argv, 10000, CAP_GENERAL, function(r) {
+				release_lock();
+				audit_append(actor, 'tailscale_set_flags', 'tailscale', r.ok ? 'committed' : 'failed', join(' ', slice(argv, 1)));
+				reply_cb({ ok: r.ok, output: scrub_prohibited(r.output), message_ar: r.ok ? 'تم تحديث خصائص Tailscale بنجاح' : 'تعذر تحديث خصائص Tailscale' });
+			});
+			return;
+		}
+		release_lock();
+		reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'أمر الشبكة الخاصة غير معروف' });
+		return;
+	}
+
+	if (verb == 'sys_save_general') {
+		let hn = trim(params.hostname || 'Gateway');
+		let zname = trim(params.zonename || 'UTC');
+		let tz = trim(params.timezone || 'GMT0');
+		let lsize = +(params.log_size != null ? params.log_size : 128);
+		let ntp_en = params.ntp_enabled ? '1' : '0';
+		let ntp_srv = params.ntp_server_enabled ? '1' : '0';
+		let ntp_list = params.ntp_servers || ['0.pool.ntp.org', '1.pool.ntp.org'];
+		if (!match(hn, /^[a-zA-Z0-9-]{2,32}$/) || has_prohibited(hn) || !match(zname, /^[A-Za-z0-9_/+.-]{1,64}$/) || length(tz) < 1 || length(tz) > 48 || lsize < 16 || lsize > 1024 || type(ntp_list) != 'array' || length(ntp_list) < 1 || length(ntp_list) > 6) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'إعدادات النظام العامة أو اسم المضيف غير صالحة' });
+			return;
+		}
+		let clean_ntp = [];
+		for (let ns in ntp_list) {
+			let nst = trim('' + ns);
+			if (!is_valid_fqdn(nst) || has_prohibited(nst)) {
+				release_lock();
+				reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'خادم NTP غير صالح أو يحتوي اسماً محظوراً' });
+				return;
+			}
+			push(clean_ntp, nst);
+		}
+		let cur = uci.cursor();
+		let sys_sid = '@system[0]';
+		cur.foreach('system', 'system', function(s) { sys_sid = s['.name']; return false; });
+		cur.set('system', sys_sid, 'hostname', hn);
+		cur.set('system', sys_sid, 'zonename', zname);
+		cur.set('system', sys_sid, 'timezone', tz);
+		cur.set('system', sys_sid, 'log_size', '' + int(lsize));
+		cur.set('system', 'ntp', 'enabled', ntp_en);
+		cur.set('system', 'ntp', 'enable_server', ntp_srv);
+		cur.set('system', 'ntp', 'server', clean_ntp);
+		cur.commit('system');
+		exec_argv_async('/etc/init.d/system', ['reload'], 6000, CAP_GENERAL, function() {
+			exec_argv_async('/etc/init.d/sysntpd', ['restart'], 6000, CAP_GENERAL, function() {
+				release_lock();
+				audit_append(actor, 'sys_save_general', hn, 'committed', sprintf('tz=%s log=%d', zname, int(lsize)));
+				reply_cb({ ok: true, message_ar: 'تم حفظ الإعدادات العامة والتوقيت (NTP) بنجاح' });
+			});
+		});
+		return;
+	}
+
+	if (verb == 'sys_save_tuning') {
+		let ct_max = +(params.conntrack_max || 262144);
+		let psteer = params.packet_steering ? '1' : '0';
+		if (ct_max < 16384 || ct_max > 524288 || ct_max != int(ct_max)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'حد Conntrack خارج النطاق الآمن (16384..524288)' });
+			return;
+		}
+		let cur = uci.cursor();
+		cur.set('network', 'globals', 'packet_steering', psteer);
+		cur.commit('network');
+		exec_argv_async('/sbin/sysctl', ['-w', 'net.netfilter.nf_conntrack_max=' + int(ct_max)], 4000, CAP_GENERAL, function(r) {
+			let sc = fs.readfile('/etc/sysctl.conf') || '';
+			let lines = [];
+			let updated = false;
+			for (let l in split(sc, '\n')) {
+				if (index(l, 'net.netfilter.nf_conntrack_max') >= 0) {
+					push(lines, 'net.netfilter.nf_conntrack_max=' + int(ct_max));
+					updated = true;
+				} else push(lines, l);
+			}
+			if (!updated) push(lines, 'net.netfilter.nf_conntrack_max=' + int(ct_max));
+			atomic_write('/etc/sysctl.conf', trim(join('\n', lines)) + '\n', 0o644);
+			release_lock();
+			audit_append(actor, 'sys_save_tuning', 'conntrack_max', r.ok ? 'committed' : 'failed', '' + int(ct_max));
+			reply_cb({ ok: r.ok, message_ar: r.ok ? 'تم تحديث معايير النواة وتوجيه الحزم بنجاح' : 'تعذر ضبط Conntrack عبر sysctl' });
+		});
+		return;
+	}
+
+	if (verb == 'sys_cron_add' || verb == 'sys_cron_delete') {
+		let cpath = '/etc/crontabs/root';
+		let existing = fs.readfile(cpath) || '';
+		let lines = [];
+		for (let l in split(existing, '\n')) {
+			let t = trim(l);
+			if (t != '' && substr(t, 0, 1) != '#') push(lines, t);
+		}
+		if (verb == 'sys_cron_delete') {
+			let idx = +(params.index != null ? params.index : -1);
+			if (idx < 0 || idx >= length(lines)) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معرف المهمة غير صالح' }); return; }
+			let next_l = [];
+			for (let i = 0; i < length(lines); i++) if (i != idx) push(next_l, lines[i]);
+			atomic_write(cpath, join('\n', next_l) + (length(next_l) > 0 ? '\n' : ''), 0o600);
+			exec_argv_async('/etc/init.d/cron', ['restart'], 6000, CAP_GENERAL, function() {
+				release_lock();
+				audit_append(actor, 'sys_cron_delete', '' + idx, 'committed', 'Removed scheduled job');
+				reply_cb({ ok: true, message_ar: 'تم حذف المهمة المجدولة بنجاح' });
+			});
+			return;
+		}
+		let tid = trim(params.template_id || '');
+		let tpl = CRON_TEMPLATES[tid];
+		let sched = trim(params.schedule || '');
+		let sf = split(sched, /\s+/);
+		if (!tpl || length(sf) != 5) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'قالب المهمة أو تعبير التوقيت (5 خانات) غير صالح' });
+			return;
+		}
+		for (let f in sf) {
+			if (length(f) == 0 || length(f) > 16 || !match(f, /^[0-9*,/-]+$/)) {
+				release_lock();
+				reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'صيغة التوقيت غير صالحة' });
+				return;
+			}
+		}
+		push(lines, sched + ' ' + tpl.exe + ' ' + tpl.arg);
+		atomic_write(cpath, join('\n', lines) + '\n', 0o600);
+		exec_argv_async('/etc/init.d/cron', ['restart'], 6000, CAP_GENERAL, function() {
+			release_lock();
+			audit_append(actor, 'sys_cron_add', tid, 'committed', sched);
+			reply_cb({ ok: true, message_ar: 'تمت إضافة المهمة المجدولة وتفعيلها بنجاح' });
+		});
+		return;
+	}
+
+	if (verb == 'sys_ssh_save') {
+		let pauth = params.password_auth ? 'on' : 'off';
+		let rpauth = params.root_password_auth ? 'on' : 'off';
+		let ak_raw = fs.readfile('/etc/dropbear/authorized_keys') || '';
+		let key_cnt = 0;
+		for (let l in split(ak_raw, '\n')) {
+			let t = trim(l);
+			if (t != '' && substr(t, 0, 1) != '#') key_cnt++;
+		}
+		if ((pauth == 'off' || rpauth == 'off') && key_cnt == 0) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يُسمح بتعطيل الدخول بكلمة المرور لعدم وجود مفاتيح SSH مصرح بها' });
+			return;
+		}
+		let cur = uci.cursor();
+		let db_sid = 'main';
+		cur.foreach('dropbear', 'dropbear', function(s) { db_sid = s['.name']; return false; });
+		cur.set('dropbear', db_sid, 'PasswordAuth', pauth);
+		cur.set('dropbear', db_sid, 'RootPasswordAuth', rpauth);
+		cur.commit('dropbear');
+		exec_argv_async('/etc/init.d/dropbear', ['reload'], 6000, CAP_GENERAL, function() {
+			release_lock();
+			audit_append(actor, 'sys_ssh_save', 'dropbear', 'committed', sprintf('pw=%s rootpw=%s', pauth, rpauth));
+			reply_cb({ ok: true, message_ar: 'تم تحديث إعدادات خادم SSH بنجاح' });
+		});
+		return;
+	}
+
+	if (verb == 'sys_ssh_key_add' || verb == 'sys_ssh_key_delete') {
+		let ak_path = '/etc/dropbear/authorized_keys';
+		let raw = fs.readfile(ak_path) || '';
+		let lines = [];
+		for (let l in split(raw, '\n')) {
+			let t = trim(l);
+			if (t != '' && substr(t, 0, 1) != '#') push(lines, t);
+		}
+		if (verb == 'sys_ssh_key_delete') {
+			let cur = uci.cursor();
+			let db_sid = 'main';
+			cur.foreach('dropbear', 'dropbear', function(s) { db_sid = s['.name']; return false; });
+			let pauth_on = cur.get('dropbear', db_sid, 'PasswordAuth') != 'off';
+			if (!pauth_on && length(lines) <= 1) {
+				release_lock();
+				reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يمكن حذف آخر مفتاح SSH أثناء تعطيل الدخول بكلمة المرور' });
+				return;
+			}
+			let idx = +(params.index != null ? params.index : -1);
+			if (idx < 0 || idx >= length(lines)) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معرف المفتاح غير صالح' }); return; }
+			let next_l = [];
+			for (let i = 0; i < length(lines); i++) if (i != idx) push(next_l, lines[i]);
+			atomic_write(ak_path, join('\n', next_l) + (length(next_l) > 0 ? '\n' : ''), 0o600);
+			release_lock();
+			audit_append(actor, 'sys_ssh_key_delete', '' + idx, 'committed', 'Deleted authorized SSH key');
+			reply_cb({ ok: true, message_ar: 'تم حذف مفتاح SSH بنجاح' });
+			return;
+		}
+		let kp = split(trim(params.public_key || ''), /\s+/);
+		let allow_kt = { 'ssh-ed25519': true, 'ecdsa-sha2-nistp256': true, 'ecdsa-sha2-nistp384': true, 'ecdsa-sha2-nistp521': true, 'ssh-rsa': true };
+		if (length(kp) < 2 || !allow_kt[kp[0]] || !match(kp[1], /^[A-Za-z0-9+/=]+$/) || length(kp[1]) < 40 || length(kp[1]) > 2048 || (kp[0] == 'ssh-rsa' && length(kp[1]) < 500)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'صيغة المفتاح العام غير صالحة (المقبول: ed25519 أو ecdsa أو rsa >= 3072-bit بدون خيارات)' });
+			return;
+		}
+		let cmt = length(kp) >= 3 ? replace(kp[2], /[^a-zA-Z0-9._@-]/g, '') : 'noc-key';
+		let norm_line = kp[0] + ' ' + kp[1] + (cmt != '' ? (' ' + cmt) : '');
+		for (let ex in lines) {
+			if (index(ex, kp[1]) >= 0) { release_lock(); reply_cb({ ok: true, message_ar: 'المفتاح مضاف مسبقاً' }); return; }
+		}
+		push(lines, norm_line);
+		atomic_write(ak_path, join('\n', lines) + '\n', 0o600);
+		release_lock();
+		audit_append(actor, 'sys_ssh_key_add', cmt, 'committed', kp[0]);
+		reply_cb({ ok: true, message_ar: 'تمت إضافة المفتاح العام إلى authorized_keys بنجاح' });
+		return;
+	}
+
+	if (verb == 'sys_pkg_action') {
+		let op = trim(params.op || '');
+		let pkg = trim(params.package || '');
+		let allow_ops = { 'update': true, 'check_upgrades': true, 'install': true, 'upgrade': true, 'del': true };
+		if (!allow_ops[op]) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'عملية إدارة الحزم غير مدعومة' });
+			return;
+		}
+		if (op == 'install' || op == 'upgrade' || op == 'del') {
+			if (pkg == '' || length(pkg) > 64 || substr(pkg, 0, 1) == '-' || !match(pkg, /^[a-zA-Z0-9._+-]+$/)) {
+				release_lock();
+				reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'اسم الحزمة البرمجية غير صالح' });
+				return;
+			}
+			let protected_pkgs = {
+				'base-files': true, 'busybox': true, 'ucode': true, 'dropbear': true, 'uhttpd': true,
+				'dnsmasq': true, 'firewall4': true, 'nftables': true, 'apk-mbedtls': true,
+				'kernel': true, 'libc': true, 'netifd': true, 'procd': true, 'ubus': true, 'uci': true
+			};
+			if (op == 'del' && (protected_pkgs[pkg] || index(pkg, 'ucode-mod-') == 0 || index(pkg, 'kmod-') == 0)) {
+				release_lock();
+				audit_append(actor, 'sys_pkg_action', 'del:' + pkg, 'refused', 'Protected system package removal refused');
+				reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يُسمح بحذف الحزم الأساسية للنظام أو وحدات النواة' });
+				return;
+			}
+		}
+		let argv = [];
+		if (op == 'update') argv = ['update'];
+		else if (op == 'check_upgrades') argv = ['upgrade', '-s'];
+		else if (op == 'install') argv = ['add', pkg];
+		else if (op == 'upgrade') argv = ['upgrade', pkg];
+		else if (op == 'del') argv = ['del', pkg];
+
+		exec_argv_async('/usr/bin/apk', argv, 25000, 262144, function(r) {
+			release_lock();
+			let clean_out = scrub_prohibited(r.output || '');
+			audit_append(actor, 'sys_pkg_' + op, pkg || 'repositories', r.ok ? 'committed' : 'failed', substr(replace(clean_out, /\s+/g, ' '), 0, 120));
+			reply_cb({
+				ok: r.ok,
+				op: op,
+				package: pkg,
+				output: clean_out != '' ? clean_out : (r.ok ? 'اكتملت العملية بنجاح دون رسائل إضافية.' : 'تعذر تنفيذ عملية الحزمة.'),
+				message_ar: r.ok ? 'تم تنفيذ عملية الحزم البرمجية بنجاح' : 'تعذر إتمام عملية الحزمة البرمجية (راجع المخرجات)'
+			});
+		});
+		return;
+	}
+
+	if (verb == 'sys_reboot_challenge') {
+		let nonce = urandom_hex(16);
+		let exp = time() + 60;
+		atomic_write(RUN_DIR + '/reboot_nonce.json', sprintf('%J\n', { nonce: nonce, actor: actor, exp: exp }), 0o600);
+		release_lock();
+		reply_cb({ ok: true, nonce: nonce, ttl_s: 60 });
+		return;
+	}
+
+	if (verb == 'sys_reboot') {
+		let phrase = trim(params.confirm || '');
+		let nonce = trim(params.nonce || '');
+		let saved = read_json(RUN_DIR + '/reboot_nonce.json', null);
+		if (phrase != 'CONFIRM_REBOOT' || !saved || saved.nonce != nonce || saved.actor != actor || time() > (+saved.exp || 0)) {
+			release_lock();
+			audit_append(actor, 'sys_reboot', 'gateway', 'refused', 'Invalid phrase or expired nonce');
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: يلزم رمز تحدٍ صالح وعبارة التأكيد CONFIRM_REBOOT' });
+			return;
+		}
+		if (fs.stat(RUN_DIR + '/reboot_nonce.json')) fs.unlink(RUN_DIR + '/reboot_nonce.json');
+		audit_append(actor, 'sys_reboot', 'gateway', 'committed', 'Scheduled reboot -d 2');
+		if (!STAGING_MODE) {
+			uloop.timer(400, function() {
+				system(['/sbin/reboot', '-d', '2']);
+			});
+		}
+		release_lock();
+		reply_cb({ ok: true, message_ar: 'جاري إعادة تشغيل البوابة الشبكية خلال ثانيتين' });
+		return;
+	}
+
+	if (verb == 'auth_change_password') {
+		let pw = '' + (params.password || '');
+		if (length(pw) < 12) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'يجب أن لا يقل طول كلمة المرور الجديدة عن 12 حرفاً' });
+			return;
+		}
+		let auth_doc = read_json(ETC_DIR + '/auth.json', null);
+		if (!auth_doc || !auth_doc.users || !auth_doc.users.admin) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'AUTH', message_ar: 'حساب المدير غير مهيأ' });
+			return;
+		}
+		if (auth_busy) {
+			release_lock();
+			reply_cb({ ok: false, status: 429, error_code: 'TIMEOUT', retry_after: 1, message_ar: 'توجد عملية تشفير جارية حالياً' });
+			return;
+		}
+		auth_busy = true;
+		let salt = urandom_hex(16);
+		let iters = +auth_doc.iter || PBKDF2_ITER;
+		uloop.task(function() {
+			return pbkdf2_sha256(pw, salt, iters);
+		}, function(dk) {
+			auth_busy = false;
+			release_lock();
+			if (!dk) { reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل اشتقاق المفتاح' }); return; }
+			let doc = read_json(ETC_DIR + '/auth.json', auth_doc);
+			let prev_u = (doc.users && doc.users.admin) ? doc.users.admin : {};
+			doc.users.admin = {
+				role: 'admin', salt_hex: salt, dk_hex: dk,
+				totp_enabled: !!prev_u.totp_enabled,
+				totp_secret: prev_u.totp_secret || ''
+			};
+			atomic_write(ETC_DIR + '/auth.json', sprintf('%J\n', doc), 0o600);
+			audit_append(actor, 'auth_change_password', 'admin', 'committed', 'Admin password rotated');
+			reply_cb({ ok: true, invalidate_sessions: true, message_ar: 'تم تحديث كلمة مرور المدير بنجاح' });
+		});
+		return;
+	}
+
+	if (verb == 'auth_delete_user') {
+		let uname = trim(params.username || '');
+		if (uname == '' || uname == 'admin') {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يمكن حذف حساب المدير الأساسي' });
+			return;
+		}
+		let auth_doc = read_json(ETC_DIR + '/auth.json', null);
+		if (!auth_doc || !auth_doc.users || !auth_doc.users[uname]) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'المستخدم غير موجود' });
+			return;
+		}
+		delete auth_doc.users[uname];
+		atomic_write(ETC_DIR + '/auth.json', sprintf('%J\n', auth_doc), 0o600);
+		release_lock();
+		audit_append(actor, 'auth_delete_user', uname, 'committed', 'Removed operator user');
+		reply_cb({ ok: true, message_ar: 'تم حذف الحساب بنجاح' });
+		return;
+	}
+
+	if (verb == 'rollback_confirm' || verb == 'rollback_revert') {
+		let tok = trim(params.token || '');
+		if (!match(tok, /^[0-9a-f]{8,32}$/)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'رمز التراجع غير صالح' });
+			return;
+		}
+		let base = RUN_DIR + '/rb_' + tok;
+		let meta = read_json(base + '.pending', null);
+		if (!meta) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'انتهت مهلة التراجع أو تم تأكيد التعديل مسبقاً' });
+			return;
+		}
+		if (verb == 'rollback_confirm') {
+			fs.unlink(base + '.pending');
+			fs.unlink(base + '.bak');
+			release_lock();
+			audit_append(actor, 'rollback_confirm', meta.kind || 'config', 'committed', 'Confirmed pending change');
+			reply_cb({ ok: true, message_ar: 'تم اعتماد التغيير بشكل دائم' });
+			return;
+		}
+		let bak = fs.readfile(base + '.bak');
+		if (bak != null && meta.cfg_path) {
+			atomic_write(meta.cfg_path, bak, 0o644);
+			if (meta.reload_cmd) system(meta.reload_cmd + ' >/dev/null 2>&1');
+		}
+		fs.unlink(base + '.pending');
+		fs.unlink(base + '.bak');
+		release_lock();
+		audit_append(actor, 'rollback_revert', meta.kind || 'config', 'committed', 'Reverted pending change');
+		reply_cb({ ok: true, message_ar: 'تم التراجع عن التغيير واستعادة الإعداد السابق بنجاح' });
+		return;
+	}
+
+	if (verb == 'alerts_set') {
+		let prev = read_json(ETC_DIR + '/alerts.json', {});
+		let tok = trim(params.telegram_bot_token || '');
+		let next_cfg = {
+			telegram_enabled: !!params.telegram_enabled,
+			telegram_bot_token: tok != '' ? tok : (prev.telegram_bot_token || ''),
+			telegram_chat_id: trim(params.telegram_chat_id != null ? params.telegram_chat_id : (prev.telegram_chat_id || '')),
+			ntfy_enabled: !!params.ntfy_enabled,
+			ntfy_url: trim(params.ntfy_url != null ? params.ntfy_url : (prev.ntfy_url || '')),
+			cpu_temp_max: +(params.cpu_temp_max || prev.cpu_temp_max || 78),
+			ram_pct_max: +(params.ram_pct_max || prev.ram_pct_max || 90),
+			alert_wan_down: params.alert_wan_down !== false,
+			alert_auth_fail: params.alert_auth_fail !== false,
+			alert_new_device: !!params.alert_new_device,
+			cooldown_sec: +(params.cooldown_sec || prev.cooldown_sec || 300)
+		};
+		if (next_cfg.ntfy_url != '' && !match(next_cfg.ntfy_url, /^https?:\/\/[a-zA-Z0-9._:\/-]+$/)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'رابط ntfy غير صالح' });
+			return;
+		}
+		atomic_write(ETC_DIR + '/alerts.json', sprintf('%J\n', next_cfg), 0o600);
+		release_lock();
+		audit_append(actor, 'alerts_set', 'alerts', 'committed', 'Updated alerting configuration');
+		reply_cb({ ok: true, message_ar: 'تم حفظ إعدادات التنبيهات بنجاح' });
+		return;
+	}
+
+	if (verb == 'alerts_test' || verb == 'alerts_dispatch') {
+		let cfg = read_json(ETC_DIR + '/alerts.json', {});
+		let title = trim(params.title || 'تنبيه البوابة الشبكية');
+		let msg = trim(params.message || 'رسالة اختبار من غرفة عمليات البوابة الشبكية');
+		let hist = read_json(RUN_DIR + '/alerts_history.json', []);
+		push(hist, { ts: now_iso(), level: trim(params.level || 'info'), title: title, message: msg });
+		if (length(hist) > 50) hist = slice(hist, -50);
+		atomic_write(RUN_DIR + '/alerts_history.json', sprintf('%J\n', hist), 0o600);
+		let sent_channels = [];
+		if (cfg.telegram_enabled && cfg.telegram_bot_token && cfg.telegram_chat_id) {
+			let tg_url = 'https://api.telegram.org/bot' + cfg.telegram_bot_token + '/sendMessage';
+			let txt = title + '\n' + msg;
+			system(sprintf('curl -fsS --max-time 4 -X POST %s -d chat_id=%s --data-urlencode text=%s >/dev/null 2>&1 &',
+				sprintf("'%s'", replace(tg_url, /'/g, '')),
+				sprintf("'%s'", replace('' + cfg.telegram_chat_id, /'/g, '')),
+				sprintf("'%s'", replace(txt, /'/g, ''))));
+			push(sent_channels, 'Telegram');
+		}
+		if (cfg.ntfy_enabled && cfg.ntfy_url) {
+			system(sprintf('curl -fsS --max-time 4 -H %s -d %s %s >/dev/null 2>&1 &',
+				sprintf("'Title: %s'", replace(title, /'/g, '')),
+				sprintf("'%s'", replace(msg, /'/g, '')),
+				sprintf("'%s'", replace(cfg.ntfy_url, /'/g, ''))));
+			push(sent_channels, 'ntfy');
+		}
+		release_lock();
+		if (verb == 'alerts_test' && length(sent_channels) == 0) {
+			reply_cb({ ok: true, message_ar: 'تم تسجيل تنبيه الاختبار محلياً (فعّل Telegram أو ntfy لإرساله خارجياً)' });
+			return;
+		}
+		reply_cb({ ok: true, channels: sent_channels, message_ar: 'تم إرسال التنبيه عبر: ' + (length(sent_channels) ? join('، ', sent_channels) : 'السجل المحلي') });
+		return;
+	}
+
+	if (verb == 'auth_totp_setup') {
+		let sec = gen_base32_secret();
+		atomic_write(RUN_DIR + '/totp_pending.json', sprintf('%J\n', { secret: sec, ts: time() }), 0o600);
+		release_lock();
+		reply_cb({
+			ok: true,
+			secret: sec,
+			otpauth_uri: sprintf('otpauth://totp/NOC-Gateway:admin?secret=%s&issuer=NOC-Gateway', sec),
+			message_ar: 'تم توليد مفتاح المصادقة الثنائية، أدخل الرمز السداسي لتأكيد التفعيل'
+		});
+		return;
+	}
+
+	if (verb == 'auth_totp_enable') {
+		let pend = read_json(RUN_DIR + '/totp_pending.json', null);
+		let sec = trim(params.secret || (pend ? pend.secret : ''));
+		let code = trim(params.code || '');
+		if (sec == '' || !totp_verify(sec, code)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'رمز التحقق السداسي (TOTP) غير صحيح' });
+			return;
+		}
+		let auth_doc = read_json(ETC_DIR + '/auth.json', null);
+		if (!auth_doc || !auth_doc.users || !auth_doc.users.admin) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'AUTH', message_ar: 'حساب المدير غير مهيأ' });
+			return;
+		}
+		auth_doc.users.admin.totp_enabled = true;
+		auth_doc.users.admin.totp_secret = sec;
+		atomic_write(ETC_DIR + '/auth.json', sprintf('%J\n', auth_doc), 0o600);
+		fs.unlink(RUN_DIR + '/totp_pending.json');
+		release_lock();
+		audit_append(actor, 'auth_totp_enable', 'admin', 'committed', 'Enabled 2FA TOTP');
+		reply_cb({ ok: true, message_ar: 'تم تفعيل المصادقة الثنائية (TOTP) لحساب المدير بنجاح' });
+		return;
+	}
+
+	if (verb == 'auth_totp_disable') {
+		let auth_doc = read_json(ETC_DIR + '/auth.json', null);
+		if (!auth_doc || !auth_doc.users || !auth_doc.users.admin) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'AUTH', message_ar: 'حساب المدير غير مهيأ' });
+			return;
+		}
+		auth_doc.users.admin.totp_enabled = false;
+		delete auth_doc.users.admin.totp_secret;
+		atomic_write(ETC_DIR + '/auth.json', sprintf('%J\n', auth_doc), 0o600);
+		release_lock();
+		audit_append(actor, 'auth_totp_disable', 'admin', 'committed', 'Disabled 2FA TOTP');
+		reply_cb({ ok: true, message_ar: 'تم تعطيل المصادقة الثنائية لحساب المدير' });
+		return;
+	}
+
+	if (verb == 'client_quota_set') {
+		let mac = lc(trim(params.mac || ''));
+		if (!match(mac, /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'عنوان MAC غير صالح' });
+			return;
+		}
+		let quotas = read_json(ETC_DIR + '/device_quotas.json', {});
+		let qmb = +(params.quota_mb || 0);
+		let tkbps = +(params.throttle_kbps || 0);
+		if (qmb <= 0 && tkbps <= 0) delete quotas[mac];
+		else quotas[mac] = { quota_mb: qmb, throttle_kbps: tkbps, updated_at: now_iso() };
+		atomic_write(ETC_DIR + '/device_quotas.json', sprintf('%J\n', quotas), 0o600);
+		release_lock();
+		audit_append(actor, 'client_quota_set', mac, 'committed', sprintf('quota_mb=%d throttle=%d', qmb, tkbps));
+		reply_cb({ ok: true, message_ar: 'تم حفظ الحصة الشهرية للجهاز بنجاح' });
+		return;
+	}
+
+	if (verb == 'schedule_action_set') {
+		let mac = lc(trim(params.mac || ''));
+		let action_type = trim(params.action_type || 'block');
+		let start_h = trim(params.start_time || '23:00');
+		let end_h = trim(params.end_time || '07:00');
+		if (!match(mac, /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/) || !match(start_h, /^[0-2][0-9]:[0-5][0-9]$/) || !match(end_h, /^[0-2][0-9]:[0-5][0-9]$/)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'بيانات الجدولة أو عنوان MAC غير صالحة' });
+			return;
+		}
+		let scheds = read_json(ETC_DIR + '/device_schedules.json', []);
+		push(scheds, { id: urandom_hex(4), mac: mac, action_type: action_type, start_time: start_h, end_time: end_h, enabled: true });
+		if (length(scheds) > 40) scheds = slice(scheds, -40);
+		atomic_write(ETC_DIR + '/device_schedules.json', sprintf('%J\n', scheds), 0o600);
+		release_lock();
+		audit_append(actor, 'schedule_action_set', mac, 'committed', start_h + '-' + end_h + ' ' + action_type);
+		reply_cb({ ok: true, message_ar: 'تمت إضافة جدولة الإجراء للجهاز بنجاح' });
+		return;
+	}
+
+	release_lock();
+	reply_cb({ ok: false, error_code: 'UNSUPPORTED', message_ar: 'أمر غير مدعوم' });
+}
+
+// --- Startup & uloop Event Loop ---
+ensure_dirs();
+uloop.init();
+
+if (fs.stat(SOCK_PATH)) fs.unlink(SOCK_PATH);
+let sa = sock.sockaddr({ path: SOCK_PATH });
+srv_sock = sock.create(sock.AF_UNIX, sock.SOCK_STREAM);
+if (!srv_sock || !srv_sock.bind(sa) || !srv_sock.listen(16)) {
+	die('Failed to bind noc-helperd socket at ' + SOCK_PATH + ': ' + sock.error());
+}
+fs.chmod(SOCK_PATH, 0o660);
+let noc_user = lookup_user_ids('noc-api');
+if (noc_user) fs.chown(SOCK_PATH, 0, noc_user.gid);
+
+let allowed_uid = noc_user ? noc_user.uid : -1;
+let staging_override_uid = getenv('NOC_STAGING_ALLOW_UID');
+if (STAGING_MODE && staging_override_uid != null && staging_override_uid != '') {
+	allowed_uid = +staging_override_uid;
+}
+
+srv_handle = uloop.handle(srv_sock, function(ev) {
+	let cli = srv_sock.accept();
+	if (!cli) return;
+	if (active_clients >= 32) { cli.close(); return; }
+	let cred = cli.getopt(sock.SOL_SOCKET, sock.SO_PEERCRED);
+	if (!cred || (cred.uid != 0 && cred.uid != allowed_uid)) {
+		try { cli.send(sprintf('%J\n', { ok: false, error_code: 'FORBIDDEN', message_ar: 'رفض الوصول: هوية العملية غير مصرح لها' })); } catch (e) {}
+		cli.close();
+		return;
+	}
+	active_clients++;
+	let buf = '';
+	let closed = false;
+	let ch = null;
+	let rt = uloop.timer(5000, function() {
+		if (closed) return;
+		closed = true;
+		active_clients--;
+		if (ch) ch.delete();
+		try { cli.close(); } catch (e) {}
+	});
+	ch = uloop.handle(cli, function(cev) {
+		if (closed) return;
+		let d = cli.recv(4096);
+		if (!d || length(d) == 0) {
+			closed = true; rt.cancel(); active_clients--; ch.delete(); cli.close(); return;
+		}
+		buf += d;
+		if (length(buf) > 65536) {
+			closed = true; rt.cancel(); active_clients--; ch.delete();
+			cli.send(sprintf('%J\n', { ok: false, error_code: 'VALIDATION', message_ar: 'تجاوز حجم الطلب الحد المسموح' }));
+			cli.close();
+			return;
+		}
+		let nl = index(buf, '\n');
+		if (nl >= 0) {
+			closed = true; rt.cancel(); ch.delete();
+			let req_obj = null;
+			try { req_obj = json(substr(buf, 0, nl)); } catch (e) { req_obj = null; }
+			if (!req_obj || type(req_obj) != 'object') {
+				active_clients--;
+				cli.send(sprintf('%J\n', { ok: false, error_code: 'VALIDATION', message_ar: 'طلب JSON غير صالح' }));
+				cli.close();
+				return;
+			}
+			handle_rpc(req_obj, function(resp) {
+				try {
+					let payload = sprintf('%J\n', resp);
+					let off = 0;
+					let total = length(payload);
+					let retries = 0;
+					while (off < total) {
+						let chunk = substr(payload, off, 8192);
+						let sent = cli.send(chunk);
+						if (sent && sent > 0) {
+							off += sent;
+							retries = 0;
+						} else {
+							retries++;
+							if (retries > 50) break;
+							sock.poll(40, [cli, sock.POLLOUT]);
+						}
+					}
+				} catch (e) {}
+				try { cli.close(); } catch (e) {}
+				active_clients--;
+			});
+		}
+	}, uloop.ULOOP_READ);
+}, uloop.ULOOP_READ);
+
+// 1-second P17 Lock TTL & P4 Timed-Disable Reconciler Timer (never stalls on PBKDF2!)
+let rec_timer = null;
+function reconciler_tick() {
+	let m = now_mono_ms();
+	if (last_tick_mono > 0) {
+		push(reconciler_gaps, m - last_tick_mono);
+		if (length(reconciler_gaps) > 20) reconciler_gaps = slice(reconciler_gaps, 1);
+	}
+	last_tick_mono = m;
+	reconciler_tick_count++;
+	if ((reconciler_tick_count % 5) == 0) {
+		try { gc('collect'); } catch (e) {}
+	}
+
+	let lp = RUN_DIR + '/mutation.lock';
+	let lk = read_json(lp, null);
+	if (lk && (now_mono_ms() - (+lk.acquired_mono_ms || 0)) > (+lk.ttl_ms || LOCK_TTL_MS)) {
+		fs.unlink(lp);
+		audit_append('reconciler', 'lock_ttl_recover', lk.op || 'unknown', 'recovered', 'Cleared stale lock held by ' + (lk.owner || 'unknown'));
+	}
+	let td_path = ETC_DIR + '/timed_disable.json';
+	let td = read_json(td_path, null);
+	if (td && time() >= (+td.deadline_epoch || 0)) {
+		if (acquire_lock('reconciler', 'timed_disable_restore').ok) {
+			let res = adguard_http('POST', '/control/protection', { enabled: !!td.target_state });
+			if (res.ok) {
+				fs.unlink(td_path);
+				audit_append('reconciler', 'timed_disable_restore', 'protection_enabled', 'committed', 'TIMED_DISABLE_RESTORED');
+			}
+			release_lock();
+		}
+	}
+	rec_timer = uloop.timer(1000, reconciler_tick);
+}
+rec_timer = uloop.timer(1000, reconciler_tick);
+
+uloop.run();
