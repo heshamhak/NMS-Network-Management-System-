@@ -83,8 +83,8 @@ function read_json(path, fallback) {
 	}
 }
 
-function atomic_write(path, content, mode, uid, gid) {
-	let r = nms_archive.atomic_write_checked(path, content, mode, uid, gid, {
+function atomic_write(path, content, mode, uid, gid, ops_override) {
+	let ops = ops_override || {
 		suffix: function() { return now_mono_ms() + '.' + urandom_hex(4); },
 		stat: fs.stat,
 		unlink: fs.unlink,
@@ -93,8 +93,40 @@ function atomic_write(path, content, mode, uid, gid) {
 		chown: fs.chown,
 		chmod: fs.chmod,
 		rename: fs.rename
-	});
-	return r.ok;
+	};
+	let r = nms_archive.atomic_write_checked(path, content, mode, uid, gid, ops);
+	if (!r.ok) {
+		if (r.cleanup_failed) {
+			warn(sprintf('CRITICAL: atomic_write cleanup_failed path=%s orig_error=%s tmp_path=%s\n', path, r.orig_error || '', r.tmp_path || ''));
+			try {
+				audit_append('system', 'atomic_write', path, 'cleanup_failed', sprintf('orig_error=%s tmp_path=%s', r.orig_error || '', r.tmp_path || ''));
+			} catch (e) {}
+		} else {
+			warn(sprintf('ERROR: atomic_write failed path=%s error=%s\n', path, r.error || ''));
+		}
+	}
+	return r;
+}
+
+function atomic_write_or_reply(path, content, mode, uid, gid, actor, verb, reply_cb, ops_override) {
+	let aw = atomic_write(path, content, mode, uid, gid, ops_override);
+	if (!aw.ok) {
+		release_lock();
+		audit_append(actor, verb, path, aw.cleanup_failed ? 'cleanup_failed' : 'failed', sprintf('error=%s orig=%s tmp=%s', aw.error || '', aw.orig_error || '', aw.tmp_path || ''));
+		reply_cb({
+			ok: false,
+			error_code: 'INTERNAL',
+			error: aw.error || 'write_failed',
+			orig_error: aw.orig_error || '',
+			cleanup_failed: !!aw.cleanup_failed,
+			tmp_path: aw.cleanup_failed ? (aw.tmp_path || '') : '',
+			message_ar: aw.cleanup_failed
+				? ('فشل الحفظ الذري وفشل تنظيف الملف المؤقت: ' + (aw.tmp_path || ''))
+				: 'فشل الحفظ الذري للملف (تم الإبقاء على الملف الأصلي)'
+		});
+		return false;
+	}
+	return true;
 }
 
 const SYSUPGRADE_CONF_PATH = '/etc/sysupgrade.conf';
@@ -3479,7 +3511,7 @@ function handle_rpc(req, reply_cb) {
 			if (idx < 0 || idx >= length(lines)) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معرف المهمة غير صالح' }); return; }
 			let next_l = [];
 			for (let i = 0; i < length(lines); i++) if (i != idx) push(next_l, lines[i]);
-			atomic_write(cpath, join('\n', next_l) + (length(next_l) > 0 ? '\n' : ''), 0o600);
+			if (!atomic_write_or_reply(cpath, join('\n', next_l) + (length(next_l) > 0 ? '\n' : ''), 0o600, null, null, actor, 'sys_cron_delete', reply_cb)) return;
 			exec_argv_async('/etc/init.d/cron', ['restart'], 6000, CAP_GENERAL, function() {
 				release_lock();
 				audit_append(actor, 'sys_cron_delete', '' + idx, 'committed', 'Removed scheduled job');
@@ -3504,7 +3536,7 @@ function handle_rpc(req, reply_cb) {
 			}
 		}
 		push(lines, sched + ' ' + tpl.exe + ' ' + tpl.arg);
-		atomic_write(cpath, join('\n', lines) + '\n', 0o600);
+		if (!atomic_write_or_reply(cpath, join('\n', lines) + '\n', 0o600, null, null, actor, 'sys_cron_add', reply_cb)) return;
 		exec_argv_async('/etc/init.d/cron', ['restart'], 6000, CAP_GENERAL, function() {
 			release_lock();
 			audit_append(actor, 'sys_cron_add', tid, 'committed', sched);
@@ -3563,7 +3595,7 @@ function handle_rpc(req, reply_cb) {
 			if (idx < 0 || idx >= length(lines)) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معرف المفتاح غير صالح' }); return; }
 			let next_l = [];
 			for (let i = 0; i < length(lines); i++) if (i != idx) push(next_l, lines[i]);
-			atomic_write(ak_path, join('\n', next_l) + (length(next_l) > 0 ? '\n' : ''), 0o600);
+			if (!atomic_write_or_reply(ak_path, join('\n', next_l) + (length(next_l) > 0 ? '\n' : ''), 0o600, null, null, actor, 'sys_ssh_key_delete', reply_cb)) return;
 			release_lock();
 			audit_append(actor, 'sys_ssh_key_delete', '' + idx, 'committed', 'Deleted authorized SSH key');
 			reply_cb({ ok: true, message_ar: 'تم حذف مفتاح SSH بنجاح' });
@@ -3582,7 +3614,7 @@ function handle_rpc(req, reply_cb) {
 			if (index(ex, kp[1]) >= 0) { release_lock(); reply_cb({ ok: true, message_ar: 'المفتاح مضاف مسبقاً' }); return; }
 		}
 		push(lines, norm_line);
-		atomic_write(ak_path, join('\n', lines) + '\n', 0o600);
+		if (!atomic_write_or_reply(ak_path, join('\n', lines) + '\n', 0o600, null, null, actor, 'sys_ssh_key_add', reply_cb)) return;
 		release_lock();
 		audit_append(actor, 'sys_ssh_key_add', cmt, 'committed', kp[0]);
 		reply_cb({ ok: true, message_ar: 'تمت إضافة المفتاح العام إلى authorized_keys بنجاح' });
@@ -3686,9 +3718,7 @@ function handle_rpc(req, reply_cb) {
 		let orig_uid = st_orig ? st_orig.uid : null;
 		let orig_gid = st_orig ? st_orig.gid : null;
 		let body_txt = nms_archive.merge_sysupgrade_conf(existing_raw, clean_paths);
-		if (!atomic_write(SYSUPGRADE_CONF_PATH, body_txt, orig_mode, orig_uid, orig_gid)) {
-			release_lock();
-			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل الحفظ الذري لملف sysupgrade.conf (تم الإبقاء على الملف الأصلي)' });
+		if (!atomic_write_or_reply(SYSUPGRADE_CONF_PATH, body_txt, orig_mode, orig_uid, orig_gid, actor, 'sys_sysupgrade_conf_save', reply_cb)) {
 			return;
 		}
 		let st_new = fs.lstat(SYSUPGRADE_CONF_PATH);

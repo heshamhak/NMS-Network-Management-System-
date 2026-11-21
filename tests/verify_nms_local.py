@@ -771,7 +771,10 @@ req_helper_syms = [
     "fs.lstat(SYSUPGRADE_CONF_PATH)",
     "nms_archive.merge_sysupgrade_conf(",
     "nms_archive.atomic_write_checked(",
-    "if (!atomic_write(",
+    "function atomic_write_or_reply(",
+    "if (!atomic_write_or_reply(",
+    "r.cleanup_failed",
+    "r.tmp_path",
 ]
 req_uc_syms = [
     "export function validate_tar_stream(",
@@ -791,7 +794,7 @@ else:
     fail(f"P3A-STRUCT: missing symbols helper={missing_syms}, uc={missing_uc}, apid={missing_apid}")
 
 # 6b. Production ucode archive validator & atomic_write_checked execution inside isolated OpenWrt x86_64 rootfs
-import tarfile, io, struct
+import tarfile, io, struct, re
 
 openwrt_rootfs = "/tmp/openwrt-x86-64-rootfs"
 has_openwrt_chroot = os.path.isfile(os.path.join(openwrt_rootfs, "usr/bin/ucode"))
@@ -956,6 +959,25 @@ if has_openwrt_chroot or ucode_bin:
             shutil.rmtree(chroot_stage, ignore_errors=True)
             shutil.copytree(td_arc, chroot_stage)
             shutil.copy2(archive_uc_path, os.path.join(chroot_stage, "nms_archive.uc"))
+            # Extract exact production atomic_write & atomic_write_or_reply from backend/noc-helperd
+            m_aw = re.search(r"(function atomic_write\(.*?\n\}\n\nfunction atomic_write_or_reply\(.*?\n\})", helperd_src, re.DOTALL)
+            if not m_aw:
+                fail("P3A-HELPERD-EXTRACT: could not extract atomic_write/atomic_write_or_reply from noc-helperd")
+            else:
+                open(os.path.join(chroot_stage, "helperd_aw_prod.uc"), "w").write(
+                    "import * as fs from 'fs';\n"
+                    "import * as nms_archive from '/tmp/p3a_test/nms_archive.uc';\n"
+                    "export let test_audits = [];\n"
+                    "export let test_locks_released = 0;\n"
+                    "export let test_warns = [];\n"
+                    "function now_mono_ms() { return 12345; }\n"
+                    "function urandom_hex(n) { return 'abcd'; }\n"
+                    "function warn(msg) { push(test_warns, msg); }\n"
+                    "function audit_append(actor, act, tgt, res, det) { push(test_audits, { actor: actor, action: act, target: tgt, result: res, details: det }); }\n"
+                    "function release_lock() { test_locks_released++; }\n"
+                    + m_aw.group(1)
+                    + "\nexport { atomic_write, atomic_write_or_reply };\n"
+                )
             shutil.copy2(os.path.join(ROOT, "tests/verify_phase3a_ucode.uc"), os.path.join(chroot_stage, "verify_phase3a_ucode.uc"))
             try:
                 ru = subprocess.run(

@@ -1,6 +1,7 @@
 // Executed directly by OpenWrt ucode runtime against production backend/nms_archive.uc
 import * as fs from 'fs';
 import * as nms_archive from '/tmp/p3a_test/nms_archive.uc';
+import * as helperd_aw from '/tmp/p3a_test/helperd_aw_prod.uc';
 
 let mod_path = ARGV[0];
 let vec_dir = ARGV[1];
@@ -65,7 +66,11 @@ function make_ops(fail_mode, fail_unlink) {
 					}
 					return real_fh.write(c);
 				},
-				close: function() { return real_fh.close(); }
+				close: function() {
+					let cr = real_fh.close();
+					if (fail_mode == 'close') return false;
+					return cr;
+				}
 			};
 		},
 		chown: function(p, u, g) {
@@ -86,12 +91,13 @@ function make_ops(fail_mode, fail_unlink) {
 let expected_err = {
 	write: 'write_failed',
 	partial: 'write_failed',
+	close: 'write_failed',
 	chown: 'chown_failed',
 	chmod: 'chmod_failed',
 	rename: 'rename_failed'
 };
 
-for (let fm in ['write', 'partial', 'chown', 'chmod', 'rename']) {
+for (let fm in ['write', 'partial', 'close', 'chown', 'chmod', 'rename']) {
 	// Case A: failure with successful cleanup
 	let r_fail = nms_archive.atomic_write_checked(target, merged, 0o640, 0, 0, make_ops(fm, false));
 	let tmp_gone = !fs.stat(r_fail.tmp_path);
@@ -122,6 +128,27 @@ check(
 	'P3A-AW[success_preserve_comments_mode_owner]',
 	sprintf('r=%J tmp_mode=%o mode=%o uid=%J gid=%J', r_ok, seen_restricted_mode || 0, st_ok ? (st_ok.mode & 0o7777) : 0, st_ok ? st_ok.uid : -1, st_ok ? st_ok.gid : -1)
 );
+
+// 3. Production noc-helperd atomic_write & atomic_write_or_reply error-propagation tests
+let prod_res = helperd_aw.atomic_write(target, merged, 0o640, 0, 0, make_ops('rename', true));
+let prod_audit_ok = length(helperd_aw.test_audits) > 0 && helperd_aw.test_audits[length(helperd_aw.test_audits) - 1].result == 'cleanup_failed' && index(helperd_aw.test_audits[length(helperd_aw.test_audits) - 1].details, 'tmp_path=' + target + '.tmp.test1234') >= 0;
+let prod_tmp_exists = !!fs.stat(prod_res.tmp_path);
+check(
+	type(prod_res) == 'object' && !prod_res.ok && prod_res.error == 'cleanup_failed' && prod_res.orig_error == 'rename_failed' && prod_res.cleanup_failed && prod_res.tmp_path == target + '.tmp.test1234' && prod_tmp_exists && prod_audit_ok,
+	'P3A-HELPERD[atomic_write_preserves_cleanup_failed_and_audits]',
+	sprintf('res=%J audits=%J', prod_res, helperd_aw.test_audits)
+);
+if (prod_tmp_exists) fs.unlink(prod_res.tmp_path);
+
+let reply_payload = null;
+let aw_ret = helperd_aw.atomic_write_or_reply(target, merged, 0o644, null, null, 'admin', 'sys_sysupgrade_conf_save', function(p) { reply_payload = p; }, make_ops('rename', true));
+let reply_tmp_exists = !!fs.stat(target + '.tmp.test1234');
+check(
+	!aw_ret && reply_payload != null && !reply_payload.ok && reply_payload.error_code == 'INTERNAL' && reply_payload.error == 'cleanup_failed' && reply_payload.orig_error == 'rename_failed' && reply_payload.cleanup_failed && reply_payload.tmp_path == target + '.tmp.test1234' && reply_tmp_exists && fs.readfile(target) == merged,
+	'P3A-HELPERD[atomic_write_or_reply_explicit_failure]',
+	sprintf('aw_ret=%J reply=%J', aw_ret, reply_payload)
+);
+if (reply_tmp_exists) fs.unlink(target + '.tmp.test1234');
 
 printf('UCODE_SUMMARY: %d passed, %d failed\n', passed, failed);
 exit(failed == 0 ? 0 : 1);
