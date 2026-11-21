@@ -462,9 +462,12 @@ echo "[5/6] Enabling and starting NMS services..."
 if [ "$SKIP_SERVICE_START" -eq 0 ] || [ -n "$SERVICE_RUNNER" ]; then
   SVC_TOUCHED=1
   run_svc "${INIT_DIR}/noc-helperd" enable
+  [ "$FAIL_POINT" = "during_service_after_helperd_enable" ] && { echo "ERROR: Injected failure during_service_after_helperd_enable" >&2; exit 1; }
   run_svc "${INIT_DIR}/noc-apid" enable
+  [ "$FAIL_POINT" = "during_service_after_apid_enable" ] && { echo "ERROR: Injected failure during_service_after_apid_enable" >&2; exit 1; }
   run_svc "${INIT_DIR}/noc-helperd" restart
   [ -z "$SERVICE_RUNNER" ] && sleep 1 || true
+  [ "$FAIL_POINT" = "during_service_after_helperd_restart" ] && { echo "ERROR: Injected failure during_service_after_helperd_restart" >&2; exit 1; }
   run_svc "${INIT_DIR}/noc-apid" restart
   [ -z "$SERVICE_RUNNER" ] && sleep 1 || true
 fi
