@@ -1219,7 +1219,6 @@ function handle_network_phase3b_verb(verb, params, actor, reply_cb, net_env) {
 			return { ok: true };
 		},
 		verify_applied: function() {
-			if (env.inject_verify_mismatch) return { ok: false, error: 'Injected post-apply UCI mismatch' };
 			let cv = uci_dir ? uci.cursor(uci_dir) : uci.cursor();
 			if (verb == 'network_interface_save') {
 				if (cv.get('network', expected_sid) != 'interface') return { ok: false, error: 'الواجهة غير موجودة بعد التطبيق' };
@@ -1228,8 +1227,11 @@ function handle_network_phase3b_verb(verb, params, actor, reply_cb, net_env) {
 				if (params.ipaddr && cv.get('network', expected_sid, 'ipaddr') != trim('' + params.ipaddr)) return { ok: false, error: 'عدم تطابق ipaddr بعد التطبيق' };
 				if (params.netmask && cv.get('network', expected_sid, 'netmask') != trim('' + params.netmask)) return { ok: false, error: 'عدم تطابق netmask بعد التطبيق' };
 				if (params.gateway && cv.get('network', expected_sid, 'gateway') != trim('' + params.gateway)) return { ok: false, error: 'عدم تطابق gateway بعد التطبيق' };
+				if (params.ip6assign != null && params.ip6assign != '' && cv.get('network', expected_sid, 'ip6assign') != ('' + int(+params.ip6assign))) return { ok: false, error: 'عدم تطابق ip6assign بعد التطبيق' };
 				if (params.ip6addr && cv.get('network', expected_sid, 'ip6addr') != trim('' + params.ip6addr)) return { ok: false, error: 'عدم تطابق ip6addr بعد التطبيق' };
+				if (params.ip6gw && cv.get('network', expected_sid, 'ip6gw') != trim('' + params.ip6gw)) return { ok: false, error: 'عدم تطابق ip6gw بعد التطبيق' };
 				if (params.mtu != null && params.mtu != '' && cv.get('network', expected_sid, 'mtu') != ('' + int(+params.mtu))) return { ok: false, error: 'عدم تطابق mtu بعد التطبيق' };
+				if (params.metric != null && params.metric != '' && cv.get('network', expected_sid, 'metric') != ('' + int(+params.metric))) return { ok: false, error: 'عدم تطابق metric بعد التطبيق' };
 				if (params.dns != null && !array_eq(cv.get('network', expected_sid, 'dns'), params.dns)) return { ok: false, error: 'عدم تطابق dns بعد التطبيق' };
 			} else if (verb == 'network_interface_delete') {
 				if (cv.get('network', expected_sid) != null) return { ok: false, error: 'الواجهة ما زالت موجودة بعد الحذف' };
@@ -1237,8 +1239,14 @@ function handle_network_phase3b_verb(verb, params, actor, reply_cb, net_env) {
 				if (cv.get('network', expected_sid) != 'device') return { ok: false, error: 'الجهاز غير موجود بعد التطبيق' };
 				if (cv.get('network', expected_sid, 'name') != trim('' + params.name)) return { ok: false, error: 'عدم تطابق اسم الجهاز بعد التطبيق' };
 				if (cv.get('network', expected_sid, 'type') != trim('' + (params.type || 'bridge'))) return { ok: false, error: 'عدم تطابق نوع الجهاز بعد التطبيق' };
-				if ((params.type == 'bridge' || !params.type) && !array_eq(cv.get('network', expected_sid, 'ports'), params.ports)) return { ok: false, error: 'عدم تطابق منافذ الجسر بعد التطبيق' };
-				if (params.type && params.type != 'bridge' && cv.get('network', expected_sid, 'vid') != ('' + int(+params.vid))) return { ok: false, error: 'عدم تطابق VLAN ID للجهاز بعد التطبيق' };
+				if (params.type == 'bridge' || !params.type) {
+					if (!array_eq(cv.get('network', expected_sid, 'ports'), params.ports)) return { ok: false, error: 'عدم تطابق منافذ الجسر بعد التطبيق' };
+				} else {
+					if (cv.get('network', expected_sid, 'ifname') != trim('' + params.ifname)) return { ok: false, error: 'عدم تطابق ifname للجهاز بعد التطبيق' };
+					if (cv.get('network', expected_sid, 'vid') != ('' + int(+params.vid))) return { ok: false, error: 'عدم تطابق VLAN ID للجهاز بعد التطبيق' };
+				}
+				if (params.mtu != null && params.mtu != '' && cv.get('network', expected_sid, 'mtu') != ('' + int(+params.mtu))) return { ok: false, error: 'عدم تطابق mtu للجهاز بعد التطبيق' };
+				if (cv.get('network', expected_sid, 'igmp_snooping') != (params.igmp_snooping ? '1' : '0')) return { ok: false, error: 'عدم تطابق igmp_snooping للجهاز بعد التطبيق' };
 			} else if (verb == 'network_bridge_vlan_save') {
 				if (cv.get('network', expected_sid) != 'bridge-vlan') return { ok: false, error: 'قسم bridge-vlan غير موجود بعد التطبيق' };
 				if (cv.get('network', expected_sid, 'device') != trim('' + (params.device || 'br-lan'))) return { ok: false, error: 'عدم تطابق جسر bridge-vlan' };

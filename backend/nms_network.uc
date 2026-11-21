@@ -217,8 +217,15 @@ function rollback_snaps(snaps, ops, do_reload) {
 			    (s.uid != null && (st_rb.uid != s.uid || st_rb.gid != s.gid)) || cur_rb != s.raw) {
 				rb_all_ok = false;
 			}
-		} else if (ops.stat(s.path)) {
-			if (!ops.unlink(s.path) || ops.stat(s.path)) rb_all_ok = false;
+		} else {
+			let st_new = ops.lstat(s.path);
+			if (st_new) {
+				if (st_new.type == 'directory') {
+					rb_all_ok = false;
+				} else if (!ops.unlink(s.path) || ops.lstat(s.path)) {
+					rb_all_ok = false;
+				}
+			}
 		}
 	}
 	if (rb_all_ok && do_reload) {

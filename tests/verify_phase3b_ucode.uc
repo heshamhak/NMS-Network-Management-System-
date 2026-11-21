@@ -125,18 +125,72 @@ fs.chmod(net_cfg, 0o640);
 let r_ok = nms_network.apply_network_tx([net_cfg, dhcp_cfg], make_tx_ops({ mutate_disk: true }));
 check(r_ok.ok === true && !r_ok.rolled_back && !r_ok.rollback_failed, 'P3B-TX[success]', sprintf('%J', r_ok));
 
-// 4f. Partial file creation (non-existent file created during apply_uci failure -> must be removed on rollback)
-let extra_cfg = tx_dir + '/extra_nonexistent';
-let r_extra = nms_network.apply_network_tx([net_cfg, extra_cfg], {
+// 4f. Symlink-safe newly-created-file cleanup tests (regular file, symlink to existing target, broken symlink, unlink fail, verify-after-unlink fail)
+let existing_target = tx_dir + '/existing_precious_target';
+fs.writefile(existing_target, 'PRECIOUS_TARGET\n');
+
+// Regular file
+let extra_reg = tx_dir + '/extra_reg';
+let r_ex1 = nms_network.apply_network_tx([net_cfg, extra_reg], {
 	stat: fs.stat, lstat: fs.lstat, readfile: fs.readfile, unlink: fs.unlink,
-	aw_ops: { suffix: function() { return 'ex'; }, stat: fs.stat, unlink: fs.unlink, open: fs.open, writefile: fs.writefile, chown: fs.chown, chmod: fs.chmod, rename: fs.rename },
-	apply_uci: function() { fs.writefile(extra_cfg, 'PARTIAL\n'); return { ok: false, error: 'partial fail' }; },
-	validate_config: function() { return { ok: true }; },
-	reload_service: function() { return { ok: true }; },
-	verify_applied: function() { return { ok: true }; },
+	aw_ops: { suffix: function() { return 'ex1'; }, stat: fs.stat, unlink: fs.unlink, open: fs.open, writefile: fs.writefile, chown: fs.chown, chmod: fs.chmod, rename: fs.rename },
+	apply_uci: function() { fs.writefile(extra_reg, 'PARTIAL\n'); return { ok: false, error: 'partial fail' }; },
+	validate_config: function() { return { ok: true }; }, reload_service: function() { return { ok: true }; }, verify_applied: function() { return { ok: true }; },
 	on_rollback_failed: function() { return { freeze_persisted: true }; }
 });
-check(!r_extra.ok && r_extra.rolled_back === true && !fs.stat(extra_cfg), 'P3B-TX[apply_fail_removes_newly_created_file]', sprintf('%J', r_extra));
+check(!r_ex1.ok && r_ex1.rolled_back === true && !fs.lstat(extra_reg), 'P3B-TX[cleanup_new_regular_file]', sprintf('%J', r_ex1));
+
+// Symlink to existing target -> removes symlink ONLY, preserves existing_target!
+let extra_sym = tx_dir + '/extra_sym';
+let r_ex2 = nms_network.apply_network_tx([net_cfg, extra_sym], {
+	stat: fs.stat, lstat: fs.lstat, readfile: fs.readfile, unlink: fs.unlink,
+	aw_ops: { suffix: function() { return 'ex2'; }, stat: fs.stat, unlink: fs.unlink, open: fs.open, writefile: fs.writefile, chown: fs.chown, chmod: fs.chmod, rename: fs.rename },
+	apply_uci: function() { fs.symlink(existing_target, extra_sym); return { ok: false, error: 'sym fail' }; },
+	validate_config: function() { return { ok: true }; }, reload_service: function() { return { ok: true }; }, verify_applied: function() { return { ok: true }; },
+	on_rollback_failed: function() { return { freeze_persisted: true }; }
+});
+check(!r_ex2.ok && r_ex2.rolled_back === true && !fs.lstat(extra_sym) && fs.readfile(existing_target) == 'PRECIOUS_TARGET\n', 'P3B-TX[cleanup_new_symlink_preserves_target]', sprintf('%J', r_ex2));
+
+// Broken symlink -> lstat detects and removes it!
+let extra_broken = tx_dir + '/extra_broken';
+let r_ex3 = nms_network.apply_network_tx([net_cfg, extra_broken], {
+	stat: fs.stat, lstat: fs.lstat, readfile: fs.readfile, unlink: fs.unlink,
+	aw_ops: { suffix: function() { return 'ex3'; }, stat: fs.stat, unlink: fs.unlink, open: fs.open, writefile: fs.writefile, chown: fs.chown, chmod: fs.chmod, rename: fs.rename },
+	apply_uci: function() { fs.symlink('/nonexistent/dangling/target', extra_broken); return { ok: false, error: 'broken sym fail' }; },
+	validate_config: function() { return { ok: true }; }, reload_service: function() { return { ok: true }; }, verify_applied: function() { return { ok: true }; },
+	on_rollback_failed: function() { return { freeze_persisted: true }; }
+});
+check(!r_ex3.ok && r_ex3.rolled_back === true && !fs.lstat(extra_broken), 'P3B-TX[cleanup_broken_symlink]', sprintf('%J', r_ex3));
+
+// Unlink failure -> triggers on_rollback_failed & rollback_failed=true
+let extra_uf = tx_dir + '/extra_uf';
+let uf_freeze = 0;
+let r_ex4 = nms_network.apply_network_tx([net_cfg, extra_uf], {
+	stat: fs.stat, lstat: fs.lstat, readfile: fs.readfile,
+	unlink: function(p) { if (p == extra_uf) return false; return fs.unlink(p); },
+	aw_ops: { suffix: function() { return 'ex4'; }, stat: fs.stat, unlink: fs.unlink, open: fs.open, writefile: fs.writefile, chown: fs.chown, chmod: fs.chmod, rename: fs.rename },
+	apply_uci: function() { fs.writefile(extra_uf, 'STUCK\n'); return { ok: false, error: 'uf fail' }; },
+	validate_config: function() { return { ok: true }; }, reload_service: function() { return { ok: true }; }, verify_applied: function() { return { ok: true }; },
+	on_rollback_failed: function() { uf_freeze++; return { freeze_persisted: true }; }
+});
+if (fs.lstat(extra_uf)) fs.unlink(extra_uf);
+check(!r_ex4.ok && r_ex4.rollback_failed === true && uf_freeze == 1, 'P3B-TX[cleanup_unlink_fail_triggers_freeze]', sprintf('%J', r_ex4));
+
+// Verification failure after unlink (lstat still reports present AFTER unlink was called) -> triggers on_rollback_failed
+let extra_vf = tx_dir + '/extra_vf';
+let vf_freeze = 0;
+let vf_unlinked = false;
+let r_ex5 = nms_network.apply_network_tx([net_cfg, extra_vf], {
+	stat: fs.stat,
+	lstat: function(p) { if (p == extra_vf && vf_unlinked) return { type: 'file' }; return fs.lstat(p); },
+	readfile: fs.readfile,
+	unlink: function(p) { if (p == extra_vf) vf_unlinked = true; return fs.unlink(p); },
+	aw_ops: { suffix: function() { return 'ex5'; }, stat: fs.stat, unlink: fs.unlink, open: fs.open, writefile: fs.writefile, chown: fs.chown, chmod: fs.chmod, rename: fs.rename },
+	apply_uci: function() { fs.writefile(extra_vf, 'GHOST\n'); return { ok: false, error: 'vf fail' }; },
+	validate_config: function() { return { ok: true }; }, reload_service: function() { return { ok: true }; }, verify_applied: function() { return { ok: true }; },
+	on_rollback_failed: function() { vf_freeze++; return { freeze_persisted: true }; }
+});
+check(!r_ex5.ok && r_ex5.rollback_failed === true && vf_freeze == 1, 'P3B-TX[cleanup_verify_after_unlink_fail_triggers_freeze]', sprintf('%J', r_ex5));
 
 // 5. Production noc-helperd handle_network_phase3b_verb integration tests with real OpenWrt uci.cursor(uci_dir)!
 let uci_dir = vec_dir + '/uci_cfg';
@@ -161,10 +215,10 @@ function run_prod_net(verb, params, extra_env) {
 	return rep;
 }
 
-// 5a. Interface save & delete + protected interface delete refusal
-let r_ifs = run_prod_net('network_interface_save', { name: 'guest', proto: 'static', device: 'br-lan.10', ipaddr: '10.10.10.1', netmask: '255.255.255.0', ip6addr: 'fd00:10::1/64', mtu: 1500, dns: ['1.1.1.1'] });
+// 5a. Interface save (including ip6assign, ip6gw, metric) & delete + protected interface delete refusal
+let r_ifs = run_prod_net('network_interface_save', { name: 'guest', proto: 'static', device: 'br-lan.10', ipaddr: '10.10.10.1', netmask: '255.255.255.0', ip6assign: 64, ip6addr: 'fd00:10::1/64', ip6gw: 'fd00:10::ffff', mtu: 1500, metric: 20, dns: ['1.1.1.1'] });
 let cv1 = uci.cursor(uci_dir);
-check(r_ifs.ok === true && cv1.get('network', 'guest', 'ipaddr') == '10.10.10.1' && cv1.get('network', 'guest', 'ip6addr') == 'fd00:10::1/64', 'P3B-PROD[interface_save_uci_verified]', sprintf('%J', r_ifs));
+check(r_ifs.ok === true && cv1.get('network', 'guest', 'ipaddr') == '10.10.10.1' && cv1.get('network', 'guest', 'ip6gw') == 'fd00:10::ffff' && cv1.get('network', 'guest', 'ip6assign') == '64' && cv1.get('network', 'guest', 'metric') == '20', 'P3B-PROD[interface_save_uci_verified]', sprintf('%J', r_ifs));
 
 let r_ifd_prot = run_prod_net('network_interface_delete', { name: 'lan' });
 check(!r_ifd_prot.ok && r_ifd_prot.error_code == 'FORBIDDEN', 'P3B-PROD[protected_interface_delete_refused]', sprintf('%J', r_ifd_prot));
@@ -173,11 +227,18 @@ let r_ifd = run_prod_net('network_interface_delete', { name: 'guest' });
 let cv2 = uci.cursor(uci_dir);
 check(r_ifd.ok === true && cv2.get('network', 'guest') == null, 'P3B-PROD[interface_delete_uci_verified]', sprintf('%J', r_ifd));
 
-// 5b. Bridge & 802.1q device save
+// 5b. Bridge, 802.1q, AND 802.1ad device save (verifying ifname, vid, mtu, igmp_snooping)
 let r_dev_br = run_prod_net('network_device_save', { name: 'br-lan', type: 'bridge', ports: ['lan1', 'lan2'], mtu: 1500, igmp_snooping: true });
-let r_dev_q = run_prod_net('network_device_save', { name: 'br-lan.10', type: '8021q', ifname: 'br-lan', vid: 10 });
+let r_dev_q = run_prod_net('network_device_save', { name: 'br-lan.10', type: '8021q', ifname: 'br-lan', vid: 10, mtu: 1500, igmp_snooping: false });
+let r_dev_ad = run_prod_net('network_device_save', { name: 'eth0.200', type: '8021ad', ifname: 'eth0', vid: 200, mtu: 1496, igmp_snooping: true });
 let cv3 = uci.cursor(uci_dir);
-check(r_dev_br.ok === true && r_dev_q.ok === true && cv3.get('network', 'dev_br_lan_10', 'vid') == '10', 'P3B-PROD[device_bridge_and_8021q_uci_verified]', sprintf('br=%J q=%J', r_dev_br, r_dev_q));
+check(
+	r_dev_br.ok === true && r_dev_q.ok === true && r_dev_ad.ok === true
+	&& cv3.get('network', 'dev_br_lan_10', 'type') == '8021q' && cv3.get('network', 'dev_br_lan_10', 'ifname') == 'br-lan' && cv3.get('network', 'dev_br_lan_10', 'vid') == '10'
+	&& cv3.get('network', 'dev_eth0_200', 'type') == '8021ad' && cv3.get('network', 'dev_eth0_200', 'ifname') == 'eth0' && cv3.get('network', 'dev_eth0_200', 'vid') == '200' && cv3.get('network', 'dev_eth0_200', 'mtu') == '1496' && cv3.get('network', 'dev_eth0_200', 'igmp_snooping') == '1',
+	'P3B-PROD[device_bridge_8021q_and_8021ad_uci_verified]',
+	sprintf('br=%J q=%J ad=%J', r_dev_br, r_dev_q, r_dev_ad)
+);
 
 // 5c. DSA bridge-vlan save & delete
 let r_bvs = run_prod_net('network_bridge_vlan_save', { device: 'br-lan', vlan: 10, ports: ['lan1:u', 'lan2:t'] });
@@ -229,20 +290,62 @@ check(
 	sprintf('%J', r_v6_mid)
 );
 
-// 5f. Post-apply verify_applied mismatch -> MUST detect mismatch and roll back both network & dhcp!
-let r_v6_mis = run_prod_net('network_ipv6_save', {
-	interface: 'lan',
-	ula_prefix: 'fd88:8888::/48',
-	ra: 'disabled',
-	dhcpv6: 'disabled',
-	ndp: 'disabled'
-}, { inject_verify_mismatch: true });
+// 5f. REAL post-apply verify_applied() mismatch detection (UCI succeeds, then persisted UCI values differ -> real verify_applied detects & rolls back!)
+let r_mis_iface = run_prod_net('network_interface_save', {
+	name: 'guest2', proto: 'static', device: 'br-lan.20', ipaddr: '10.20.20.1', netmask: '255.255.255.0', ip6gw: 'fd00:20::ffff', metric: 30
+}, {
+	reload_fn: function() {
+		// Real UCI succeeded; tamper ip6gw on disk so actual verify_applied() catches the mismatch!
+		let c_t = uci.cursor(uci_dir);
+		c_t.set('network', 'guest2', 'ip6gw', 'fd00:20::dead');
+		c_t.commit('network');
+		return { ok: true };
+	}
+});
 check(
-	!r_v6_mis.ok && r_v6_mis.rolled_back === true && r_v6_mis.error == 'verify_failed'
+	!r_mis_iface.ok && r_mis_iface.rolled_back === true && r_mis_iface.error == 'verify_failed'
+	&& fs.readfile(uci_dir + '/network') == snap_net_before_mid,
+	'P3B-PROD[real_verify_mismatch_interface_ip6gw_triggers_rollback]',
+	sprintf('%J', r_mis_iface)
+);
+
+let r_mis_dev = run_prod_net('network_device_save', {
+	name: 'eth0.300', type: '8021ad', ifname: 'eth0', vid: 300, mtu: 1492, igmp_snooping: true
+}, {
+	reload_fn: function() {
+		let c_t = uci.cursor(uci_dir);
+		c_t.set('network', 'dev_eth0_300', 'ifname', 'eth1'); // mismatch ifname!
+		c_t.commit('network');
+		return { ok: true };
+	}
+});
+check(
+	!r_mis_dev.ok && r_mis_dev.rolled_back === true && r_mis_dev.error == 'verify_failed'
+	&& fs.readfile(uci_dir + '/network') == snap_net_before_mid,
+	'P3B-PROD[real_verify_mismatch_device_ifname_triggers_rollback]',
+	sprintf('%J', r_mis_dev)
+);
+
+let rc_v6 = 0;
+let r_mis_v6 = run_prod_net('network_ipv6_save', {
+	interface: 'lan', ula_prefix: 'fd88:8888::/48', ra: 'server', dhcpv6: 'server', ndp: 'disabled'
+}, {
+	reload_fn: function() {
+		rc_v6++;
+		if (rc_v6 == 1) {
+			let c_t = uci.cursor(uci_dir);
+			c_t.set('dhcp', 'lan', 'ra', 'disabled'); // mismatch ra in dhcp!
+			c_t.commit('dhcp');
+		}
+		return { ok: true };
+	}
+});
+check(
+	!r_mis_v6.ok && r_mis_v6.rolled_back === true && r_mis_v6.error == 'verify_failed'
 	&& fs.readfile(uci_dir + '/network') == snap_net_before_mid
 	&& fs.readfile(uci_dir + '/dhcp') == snap_dhcp_before_mid,
-	'P3B-PROD[verify_mismatch_triggers_full_rollback]',
-	sprintf('%J', r_v6_mis)
+	'P3B-PROD[real_verify_mismatch_ipv6_dhcp_triggers_rollback]',
+	sprintf('net_eq=%J dhcp_eq=%J res=%J', fs.readfile(uci_dir + '/network') == snap_net_before_mid, fs.readfile(uci_dir + '/dhcp') == snap_dhcp_before_mid, r_mis_v6)
 );
 
 printf('UCODE3B_SUMMARY: %d passed, %d failed\n', passed, failed);
