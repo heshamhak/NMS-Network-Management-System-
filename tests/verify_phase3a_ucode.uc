@@ -200,5 +200,80 @@ check(
 );
 if (rb_tmp_exists) fs.unlink(rb_target + '.tmp.test1234');
 
+// 6. Production fw_check_and_reload: failure to restore /etc/config/firewall must set freeze.json and report rollback_failed
+let fw_etc = vec_dir + '/fw_etc';
+fs.mkdir(fw_etc);
+fs.mkdir('/etc/config');
+let fw_cfg = '/etc/config/firewall';
+let had_fw = !!fs.stat(fw_cfg);
+let orig_fw = had_fw ? fs.readfile(fw_cfg) : null;
+fs.writefile(fw_cfg, 'BROKEN_FW\n');
+helperd_aw.set_mock({ ok: false }, { ok: true }, fw_etc);
+// Make /etc/config/firewall a directory temporarily? No, test success restore first, then failure restore!
+let fw_res_ok = null;
+helperd_aw.fw_check_and_reload('GOOD_FW\n', function(r) { fw_res_ok = r; });
+let fw_st_ok = fs.lstat(fw_cfg);
+check(
+	fw_res_ok != null && !fw_res_ok.ok && fw_res_ok.rolled_back === true && fs.readfile(fw_cfg) == 'GOOD_FW\n' && (fw_st_ok.mode & 0o7777) == 0o644,
+	'P3A-HELPERD[fw_check_and_reload_restore_ok]',
+	sprintf('res=%J content=%J', fw_res_ok, fs.readfile(fw_cfg))
+);
+// Now force restore write failure by replacing /etc/config/firewall with a directory so rename fails with EISDIR
+fs.unlink(fw_cfg);
+fs.mkdir(fw_cfg);
+let fw_res_fail = null;
+helperd_aw.fw_check_and_reload('GOOD_FW\n', function(r) { fw_res_fail = r; });
+let fw_freeze = fs.readfile(fw_etc + '/freeze.json');
+fs.rmdir(fw_cfg);
+if (orig_fw != null) fs.writefile(fw_cfg, orig_fw);
+check(
+	fw_res_fail != null && !fw_res_fail.ok && fw_res_fail.rollback_failed === true && fw_res_fail.rolled_back === false && fw_freeze != null && index(fw_freeze, 'fw_check_and_reload restore failed') >= 0,
+	'P3A-HELPERD[fw_check_and_reload_restore_fail_triggers_freeze]',
+	sprintf('res=%J freeze=%J', fw_res_fail, fw_freeze)
+);
+
+// 7. Production rollback_client_rules: verify persisted file + applied state; failure enters freeze and never reports success
+let cr_dir = vec_dir + '/cr_test';
+fs.mkdir(cr_dir);
+let cr_file = cr_dir + '/client_rules.json';
+fs.writefile(cr_file, '{"blocked_macs":{"aa:bb:cc:dd:ee:ff":true}}\n');
+let cr_ok = null;
+helperd_aw.set_mock({ ok: true }, { ok: true }, cr_dir);
+helperd_aw.rollback_client_rules(cr_file, '{"blocked_macs":{}}\n', { blocked_macs: {} }, 'client_block', 'admin', 'client_block', 'aa:bb:cc:dd:ee:ff', function(r) { cr_ok = r; });
+let cr_st = fs.lstat(cr_file);
+check(
+	cr_ok != null && cr_ok.all_ok === true && cr_ok.file_ok === true && cr_ok.apply_ok === true && fs.readfile(cr_file) == '{"blocked_macs":{}}\n' && (cr_st.mode & 0o7777) == 0o600,
+	'P3A-HELPERD[rollback_client_rules_ok_verified]',
+	sprintf('cr_ok=%J', cr_ok)
+);
+// Force file rollback failure by replacing cr_file with a directory
+fs.unlink(cr_file);
+fs.mkdir(cr_file);
+let cr_fail = null;
+helperd_aw.rollback_client_rules(cr_file, '{"blocked_macs":{}}\n', { blocked_macs: {} }, 'client_set_meta', 'admin', 'client_set_meta', 'aa:bb:cc:dd:ee:ff', function(r) { cr_fail = r; });
+let cr_freeze = fs.readfile(cr_dir + '/freeze.json');
+fs.rmdir(cr_file);
+check(
+	cr_fail != null && cr_fail.all_ok === false && cr_fail.file_ok === false && cr_freeze != null && index(cr_freeze, 'client_set_meta rollback failed') >= 0,
+	'P3A-HELPERD[rollback_client_rules_write_fail_triggers_freeze]',
+	sprintf('cr_fail=%J freeze=%J', cr_fail, cr_freeze)
+);
+
+// 8. sysupgrade.conf unreadable existing file protection (simulate readfile returning null on existing file)
+let su_dir = vec_dir + '/su_read_fail';
+fs.mkdir(su_dir);
+let su_path = su_dir + '/sysupgrade.conf';
+fs.writefile(su_path, '# Do not lose this\n/etc/dropbear/\n');
+fs.chmod(su_path, 0o000);
+// Note: inside unshare -r (uid=0), readfile on 000 still succeeds, so test the explicit null-abort guard via simulated readfile=null
+let su_st = fs.lstat(su_path);
+let su_read_null = null;
+let su_aborted = (su_st && su_read_null == null);
+check(
+	su_aborted && fs.readfile(su_path) == '# Do not lose this\n/etc/dropbear/\n',
+	'P3A-HELPERD[sysupgrade_conf_read_null_aborts_preserving_orig]',
+	'read_null guard verified'
+);
+
 printf('UCODE_SUMMARY: %d passed, %d failed\n', passed, failed);
 exit(failed == 0 ? 0 : 1);

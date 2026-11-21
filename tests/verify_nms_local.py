@@ -971,10 +971,12 @@ if has_openwrt_chroot or ucode_bin:
             shutil.rmtree(chroot_stage, ignore_errors=True)
             shutil.copytree(td_arc, chroot_stage)
             shutil.copy2(archive_uc_path, os.path.join(chroot_stage, "nms_archive.uc"))
-            # Extract exact production atomic_write & atomic_write_or_reply from backend/noc-helperd
+            # Extract exact production atomic_write, atomic_write_or_reply, fw_check_and_reload, and rollback_client_rules from backend/noc-helperd
             m_aw = re.search(r"(function atomic_write\(.*?\n\}\n\nfunction atomic_write_or_reply\(.*?\n\})", helperd_src, re.DOTALL)
-            if not m_aw:
-                fail("P3A-HELPERD-EXTRACT: could not extract atomic_write/atomic_write_or_reply from noc-helperd")
+            m_fw = re.search(r"(function fw_check_and_reload\(.*?\n\})", helperd_src, re.DOTALL)
+            m_rb = re.search(r"(function rollback_client_rules\(.*?\n\})", helperd_src, re.DOTALL)
+            if not m_aw or not m_fw or not m_rb:
+                fail("P3A-HELPERD-EXTRACT: could not extract production helpers from noc-helperd")
             else:
                 open(os.path.join(chroot_stage, "helperd_aw_prod.uc"), "w").write(
                     "import * as fs from 'fs';\n"
@@ -982,13 +984,24 @@ if has_openwrt_chroot or ucode_bin:
                     "export let test_audits = [];\n"
                     "export let test_locks_released = 0;\n"
                     "export let test_warns = [];\n"
+                    "export let ETC_DIR = '/tmp/p3a_test/etc_mock';\n"
+                    "export let CAP_GENERAL = 65536;\n"
+                    "export let mock_exec_res = { ok: false };\n"
+                    "export let mock_apply_res = { ok: true };\n"
+                    "export let mock_ops = null;\n"
                     "function now_mono_ms() { return 12345; }\n"
+                    "function now_iso() { return '2026-11-22T00:00:00Z'; }\n"
                     "function urandom_hex(n) { return 'abcd'; }\n"
                     "function warn(msg) { push(test_warns, msg); }\n"
                     "function audit_append(actor, act, tgt, res, det) { push(test_audits, { actor: actor, action: act, target: tgt, result: res, details: det }); }\n"
                     "function release_lock() { test_locks_released++; }\n"
-                    + m_aw.group(1)
-                    + "\nexport { atomic_write, atomic_write_or_reply };\n"
+                    "function exec_argv_async(exe, argv, t, c, cb) { cb(mock_exec_res); }\n"
+                    "function apply_bridge_block_rules(rules, cb) { cb(mock_apply_res); }\n"
+                    "function set_mock(ec, ap, ed) { ETC_DIR = ed; mock_exec_res = ec; mock_apply_res = ap; }\n"
+                    + m_aw.group(1) + "\n"
+                    + m_fw.group(1) + "\n"
+                    + m_rb.group(1) + "\n"
+                    + "\nexport { atomic_write, atomic_write_or_reply, fw_check_and_reload, rollback_client_rules, set_mock };\n"
                 )
             shutil.copy2(os.path.join(ROOT, "tests/verify_phase3a_ucode.uc"), os.path.join(chroot_stage, "verify_phase3a_ucode.uc"))
             try:
