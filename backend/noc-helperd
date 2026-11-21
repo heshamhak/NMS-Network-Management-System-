@@ -7,6 +7,7 @@ import * as digest from 'digest';
 import * as ubus from 'ubus';
 import * as uci from 'uci';
 import * as nms_archive from '/usr/libexec/nms_archive.uc';
+import * as nms_network from '/usr/libexec/nms_network.uc';
 
 const ETC_DIR = getenv('NOC_ETC_DIR') || '/etc/noc-console';
 const RUN_DIR = getenv('NOC_RUN_DIR') || '/tmp/noc-console';
@@ -1469,12 +1470,71 @@ function handle_rpc(req, reply_cb) {
 			ap_disabled: cur.get('wireless', 'default_radio0', 'disabled') == '1'
 		};
 		let scan_cache = read_json(RUN_DIR + '/wifi_scan.json', { ts: 0, results: [] });
+		let uci_interfaces = [];
+		cur.foreach('network', 'interface', function(s) {
+			let nm = s['.name'];
+			push(uci_interfaces, {
+				name: nm,
+				proto: s.proto || '',
+				device: s.device || s.ifname || '',
+				ipaddr: s.ipaddr || '',
+				netmask: s.netmask || '',
+				gateway: s.gateway || '',
+				ip6assign: s.ip6assign != null ? +s.ip6assign : null,
+				ip6addr: s.ip6addr || '',
+				ip6gw: s.ip6gw || '',
+				mtu: s.mtu != null ? +s.mtu : null,
+				metric: s.metric != null ? +s.metric : null,
+				auto: s.auto != '0',
+				protected: (nm == 'loopback' || nm == 'lan' || nm == 'wan')
+			});
+		});
+		let uci_devices = [];
+		cur.foreach('network', 'device', function(s) {
+			push(uci_devices, {
+				id: s['.name'],
+				name: s.name || s['.name'],
+				type: s.type || 'bridge',
+				ports: type(s.ports) == 'array' ? s.ports : (s.ports ? split(trim(s.ports), /\s+/) : []),
+				ifname: s.ifname || '',
+				vid: s.vid != null ? +s.vid : null,
+				mtu: s.mtu != null ? +s.mtu : null,
+				igmp_snooping: s.igmp_snooping == '1',
+				bridge_empty: s.bridge_empty == '1'
+			});
+		});
+		let bridge_vlans = [];
+		cur.foreach('network', 'bridge-vlan', function(s) {
+			push(bridge_vlans, {
+				id: s['.name'],
+				device: s.device || 'br-lan',
+				vlan: +(s.vlan || 1),
+				ports: type(s.ports) == 'array' ? s.ports : (s.ports ? split(trim(s.ports), /\s+/) : [])
+			});
+		});
+		let ipv6_settings = {
+			ula_prefix: cur.get('network', 'globals', 'ula_prefix') || '',
+			interface: 'lan',
+			ra: cur.get('dhcp', 'lan', 'ra') || 'disabled',
+			dhcpv6: cur.get('dhcp', 'lan', 'dhcpv6') || 'disabled',
+			ndp: cur.get('dhcp', 'lan', 'ndp') || 'disabled',
+			ra_management: +(cur.get('dhcp', 'lan', 'ra_management') || 1),
+			ra_default: +(cur.get('dhcp', 'lan', 'ra_default') || 0),
+			ra_slaac: cur.get('dhcp', 'lan', 'ra_slaac') != '0',
+			ra_flags: type(cur.get('dhcp', 'lan', 'ra_flags')) == 'array' ? cur.get('dhcp', 'lan', 'ra_flags') : [],
+			dns: type(cur.get('dhcp', 'lan', 'dns')) == 'array' ? cur.get('dhcp', 'lan', 'dns') : []
+		};
 		reply_cb({
 			ok: true,
 			dhcp_pool: dhcp_pool,
 			wan_settings: wan_settings,
 			static_routes: static_routes,
+			uci_interfaces: uci_interfaces,
+			uci_devices: uci_devices,
+			bridge_vlans: bridge_vlans,
+			ipv6_settings: ipv6_settings,
 			wireless_settings: wireless_settings,
+			scan_cache_ignored: null,
 			wifi_scan: scan_cache.results || []
 		});
 		return;
@@ -2377,6 +2437,10 @@ function handle_rpc(req, reply_cb) {
 		'client_domain_add': true, 'client_domain_delete': true, 'client_lease_delete': true,
 		'network_action': true, 'network_save_dhcp': true, 'network_save_wan': true,
 		'network_route_add': true, 'network_route_delete': true,
+		'network_interface_save': true, 'network_interface_delete': true,
+		'network_device_save': true,
+		'network_bridge_vlan_save': true, 'network_bridge_vlan_delete': true,
+		'network_ipv6_save': true,
 		'wifi_scan': true, 'wifi_save_uplink': true, 'wifi_save_ap': true,
 		'sqm_update': true,
 		'fw_add_redirect': true, 'fw_delete_redirect': true, 'fw_toggle_rule': true,
@@ -3430,6 +3494,163 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 			audit_append(actor, 'network_route_add', target + '/' + nmask, 'committed', 'via ' + gw);
 			reply_cb({ ok: true, message_ar: 'تمت إضافة المسار الثابت بنجاح' });
 		});
+		return;
+	}
+
+	if (verb == 'network_interface_save' || verb == 'network_interface_delete' ||
+	    verb == 'network_device_save' || verb == 'network_bridge_vlan_save' ||
+	    verb == 'network_bridge_vlan_delete' || verb == 'network_ipv6_save') {
+		let cfg_paths = verb == 'network_ipv6_save' ? ['/etc/config/network', '/etc/config/dhcp'] : ['/etc/config/network'];
+		let target_id = trim('' + (params.name || params.id || params.device || params.interface || 'network'));
+
+		if (verb == 'network_interface_save') {
+			let v = nms_network.validate_interface_cfg(params);
+			if (!v.ok) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: v.error }); return; }
+		} else if (verb == 'network_interface_delete') {
+			let nm = trim('' + (params.name || ''));
+			if (!nms_network.is_valid_ifname(nm) || nm == 'loopback' || nm == 'lan' || nm == 'wan') {
+				release_lock();
+				reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'لا يُسمح بحذف الواجهات الأساسية (loopback/lan/wan)' });
+				return;
+			}
+		} else if (verb == 'network_device_save') {
+			let v = nms_network.validate_device_cfg(params);
+			if (!v.ok) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: v.error }); return; }
+		} else if (verb == 'network_bridge_vlan_save') {
+			let v = nms_network.validate_bridge_vlan_cfg(params);
+			if (!v.ok) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: v.error }); return; }
+		} else if (verb == 'network_bridge_vlan_delete') {
+			let sid = trim('' + (params.id || ''));
+			if (!match(sid, /^[a-zA-Z0-9_-]+$/)) {
+				release_lock();
+				reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معرف Bridge-VLAN غير صالح' });
+				return;
+			}
+		} else if (verb == 'network_ipv6_save') {
+			let v = nms_network.validate_ipv6_dhcp_cfg(params);
+			if (!v.ok) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: v.error }); return; }
+		}
+
+		let tx_res = nms_network.apply_network_tx(cfg_paths, {
+			stat: fs.stat,
+			lstat: fs.lstat,
+			readfile: fs.readfile,
+			unlink: fs.unlink,
+			aw_ops: {
+				suffix: function() { return now_mono_ms() + '.' + urandom_hex(4); },
+				stat: fs.stat, unlink: fs.unlink, open: fs.open,
+				writefile: fs.writefile, chown: fs.chown, chmod: fs.chmod, rename: fs.rename
+			},
+			apply_uci: function() {
+				try {
+					let cur = uci.cursor();
+					if (verb == 'network_interface_save') {
+						let nm = trim('' + params.name);
+						cur.set('network', nm, 'interface');
+						cur.set('network', nm, 'proto', trim('' + params.proto));
+						if (params.device) cur.set('network', nm, 'device', trim('' + params.device));
+						if (params.ipaddr) cur.set('network', nm, 'ipaddr', trim('' + params.ipaddr));
+						if (params.netmask) cur.set('network', nm, 'netmask', trim('' + params.netmask));
+						if (params.gateway) cur.set('network', nm, 'gateway', trim('' + params.gateway));
+						if (params.ip6assign != null && params.ip6assign != '') cur.set('network', nm, 'ip6assign', '' + int(+params.ip6assign));
+						if (params.ip6addr) cur.set('network', nm, 'ip6addr', trim('' + params.ip6addr));
+						if (params.ip6gw) cur.set('network', nm, 'ip6gw', trim('' + params.ip6gw));
+						if (params.mtu != null && params.mtu != '') cur.set('network', nm, 'mtu', '' + int(+params.mtu));
+						if (params.metric != null && params.metric != '') cur.set('network', nm, 'metric', '' + int(+params.metric));
+						if (params.dns != null) cur.set('network', nm, 'dns', params.dns);
+						cur.commit('network');
+					} else if (verb == 'network_interface_delete') {
+						let nm = trim('' + params.name);
+						if (cur.get('network', nm) != 'interface') return { ok: false, error: 'الواجهة غير موجودة' };
+						cur.delete('network', nm);
+						cur.commit('network');
+					} else if (verb == 'network_device_save') {
+						let dname = trim('' + params.name);
+						let sid = null;
+						cur.foreach('network', 'device', function(s) {
+							if (s.name == dname || s['.name'] == dname) { sid = s['.name']; return false; }
+						});
+						if (!sid) sid = 'dev_' + replace(dname, /[^a-zA-Z0-9_]/g, '_');
+						cur.set('network', sid, 'device');
+						cur.set('network', sid, 'name', dname);
+						cur.set('network', sid, 'type', trim('' + (params.type || 'bridge')));
+						if (params.type == 'bridge' || !params.type) cur.set('network', sid, 'ports', params.ports);
+						else {
+							cur.set('network', sid, 'ifname', trim('' + params.ifname));
+							cur.set('network', sid, 'vid', '' + int(+params.vid));
+						}
+						if (params.mtu != null && params.mtu != '') cur.set('network', sid, 'mtu', '' + int(+params.mtu));
+						cur.set('network', sid, 'igmp_snooping', params.igmp_snooping ? '1' : '0');
+						cur.commit('network');
+					} else if (verb == 'network_bridge_vlan_save') {
+						let dev = trim('' + (params.device || 'br-lan'));
+						let vid = int(+params.vlan);
+						let sid = trim('' + (params.id || ''));
+						if (sid == '') {
+							cur.foreach('network', 'bridge-vlan', function(s) {
+								if ((s.device || 'br-lan') == dev && +(s.vlan || 0) == vid) { sid = s['.name']; return false; }
+							});
+						}
+						if (sid == '') sid = 'bv_' + replace(dev, /[^a-zA-Z0-9_]/g, '_') + '_' + vid;
+						cur.set('network', sid, 'bridge-vlan');
+						cur.set('network', sid, 'device', dev);
+						cur.set('network', sid, 'vlan', '' + vid);
+						cur.set('network', sid, 'ports', params.ports);
+						cur.commit('network');
+					} else if (verb == 'network_bridge_vlan_delete') {
+						let sid = trim('' + params.id);
+						if (cur.get('network', sid) != 'bridge-vlan') return { ok: false, error: 'قسم Bridge-VLAN غير موجود' };
+						cur.delete('network', sid);
+						cur.commit('network');
+					} else if (verb == 'network_ipv6_save') {
+						let iface = trim('' + (params.interface || 'lan'));
+						if (params.ula_prefix != null && trim('' + params.ula_prefix) != '') {
+							cur.set('network', 'globals', 'ula_prefix', trim('' + params.ula_prefix));
+							cur.commit('network');
+						}
+						cur.set('dhcp', iface, 'ra', trim('' + (params.ra || 'server')));
+						cur.set('dhcp', iface, 'dhcpv6', trim('' + (params.dhcpv6 || 'server')));
+						cur.set('dhcp', iface, 'ndp', trim('' + (params.ndp || 'disabled')));
+						if (params.ra_management != null && params.ra_management != '') cur.set('dhcp', iface, 'ra_management', '' + int(+params.ra_management));
+						if (params.ra_default != null && params.ra_default != '') cur.set('dhcp', iface, 'ra_default', '' + int(+params.ra_default));
+						cur.set('dhcp', iface, 'ra_slaac', params.ra_slaac !== false ? '1' : '0');
+						if (params.ra_flags != null) cur.set('dhcp', iface, 'ra_flags', params.ra_flags);
+						if (params.dns != null) cur.set('dhcp', iface, 'dns', params.dns);
+						cur.commit('dhcp');
+					}
+					return { ok: true };
+				} catch (e) {
+					return { ok: false, error: 'فشل تحديث UCI للشبكة' };
+				}
+			},
+			validate_config: function() {
+				let rc = system('/sbin/uci -q show network >/dev/null 2>&1');
+				if (rc != 0) return { ok: false, error: 'فشل التحقق من بنية UCI للشبكة' };
+				if (verb == 'network_ipv6_save' && system('/sbin/uci -q show dhcp >/dev/null 2>&1') != 0) {
+					return { ok: false, error: 'فشل التحقق من بنية UCI لـ DHCP/IPv6' };
+				}
+				return { ok: true };
+			},
+			reload_service: function() {
+				let rc = system('/etc/init.d/network reload >/dev/null 2>&1');
+				if (rc != 0) return { ok: false, error: 'فشل إعادة تحميل /etc/init.d/network' };
+				if (verb == 'network_ipv6_save' && fs.stat('/etc/init.d/odhcpd')) {
+					if (system('/etc/init.d/odhcpd reload >/dev/null 2>&1') != 0) {
+						return { ok: false, error: 'فشل إعادة تحميل /etc/init.d/odhcpd' };
+					}
+				}
+				return { ok: true };
+			},
+			verify_applied: function() {
+				return { ok: system('/sbin/uci -q show network >/dev/null 2>&1') == 0 };
+			},
+			on_rollback_failed: function(reason) {
+				return enter_emergency_freeze(reason);
+			}
+		});
+		release_lock();
+		audit_append(actor, verb, target_id, tx_res.ok ? 'committed' : (tx_res.rollback_failed ? 'rollback_failed' : 'rolled_back'), tx_res.message_ar || '');
+		reply_cb(tx_res);
 		return;
 	}
 

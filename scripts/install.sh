@@ -416,6 +416,7 @@ fi
 echo "[3/6] Installing backend, init.d, and frontend files (collision-safe)..."
 install_managed_file "${REPO_ROOT}/backend/noc-helperd" "/usr/libexec/noc-helperd" 0755
 install_managed_file "${REPO_ROOT}/backend/nms_archive.uc" "/usr/libexec/nms_archive.uc" 0644
+install_managed_file "${REPO_ROOT}/backend/nms_network.uc" "/usr/libexec/nms_network.uc" 0644
 install_managed_file "${REPO_ROOT}/backend/noc-apid" "/usr/libexec/noc-apid" 0755
 [ "$FAIL_POINT" = "after_backend" ] && { echo "ERROR: Injected failure after_backend" >&2; exit 1; }
 

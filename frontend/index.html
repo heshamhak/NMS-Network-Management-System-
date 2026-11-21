@@ -1153,6 +1153,88 @@
             </div>
           </article>
 
+          <article class="card admin-only">
+            <div class="card-head">
+              <h3>إدارة واجهات الشبكة وVLAN وBridge / DSA</h3>
+              <button type="button" id="btnSaveUciIface" class="btn btn-primary btn-sm">حفظ الواجهة</button>
+            </div>
+            <div class="inline-form">
+              <input type="text" id="uciIfaceNameInput" class="form-input mono" placeholder="اسم الواجهة (مثال: guest أو vlan10)" />
+              <select id="uciIfaceProtoSelect" class="form-input">
+                <option value="static">static</option>
+                <option value="dhcp">dhcp</option>
+                <option value="dhcpv6">dhcpv6</option>
+                <option value="pppoe">pppoe</option>
+                <option value="none">none</option>
+              </select>
+              <input type="text" id="uciIfaceDevInput" class="form-input mono" placeholder="الجهاز (مثال: br-lan.10)" />
+              <input type="text" id="uciIfaceIpInput" class="form-input mono" placeholder="IPv4 (مثال: 10.10.10.1)" />
+              <input type="text" id="uciIfaceMaskInput" class="form-input mono" value="255.255.255.0" />
+            </div>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead><tr><th>الاسم</th><th>البروتوكول</th><th>الجهاز</th><th>IPv4</th><th>IPv6</th><th>إجراء</th></tr></thead>
+                <tbody id="uciInterfacesBody"></tbody>
+              </table>
+            </div>
+            <div class="inset-panel">
+              <div class="card-head">
+                <h4>توزيع منافذ Bridge-VLAN (DSA)</h4>
+                <button type="button" id="btnSaveBridgeVlan" class="btn btn-primary btn-sm">حفظ Bridge-VLAN</button>
+              </div>
+              <div class="inline-form">
+                <input type="text" id="bvDeviceInput" class="form-input mono" value="br-lan" placeholder="الجسر (br-lan)" />
+                <input type="number" id="bvVlanInput" class="form-input mono" min="1" max="4094" placeholder="VLAN ID (1..4094)" />
+                <input type="text" id="bvPortsInput" class="form-input mono" placeholder="المنافذ (مثال: lan1:u, lan2:t, eth1:t*)" />
+              </div>
+              <div class="table-scroll">
+                <table class="data-table">
+                  <thead><tr><th>الجسر</th><th>VLAN</th><th>منافذ DSA</th><th>إجراء</th></tr></thead>
+                  <tbody id="bridgeVlansBody"></tbody>
+                </table>
+              </div>
+            </div>
+          </article>
+
+          <article class="card admin-only">
+            <div class="card-head">
+              <h3>إعدادات IPv6 وRA وDHCPv6 (odhcpd)</h3>
+              <button type="button" id="btnSaveIpv6" class="btn btn-primary btn-sm">حفظ إعدادات IPv6</button>
+            </div>
+            <div class="form-row-2">
+              <label class="field-label">بادئة ULA (IPv6 Global Prefix)
+                <input type="text" id="ipv6UlaInput" class="form-input mono" placeholder="fd00::/48" />
+              </label>
+              <label class="field-label">وضع Router Advertisement (RA)
+                <select id="ipv6RaSelect" class="form-input">
+                  <option value="disabled">disabled</option>
+                  <option value="server">server</option>
+                  <option value="relay">relay</option>
+                  <option value="hybrid">hybrid</option>
+                </select>
+              </label>
+              <label class="field-label">وضع DHCPv6
+                <select id="ipv6Dhcpv6Select" class="form-input">
+                  <option value="disabled">disabled</option>
+                  <option value="server">server</option>
+                  <option value="relay">relay</option>
+                  <option value="hybrid">hybrid</option>
+                </select>
+              </label>
+              <label class="field-label">وضع NDP Proxy
+                <select id="ipv6NdpSelect" class="form-input">
+                  <option value="disabled">disabled</option>
+                  <option value="relay">relay</option>
+                  <option value="hybrid">hybrid</option>
+                </select>
+              </label>
+            </div>
+            <div class="toggle-item">
+              <span class="toggle-title">تفعيل SLAAC (ra_slaac)</span>
+              <label class="switch"><input type="checkbox" id="ipv6SlaacChk" checked /><span class="switch-slider"></span></label>
+            </div>
+          </article>
+
           <article class="card">
             <div class="card-head"><h3>تفاصيل جميع الواجهات الشبكية</h3></div>
             <div class="table-scroll">

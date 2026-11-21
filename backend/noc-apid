@@ -1496,6 +1496,10 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 				dhcp_pool: (res && res.dhcp_pool) || {},
 				wan_settings: (res && res.wan_settings) || {},
 				static_routes: (res && res.static_routes) || [],
+				uci_interfaces: (res && res.uci_interfaces) || [],
+				uci_devices: (res && res.uci_devices) || [],
+				bridge_vlans: (res && res.bridge_vlans) || [],
+				ipv6_settings: (res && res.ipv6_settings) || {},
 				wireless_settings: (res && res.wireless_settings) || {},
 				wifi_scan: (res && res.wifi_scan) || []
 			};
@@ -1627,6 +1631,10 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 				reconnect_wan: 'network_action', reconnect_wwan: 'network_action', flush_dns: 'network_action', sync_time: 'network_action',
 				save_dhcp: 'network_save_dhcp', save_wan: 'network_save_wan',
 				route_add: 'network_route_add', route_delete: 'network_route_delete',
+				interface_save: 'network_interface_save', interface_delete: 'network_interface_delete',
+				device_save: 'network_device_save',
+				bridge_vlan_save: 'network_bridge_vlan_save', bridge_vlan_delete: 'network_bridge_vlan_delete',
+				ipv6_save: 'network_ipv6_save',
 				wifi_scan: 'wifi_scan', wifi_save_uplink: 'wifi_save_uplink', wifi_save_ap: 'wifi_save_ap'
 			};
 			let nverb = net_vmap[sub] || '';

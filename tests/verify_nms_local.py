@@ -971,6 +971,11 @@ if has_openwrt_chroot or ucode_bin:
             shutil.rmtree(chroot_stage, ignore_errors=True)
             shutil.copytree(td_arc, chroot_stage)
             shutil.copy2(archive_uc_path, os.path.join(chroot_stage, "nms_archive.uc"))
+            shutil.copy2(os.path.join(ROOT, "backend/nms_network.uc"), os.path.join(chroot_stage, "nms_network.uc"))
+            # Copy modules to /usr/libexec inside chroot too so import '/usr/libexec/nms_archive.uc' resolves cleanly
+            os.makedirs(os.path.join(openwrt_rootfs, "usr/libexec"), exist_ok=True)
+            shutil.copy2(archive_uc_path, os.path.join(openwrt_rootfs, "usr/libexec/nms_archive.uc"))
+            shutil.copy2(os.path.join(ROOT, "backend/nms_network.uc"), os.path.join(openwrt_rootfs, "usr/libexec/nms_network.uc"))
             # Extract exact production helpers & handlers from backend/noc-helperd
             m_aw = re.search(r"(function atomic_write\(.*?\n\}\n\nfunction atomic_write_or_reply\(.*?\n\})", helperd_src, re.DOTALL)
             m_frz = re.search(r"(function get_freeze_state\(.*?\n\}\n\nfunction enter_emergency_freeze\(.*?\n\}\n\nfunction enforce_mutation_gate\(.*?\n\})", helperd_src, re.DOTALL)
@@ -1030,6 +1035,7 @@ if has_openwrt_chroot or ucode_bin:
                     + "\nexport { atomic_write, atomic_write_or_reply, get_freeze_state, enter_emergency_freeze, enforce_mutation_gate, fw_check_and_reload, handle_sys_sysupgrade_conf_save, handle_rollback_revert, rollback_client_rules, set_mock, clear_freeze_mem };\n"
                 )
             shutil.copy2(os.path.join(ROOT, "tests/verify_phase3a_ucode.uc"), os.path.join(chroot_stage, "verify_phase3a_ucode.uc"))
+            shutil.copy2(os.path.join(ROOT, "tests/verify_phase3b_ucode.uc"), os.path.join(chroot_stage, "verify_phase3b_ucode.uc"))
             try:
                 ru = subprocess.run(
                     ["unshare", "-r", "/usr/sbin/chroot", openwrt_rootfs, "/usr/bin/ucode", "/tmp/p3a_test/verify_phase3a_ucode.uc", "/tmp/p3a_test/nms_archive.uc", "/tmp/p3a_test"],
@@ -1042,6 +1048,18 @@ if has_openwrt_chroot or ucode_bin:
                         fail(line[len("[FAIL] "):])
                 if ru.returncode != 0 and "UCODE_SUMMARY:" not in ru.stdout:
                     fail(f"P3A-UCODE: runner failed rc={ru.returncode}: {ru.stderr}")
+
+                ru3b = subprocess.run(
+                    ["unshare", "-r", "/usr/sbin/chroot", openwrt_rootfs, "/usr/bin/ucode", "/tmp/p3a_test/verify_phase3b_ucode.uc", "/tmp/p3a_test"],
+                    capture_output=True, text=True
+                )
+                for line in ru3b.stdout.splitlines():
+                    if line.startswith("[PASS] "):
+                        ok(line[len("[PASS] "):])
+                    elif line.startswith("[FAIL] "):
+                        fail(line[len("[FAIL] "):])
+                if ru3b.returncode != 0 and "UCODE3B_SUMMARY:" not in ru3b.stdout:
+                    fail(f"P3B-UCODE: runner failed rc={ru3b.returncode}: {ru3b.stderr}")
             finally:
                 shutil.rmtree(chroot_stage, ignore_errors=True)
 else:

@@ -1441,6 +1441,67 @@
       }
     }
 
+    const uciIfBody = qs('uciInterfacesBody');
+    if (uciIfBody) {
+      clearEl(uciIfBody);
+      for (const ui of (data.uci_interfaces || [])) {
+        const tr = el('tr');
+        tr.appendChild(el('td', 'mono', ui.name || ''));
+        tr.appendChild(el('td', 'mono', ui.proto || '--'));
+        tr.appendChild(el('td', 'mono', ui.device || '--'));
+        tr.appendChild(el('td', 'mono', ui.ipaddr || '--'));
+        tr.appendChild(el('td', 'mono', ui.ip6addr || (ui.ip6assign != null ? ('/' + ui.ip6assign) : '--')));
+        const ac = el('td');
+        if (!ui.protected && ui.name) {
+          const delBtn = el('button', 'btn btn-danger btn-sm', 'حذف', { type: 'button' });
+          delBtn.addEventListener('click', async () => {
+            const ok = await confirmAction('حذف واجهة شبكة', 'هل تريد حذف الواجهة ' + ui.name + '؟');
+            if (!ok) return;
+            const res = await apiCall('network_control', { method: 'POST', body: { subaction: 'interface_delete', name: ui.name } });
+            if (res.ok) { showToast('تم حذف الواجهة بنجاح', 'success'); refreshActiveTab(); }
+            else showToast((res.errors && res.errors[0] && res.errors[0].message_ar) || 'فشل الحذف', 'error');
+          });
+          ac.appendChild(delBtn);
+        } else {
+          ac.appendChild(el('span', 'status-pill pill-neutral', 'محمي'));
+        }
+        tr.appendChild(ac);
+        uciIfBody.appendChild(tr);
+      }
+    }
+
+    const bvBody = qs('bridgeVlansBody');
+    if (bvBody) {
+      clearEl(bvBody);
+      for (const bv of (data.bridge_vlans || [])) {
+        const tr = el('tr');
+        tr.appendChild(el('td', 'mono', bv.device || 'br-lan'));
+        tr.appendChild(el('td', 'mono', String(bv.vlan || '')));
+        tr.appendChild(el('td', 'mono', (bv.ports || []).join(', ')));
+        const ac = el('td');
+        if (bv.id) {
+          const delBtn = el('button', 'btn btn-danger btn-sm', 'حذف', { type: 'button' });
+          delBtn.addEventListener('click', async () => {
+            const ok = await confirmAction('حذف Bridge-VLAN', 'هل تريد حذف VLAN ' + bv.vlan + '؟');
+            if (!ok) return;
+            const res = await apiCall('network_control', { method: 'POST', body: { subaction: 'bridge_vlan_delete', id: bv.id } });
+            if (res.ok) { showToast('تم حذف Bridge-VLAN', 'success'); refreshActiveTab(); }
+            else showToast((res.errors && res.errors[0] && res.errors[0].message_ar) || 'فشل الحذف', 'error');
+          });
+          ac.appendChild(delBtn);
+        }
+        tr.appendChild(ac);
+        bvBody.appendChild(tr);
+      }
+    }
+
+    const v6 = data.ipv6_settings || {};
+    if (qs('ipv6UlaInput') && document.activeElement !== qs('ipv6UlaInput')) qs('ipv6UlaInput').value = v6.ula_prefix || '';
+    if (qs('ipv6RaSelect')) qs('ipv6RaSelect').value = v6.ra || 'disabled';
+    if (qs('ipv6Dhcpv6Select')) qs('ipv6Dhcpv6Select').value = v6.dhcpv6 || 'disabled';
+    if (qs('ipv6NdpSelect')) qs('ipv6NdpSelect').value = v6.ndp || 'disabled';
+    if (qs('ipv6SlaacChk')) qs('ipv6SlaacChk').checked = v6.ra_slaac !== false;
+
     const tbody = qs('netInterfacesTableBody');
     clearEl(tbody);
     const ifaces = data.interfaces || {};
@@ -2733,6 +2794,60 @@
         refreshActiveTab();
       } else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'بيانات غير صالحة', 'error');
     });
+
+    if (qs('btnSaveUciIface')) {
+      qs('btnSaveUciIface').addEventListener('click', async () => {
+        const r = await apiCall('network_control', {
+          method: 'POST',
+          body: {
+            subaction: 'interface_save',
+            name: qs('uciIfaceNameInput').value.trim(),
+            proto: qs('uciIfaceProtoSelect').value,
+            device: qs('uciIfaceDevInput').value.trim(),
+            ipaddr: qs('uciIfaceIpInput').value.trim(),
+            netmask: qs('uciIfaceMaskInput').value.trim()
+          }
+        });
+        if (r.ok) { showToast('تم حفظ الواجهة بنجاح', 'success'); refreshActiveTab(); }
+        else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'فشل حفظ الواجهة', 'error');
+      });
+    }
+
+    if (qs('btnSaveBridgeVlan')) {
+      qs('btnSaveBridgeVlan').addEventListener('click', async () => {
+        const ports = (qs('bvPortsInput').value || '').split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+        const r = await apiCall('network_control', {
+          method: 'POST',
+          body: {
+            subaction: 'bridge_vlan_save',
+            device: qs('bvDeviceInput').value.trim(),
+            vlan: Number(qs('bvVlanInput').value),
+            ports
+          }
+        });
+        if (r.ok) { showToast('تم حفظ Bridge-VLAN بنجاح', 'success'); refreshActiveTab(); }
+        else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'فشل حفظ Bridge-VLAN', 'error');
+      });
+    }
+
+    if (qs('btnSaveIpv6')) {
+      qs('btnSaveIpv6').addEventListener('click', async () => {
+        const r = await apiCall('network_control', {
+          method: 'POST',
+          body: {
+            subaction: 'ipv6_save',
+            interface: 'lan',
+            ula_prefix: qs('ipv6UlaInput').value.trim(),
+            ra: qs('ipv6RaSelect').value,
+            dhcpv6: qs('ipv6Dhcpv6Select').value,
+            ndp: qs('ipv6NdpSelect').value,
+            ra_slaac: qs('ipv6SlaacChk').checked
+          }
+        });
+        if (r.ok) { showToast('تم حفظ إعدادات IPv6 بنجاح', 'success'); refreshActiveTab(); }
+        else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'فشل حفظ إعدادات IPv6', 'error');
+      });
+    }
 
     // SQM Editor Controls
     qs('btnSqmBindActive').addEventListener('click', () => {
