@@ -1911,6 +1911,7 @@
     const r = await apiCall('packages', { query: { q: q || '' }, skipSeqCheck: true });
     if (!r || !r.ok || !r.data) return;
     const d = r.data;
+    if (qs('pkgManagerBadge')) qs('pkgManagerBadge').textContent = String(d.pkg_manager || 'unknown').toUpperCase();
     if (qs('pkgCountBadge')) qs('pkgCountBadge').textContent = nfInt.format(d.filtered_count || 0) + ' / ' + nfInt.format(d.total_count || 0) + ' حزمة';
     if (qs('sysPkgVersionText') && d.system_version) {
       qs('sysPkgVersionText').textContent = 'System OS ' + d.system_version + ' | Kernel ' + (d.kernel_version || '6.12.112');
@@ -2948,6 +2949,77 @@
       URL.revokeObjectURL(url);
       showToast('تم تصدير النسخة الاحتياطية للإعدادات بنجاح', 'success');
     });
+
+    if (qs('btnExportSysupgradeBackup')) {
+      qs('btnExportSysupgradeBackup').addEventListener('click', async () => {
+        const r = await apiCall('backup_export', { method: 'POST', body: { mode: 'sysupgrade' }, skipSeqCheck: true });
+        if (!r.ok || !r.data || !r.data.archive_b64) {
+          showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'تعذر تصدير أرشيف sysupgrade -b', 'error');
+          return;
+        }
+        const binStr = atob(r.data.archive_b64);
+        const bytes = new Uint8Array(binStr.length);
+        for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
+        const blob = new Blob([bytes], { type: 'application/gzip' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = r.data.filename || 'sysupgrade-backup.tar.gz';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        if (qs('sysBackupStatusPre')) {
+          qs('sysBackupStatusPre').classList.remove('hidden');
+          qs('sysBackupStatusPre').textContent = 'SHA-256: ' + (r.data.sha256 || '') + '\nالملفات: ' + (r.data.entries_count || 0);
+        }
+        showToast('تم تصدير أرشيف sysupgrade -b والتحقق من سلامته', 'success');
+      });
+    }
+
+    if (qs('btnValidateSysBackup')) {
+      qs('btnValidateSysBackup').addEventListener('click', async () => {
+        const fInput = qs('sysBackupValidateFile');
+        const file = fInput && fInput.files ? fInput.files[0] : null;
+        if (!file) {
+          showToast('اختر ملف أرشيف (.tar.gz) أولاً للتحقق من سلامته', 'warning');
+          return;
+        }
+        const buf = await file.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let binStr = '';
+        for (let i = 0; i < bytes.length; i++) binStr += String.fromCharCode(bytes[i]);
+        const r = await apiCall('backup_validate', { method: 'POST', body: { archive_b64: btoa(binStr) }, skipSeqCheck: true });
+        if (qs('sysBackupStatusPre')) {
+          qs('sysBackupStatusPre').classList.remove('hidden');
+          const d = r.data || {};
+          qs('sysBackupStatusPre').textContent = (r.ok && d.valid ? 'VALID' : 'INVALID') + '\nSHA-256: ' + (d.sha256 || '--') + '\nEntries: ' + (d.entries_count || 0) + ((d.errors && d.errors.length) ? '\nErrors: ' + d.errors.join('; ') : '');
+        }
+        showToast(r.ok ? 'الأرشيف سليم واجتاز فحص المسارات' : 'الأرشيف غير صالح أو يحتوي مسارات مرفوضة', r.ok ? 'success' : 'error');
+      });
+    }
+
+    if (qs('btnLoadSysupgradeConf')) {
+      qs('btnLoadSysupgradeConf').addEventListener('click', async () => {
+        const r = await apiCall('system_control', { method: 'POST', body: { subaction: 'sysupgrade_conf_get' }, skipSeqCheck: true });
+        if (r.ok && r.data && qs('sysupgradeConfTextarea')) {
+          qs('sysupgradeConfTextarea').value = (r.data.entries || []).join('\n');
+          showToast('تم تحميل مسارات sysupgrade.conf', 'success');
+        } else {
+          showToast('تعذر قراءة sysupgrade.conf', 'error');
+        }
+      });
+    }
+
+    if (qs('btnSaveSysupgradeConf')) {
+      qs('btnSaveSysupgradeConf').addEventListener('click', async () => {
+        const raw = qs('sysupgradeConfTextarea') ? qs('sysupgradeConfTextarea').value : '';
+        const paths = raw.split(/\r?\n/).map((s) => s.trim()).filter((s) => s && !s.startsWith('#'));
+        const r = await apiCall('system_control', { method: 'POST', body: { subaction: 'sysupgrade_conf_save', paths } });
+        if (r.ok) showToast('تم حفظ sysupgrade.conf بأمان', 'success');
+        else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'فشل حفظ sysupgrade.conf', 'error');
+      });
+    }
 
     qs('btnSysReboot').addEventListener('click', async () => {
       const ch = await apiCall('system_control', { method: 'POST', body: { subaction: 'reboot_challenge' } });

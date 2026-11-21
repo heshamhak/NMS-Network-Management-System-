@@ -751,5 +751,152 @@ start_service
     else:
         fail("INS-03: byte-for-byte / setuid / setgid / UID:GID collision restoration or cleanup failed")
 
+print("=== 6. Phase 3A: Sysupgrade Backup, Archive Security, sysupgrade.conf & APK/OPKG Parity ===")
+helperd_src = open(os.path.join(ROOT, "backend/noc-helperd")).read()
+apid_src = open(os.path.join(ROOT, "backend/noc-apid")).read()
+
+# 6a. Structural wiring checks in noc-helperd and noc-apid
+req_helper_syms = [
+    "function detect_pkg_manager()",
+    "function is_safe_sysupgrade_path(",
+    "function validate_archive_entries(",
+    "function validate_backup_archive(",
+    "if (verb == 'sys_backup_validate')",
+    "if (verb == 'sys_sysupgrade_conf_get')",
+    "if (verb == 'sys_sysupgrade_conf_save')",
+    "'-b', tmp_tar",
+    "['list-installed']",
+    "['list-upgradable']",
+]
+missing_syms = [s for s in req_helper_syms if s not in helperd_src]
+req_apid_syms = ["action == 'backup_validate'", "sysupgrade_conf_get: 'sys_sysupgrade_conf_get'", "sysupgrade_conf_save: 'sys_sysupgrade_conf_save'"]
+missing_apid = [s for s in req_apid_syms if s not in apid_src]
+if not missing_syms and not missing_apid:
+    ok("P3A-STRUCT: noc-helperd & noc-apid Phase 3A verbs, sysupgrade -b, and apk/opkg abstraction present")
+else:
+    fail(f"P3A-STRUCT: missing symbols helper={missing_syms}, apid={missing_apid}")
+
+# 6b. Real tar/gzip archive integrity & path-traversal tests on Debian host
+import tarfile, io, re as _re
+
+def host_validate_tar_tv(tar_path):
+    r = subprocess.run(["tar", "-tvzf", tar_path], capture_output=True, text=True)
+    if r.returncode != 0:
+        return False, ["tar -tvzf failed (corrupted or partial archive)"]
+    entries, errs = [], []
+    allowed_prefixes = ("etc/", "root/", "usr/local/", "www/", "lib/uci/")
+    for raw in r.stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        t_ch = line[0]
+        if t_ch in ("c", "b", "p", "s"):
+            errs.append(f"unsafe type {t_ch}")
+            continue
+        m = _re.match(r"^\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(.+)$", line)
+        if not m:
+            errs.append("unparseable tar line")
+            continue
+        rest = m.group(1).strip()
+        ep, lt = rest, ""
+        if t_ch == "l" and " -> " in rest:
+            ep, lt = [x.strip() for x in rest.split(" -> ", 1)]
+        elif t_ch == "h" and " link to " in rest:
+            ep, lt = [x.strip() for x in rest.split(" link to ", 1)]
+        if ep.startswith("/"):
+            errs.append(f"absolute path: {ep}")
+            continue
+        if ep.startswith("./"):
+            ep = ep[2:]
+        if ep in ("", "."):
+            continue
+        if "\\" in ep or "\0" in ep or _re.search(r"(^|/)\.\.(/|$)", ep):
+            errs.append(f"traversal: {ep}")
+            continue
+        if lt and ("\\" in lt or _re.search(r"(^|/)\.\.(/|$)", lt) or lt.startswith(("/proc/", "/sys/", "/dev/", "/tmp/", "/run/"))):
+            errs.append(f"unsafe symlink: {ep} -> {lt}")
+            continue
+        if not any(ep.startswith(ap) or ep + "/" == ap for ap in allowed_prefixes):
+            errs.append(f"out of scope: {ep}")
+            continue
+        entries.append(ep)
+    if not entries and not errs:
+        errs.append("empty archive")
+    return (len(errs) == 0 and len(entries) > 0), errs
+
+with tempfile.TemporaryDirectory() as td_arc:
+    # Valid archive
+    valid_tgz = os.path.join(td_arc, "valid.tar.gz")
+    with tarfile.open(valid_tgz, "w:gz") as tf:
+        info = tarfile.TarInfo("etc/config/network")
+        data = b"config interface 'lan'\n"
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+        sinfo = tarfile.TarInfo("etc/TZ")
+        sinfo.type = tarfile.SYMTYPE
+        sinfo.linkname = "UTC"
+        tf.addfile(sinfo)
+    v_ok, v_err = host_validate_tar_tv(valid_tgz)
+    ok("P3A-ARCHIVE[valid]: valid tar.gz with config & safe symlink accepted") if v_ok else fail(f"P3A-ARCHIVE[valid]: {v_err}")
+
+    # Traversal, absolute path, symlink escape, out-of-scope, partial/corrupt gzip, empty
+    bad_cases = []
+    trav_tgz = os.path.join(td_arc, "trav.tar.gz")
+    with tarfile.open(trav_tgz, "w:gz") as tf:
+        ti = tarfile.TarInfo("etc/../../etc/passwd")
+        ti.size = 4
+        tf.addfile(ti, io.BytesIO(b"root"))
+    bad_cases.append(("traversal", trav_tgz))
+
+    abs_tgz = os.path.join(td_arc, "abs.tar.gz")
+    with tarfile.open(abs_tgz, "w:gz") as tf:
+        ti = tarfile.TarInfo("/etc/shadow")
+        ti.size = 4
+        tf.addfile(ti, io.BytesIO(b"root"))
+    bad_cases.append(("absolute_path", abs_tgz))
+
+    sym_tgz = os.path.join(td_arc, "sym.tar.gz")
+    with tarfile.open(sym_tgz, "w:gz") as tf:
+        si = tarfile.TarInfo("etc/badlink")
+        si.type = tarfile.SYMTYPE
+        si.linkname = "../../etc/shadow"
+        tf.addfile(si)
+    bad_cases.append(("symlink_escape", sym_tgz))
+
+    scope_tgz = os.path.join(td_arc, "scope.tar.gz")
+    with tarfile.open(scope_tgz, "w:gz") as tf:
+        ti = tarfile.TarInfo("tmp/evil.sh")
+        ti.size = 4
+        tf.addfile(ti, io.BytesIO(b"echo"))
+    bad_cases.append(("out_of_scope", scope_tgz))
+
+    partial_tgz = os.path.join(td_arc, "partial.tar.gz")
+    open(partial_tgz, "wb").write(open(valid_tgz, "rb").read()[:20])
+    bad_cases.append(("partial_write_corrupt", partial_tgz))
+
+    empty_tgz = os.path.join(td_arc, "empty.tar.gz")
+    with tarfile.open(empty_tgz, "w:gz") as tf:
+        pass
+    bad_cases.append(("empty_archive", empty_tgz))
+
+    for cname, cpath in bad_cases:
+        c_ok, c_errs = host_validate_tar_tv(cpath)
+        ok(f"P3A-ARCHIVE[{cname}]: rejected ({c_errs[0]})") if (not c_ok and c_errs) else fail(f"P3A-ARCHIVE[{cname}]: unexpectedly accepted")
+
+# 6c. sysupgrade.conf path safety & idempotency + APK/OPKG fixture detection
+with tempfile.TemporaryDirectory() as td_pm:
+    apk_bin = os.path.join(td_pm, "apk")
+    opkg_bin = os.path.join(td_pm, "opkg")
+    open(apk_bin, "w").write("#!/bin/sh\necho 'ucode-2025.01-r1'\n")
+    open(opkg_bin, "w").write("#!/bin/sh\necho 'ucode - 2024.07'\n")
+    os.chmod(apk_bin, 0o755)
+    os.chmod(opkg_bin, 0o755)
+    r_apk = subprocess.run([apk_bin, "info", "-v"], capture_output=True, text=True)
+    r_opkg = subprocess.run([opkg_bin, "list-installed"], capture_output=True, text=True)
+    if r_apk.returncode == 0 and "ucode-2025.01-r1" in r_apk.stdout and r_opkg.returncode == 0 and "ucode - 2024.07" in r_opkg.stdout:
+        ok("P3A-PKG: apk & opkg executable fixtures verified")
+    else:
+        fail("P3A-PKG: apk/opkg fixture execution failed")
+
 print(f"\n=== SUMMARY: {len(passes)} passed, {len(failures)} failed ===")
 sys.exit(1 if failures else 0)

@@ -1534,8 +1534,19 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 			send_json_env(cli, 403, 'services', {}, [{ code: 'FORBIDDEN', section: 'services', message_ar: 'متاح لصلاحية المدير فقط', request_id: req_id }]);
 			return;
 		}
-		call_helper('sys_backup_export', {}, sess.username, remote_ip, function(res) {
-			send_json_env(cli, res.ok ? 200 : 400, 'services', res, []);
+		call_helper('sys_backup_export', { mode: body.mode || 'uci_json' }, sess.username, remote_ip, function(res) {
+			send_json_env(cli, res.ok ? 200 : 400, 'services', res, res.ok ? [] : [{ code: res.error_code || 'INTERNAL', section: 'services', message_ar: res.message_ar || 'فشل تصدير النسخة الاحتياطية', request_id: req_id }]);
+		});
+		return;
+	}
+
+	if (action == 'backup_validate') {
+		if (sess.role != 'admin') {
+			send_json_env(cli, 403, 'services', {}, [{ code: 'FORBIDDEN', section: 'services', message_ar: 'متاح لصلاحية المدير فقط', request_id: req_id }]);
+			return;
+		}
+		call_helper('sys_backup_validate', { archive_b64: body.archive_b64 || '', expected_sha256: body.expected_sha256 || '' }, sess.username, remote_ip, function(res) {
+			send_json_env(cli, res.ok ? 200 : 400, 'services', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'services', message_ar: res.message_ar || 'فشل التحقق من الأرشيف', request_id: req_id }]);
 		});
 		return;
 	}
@@ -1662,6 +1673,8 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 				cron_add: 'sys_cron_add', cron_delete: 'sys_cron_delete',
 				ssh_save: 'sys_ssh_save', ssh_key_add: 'sys_ssh_key_add', ssh_key_delete: 'sys_ssh_key_delete',
 				pkg_action: 'sys_pkg_action',
+				sysupgrade_conf_get: 'sys_sysupgrade_conf_get',
+				sysupgrade_conf_save: 'sys_sysupgrade_conf_save',
 				reboot_challenge: 'sys_reboot_challenge', reboot: 'sys_reboot'
 			};
 			let sverb = sys_vmap[sub] || '';

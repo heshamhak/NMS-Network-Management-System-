@@ -1702,11 +1702,22 @@
                 </div>
               </div>
               <div class="inset-panel">
-                <h4>تصدير الإعدادات وإعادة تشغيل البوابة</h4>
+                <h4>تصدير الإعدادات وإدارة sysupgrade.conf وإعادة تشغيل البوابة</h4>
                 <div class="inline-form">
                   <button type="button" id="btnExportSysBackup" class="btn btn-secondary btn-sm">تصدير نسخة احتياطية للإعدادات (JSON)</button>
+                  <button type="button" id="btnExportSysupgradeBackup" class="btn btn-primary btn-sm">تصدير أرشيف النظام (sysupgrade -b)</button>
                   <button type="button" id="btnSysReboot" class="btn btn-danger btn-sm">إعادة تشغيل البوابة (بتحدي تأكيد ثنائي)</button>
                 </div>
+                <div class="inline-form">
+                  <input type="file" id="sysBackupValidateFile" accept=".tar.gz,.tgz" class="form-input" />
+                  <button type="button" id="btnValidateSysBackup" class="btn btn-secondary btn-sm">فحص سلامة أرشيف (.tar.gz)</button>
+                </div>
+                <pre id="sysBackupStatusPre" class="log-pre mono hidden"></pre>
+                <div class="inline-form">
+                  <button type="button" id="btnLoadSysupgradeConf" class="btn btn-secondary btn-sm">قراءة /etc/sysupgrade.conf</button>
+                  <button type="button" id="btnSaveSysupgradeConf" class="btn btn-primary btn-sm">حفظ /etc/sysupgrade.conf</button>
+                </div>
+                <textarea id="sysupgradeConfTextarea" rows="4" class="form-input mono" placeholder="/etc/noc-console/&#10;/etc/dropbear/"></textarea>
               </div>
             </article>
           </div>
@@ -1757,8 +1768,11 @@
 
           <article class="card admin-only">
             <div class="card-head">
-              <h3>إدارة البرامج والحزم وترقية النظام (APK Package &amp; System Upgrade Manager)</h3>
-              <span class="status-pill pill-neutral mono" id="pkgCountBadge">--</span>
+              <h3>إدارة البرامج والحزم وترقية النظام (APK / OPKG Package Manager)</h3>
+              <div class="inline-form">
+                <span class="status-pill pill-neutral mono" id="pkgManagerBadge">--</span>
+                <span class="status-pill pill-neutral mono" id="pkgCountBadge">--</span>
+              </div>
             </div>
             <div class="inset-panel">
               <div class="card-head">
