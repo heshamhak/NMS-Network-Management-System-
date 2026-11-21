@@ -138,6 +138,8 @@ TMP_RESTORE=""
 RUN_DIR_EXISTED=0
 RUN_DIR_ORIG_OWNER=""
 SVC_TOUCHED=0
+PREV_HELPERD_EXISTED=0
+PREV_APID_EXISTED=0
 PREV_HELPERD_EN=0
 PREV_APID_EN=0
 PREV_HELPERD_RUN=0
@@ -254,18 +256,24 @@ rollback_tx() {
       fi
     done
 
-    # 5. Remove newly created directories (deepest first) if empty
+    # 5. Remove newly created directories (deepest first) if empty; fail on unexpected rmdir errors
     for _d in $TX_CREATED_DIRS; do
       [ -n "$_d" ] || continue
       if [ -d "$_d" ]; then
-        rmdir "$_d" 2>/dev/null || true
+        if [ -z "$(ls -A "$_d" 2>/dev/null)" ]; then
+          rmdir "$_d" || { echo "ROLLBACK ERROR: failed to remove empty dir $_d" >&2; _rb_err=1; }
+        fi
       fi
     done
 
-    # 6. Restore previous enabled/running state using the RESTORED init.d scripts & verify
+    # 6. Restore previous enabled/running state ONLY for services that existed prior to transaction
     if [ "$SVC_TOUCHED" -eq 1 ]; then
-      restore_one_service "${INIT_DIR}/noc-helperd" "$PREV_HELPERD_EN" "$PREV_HELPERD_RUN" || _rb_err=1
-      restore_one_service "${INIT_DIR}/noc-apid" "$PREV_APID_EN" "$PREV_APID_RUN" || _rb_err=1
+      if [ "$PREV_HELPERD_EXISTED" -eq 1 ]; then
+        restore_one_service "${INIT_DIR}/noc-helperd" "$PREV_HELPERD_EN" "$PREV_HELPERD_RUN" || _rb_err=1
+      fi
+      if [ "$PREV_APID_EXISTED" -eq 1 ]; then
+        restore_one_service "${INIT_DIR}/noc-apid" "$PREV_APID_EN" "$PREV_APID_RUN" || _rb_err=1
+      fi
     fi
 
     if [ "$_rb_err" -ne 0 ]; then
@@ -391,10 +399,12 @@ install_managed_file() {
 }
 
 if [ -e "${INIT_DIR}/noc-helperd" ]; then
+  PREV_HELPERD_EXISTED=1
   run_svc "${INIT_DIR}/noc-helperd" enabled >/dev/null 2>&1 && PREV_HELPERD_EN=1 || true
   run_svc "${INIT_DIR}/noc-helperd" running >/dev/null 2>&1 && PREV_HELPERD_RUN=1 || true
 fi
 if [ -e "${INIT_DIR}/noc-apid" ]; then
+  PREV_APID_EXISTED=1
   run_svc "${INIT_DIR}/noc-apid" enabled >/dev/null 2>&1 && PREV_APID_EN=1 || true
   run_svc "${INIT_DIR}/noc-apid" running >/dev/null 2>&1 && PREV_APID_RUN=1 || true
 fi
