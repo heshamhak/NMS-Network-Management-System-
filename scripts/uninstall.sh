@@ -73,7 +73,6 @@ if [ -f "$RESTORE_FILE" ]; then
   rm -f "$RESTORE_FILE"
 fi
 
-# Remove shared directories ONLY if empty (never alter permissions or delete user files)
 if [ -d "$WEB_DIR" ]; then
   find "$WEB_DIR" -depth -type d -exec rmdir {} + 2>/dev/null || true
 fi
