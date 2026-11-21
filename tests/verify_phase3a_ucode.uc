@@ -259,20 +259,69 @@ check(
 	sprintf('cr_fail=%J freeze=%J', cr_fail, cr_freeze)
 );
 
-// 8. sysupgrade.conf unreadable existing file protection (simulate readfile returning null on existing file)
+// 8. Production handle_sys_sysupgrade_conf_save: readfile == null on existing file aborts with zero mutations
 let su_dir = vec_dir + '/su_read_fail';
 fs.mkdir(su_dir);
 let su_path = su_dir + '/sysupgrade.conf';
-fs.writefile(su_path, '# Do not lose this\n/etc/dropbear/\n');
-fs.chmod(su_path, 0o000);
-// Note: inside unshare -r (uid=0), readfile on 000 still succeeds, so test the explicit null-abort guard via simulated readfile=null
-let su_st = fs.lstat(su_path);
-let su_read_null = null;
-let su_aborted = (su_st && su_read_null == null);
+let su_orig = '# Do not lose this\n/etc/dropbear/\n';
+fs.writefile(su_path, su_orig);
+fs.chmod(su_path, 0o640);
+helperd_aw.set_mock({ ok: true }, { ok: true }, su_dir, su_path, su_path);
+let su_reply = null;
+helperd_aw.handle_sys_sysupgrade_conf_save({ paths: ['/etc/noc-console/'] }, 'admin', function(r) { su_reply = r; });
+let su_st_after = fs.lstat(su_path);
 check(
-	su_aborted && fs.readfile(su_path) == '# Do not lose this\n/etc/dropbear/\n',
+	su_reply != null && !su_reply.ok && su_reply.error_code == 'INTERNAL' && helperd_aw.spy_mutations == 0 && fs.readfile(su_path) == su_orig && (su_st_after.mode & 0o7777) == 0o640,
 	'P3A-HELPERD[sysupgrade_conf_read_null_aborts_preserving_orig]',
-	'read_null guard verified'
+	sprintf('reply=%J mutations=%d', su_reply, helperd_aw.spy_mutations)
+);
+
+// 9. Fail-safe in-memory freeze when freeze.json persistence fails -> subsequent mutations blocked & freeze_persist_failed reported
+let frz_etc = vec_dir + '/frz_fail_etc';
+fs.mkdir(frz_etc);
+fs.mkdir(frz_etc + '/freeze.json'); // directory obstruction causes atomic_write(freeze.json) rename to fail!
+helperd_aw.clear_freeze_mem();
+helperd_aw.set_mock({ ok: false }, { ok: true }, frz_etc, null, null);
+fs.unlink(fw_cfg);
+fs.mkdir(fw_cfg);
+let fw_frz_res = null;
+helperd_aw.fw_check_and_reload('GOOD_FW\n', function(r) { fw_frz_res = r; });
+fs.rmdir(fw_cfg);
+if (orig_fw != null) fs.writefile(fw_cfg, orig_fw);
+let frz_state_now = helperd_aw.get_freeze_state();
+check(
+	fw_frz_res != null && !fw_frz_res.ok && fw_frz_res.rollback_failed === true && fw_frz_res.freeze_persist_failed === true && fw_frz_res.freeze_persisted === false && frz_state_now.frozen === true,
+	'P3A-HELPERD[freeze_persist_fail_enforces_in_memory_freeze]',
+	sprintf('res=%J freeze_state=%J', fw_frz_res, frz_state_now)
+);
+helperd_aw.clear_freeze_mem();
+
+// 10. Production handle_rollback_revert: failure preserves .bak/.pending, success verifies & cleans up
+let rbr_dir = vec_dir + '/rbr_test';
+fs.mkdir(rbr_dir);
+let rbr_base = rbr_dir + '/rb_deadbeef';
+let rbr_cfg = rbr_dir + '/target.cfg';
+fs.writefile(rbr_base + '.bak', 'RESTORED_CFG\n');
+fs.writefile(rbr_base + '.pending', '{"kind":"firewall"}\n');
+// 10a. Failure case: target is a directory so atomic_write fails -> .bak & .pending preserved, rollback_failed=true
+fs.mkdir(rbr_cfg);
+let rbr_fail_res = null;
+helperd_aw.handle_rollback_revert(rbr_base, { kind: 'firewall', cfg_path: rbr_cfg, reload_cmd: '' }, 'admin', function(r) { rbr_fail_res = r; });
+fs.rmdir(rbr_cfg);
+check(
+	rbr_fail_res != null && !rbr_fail_res.ok && rbr_fail_res.rollback_failed === true && !!fs.stat(rbr_base + '.bak') && !!fs.stat(rbr_base + '.pending'),
+	'P3A-HELPERD[rollback_revert_fail_preserves_artifacts]',
+	sprintf('res=%J', rbr_fail_res)
+);
+// 10b. Success case: target restored, mode 0644 & bytes verified, .bak & .pending deleted
+fs.writefile(rbr_cfg, 'BROKEN_CFG\n');
+let rbr_ok_res = null;
+helperd_aw.handle_rollback_revert(rbr_base, { kind: 'firewall', cfg_path: rbr_cfg, reload_cmd: '' }, 'admin', function(r) { rbr_ok_res = r; });
+let rbr_st = fs.lstat(rbr_cfg);
+check(
+	rbr_ok_res != null && rbr_ok_res.ok === true && fs.readfile(rbr_cfg) == 'RESTORED_CFG\n' && (rbr_st.mode & 0o7777) == 0o644 && !fs.stat(rbr_base + '.bak') && !fs.stat(rbr_base + '.pending'),
+	'P3A-HELPERD[rollback_revert_ok_verified_and_cleaned]',
+	sprintf('res=%J', rbr_ok_res)
 );
 
 printf('UCODE_SUMMARY: %d passed, %d failed\n', passed, failed);

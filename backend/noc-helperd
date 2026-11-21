@@ -24,6 +24,7 @@ const MAX_ETC_BYTES = 4 * 1024 * 1024;
 const AUDIT_ROTATE_BYTES = 512 * 1024;
 
 let auth_busy = false;
+let emergency_freeze_state = null;
 let srv_sock = null;
 let srv_handle = null;
 let active_clients = 0;
@@ -456,7 +457,17 @@ function check_staging_guard() {
 
 // --- P17 Freeze, Lock & Timed-Disable State ---
 function get_freeze_state() {
+	if (emergency_freeze_state != null) return emergency_freeze_state;
 	return read_json(ETC_DIR + '/freeze.json', { frozen: false });
+}
+
+function enter_emergency_freeze(reason) {
+	emergency_freeze_state = { frozen: true, reason: reason, ts: now_iso(), in_memory: true };
+	let f_aw = atomic_write(ETC_DIR + '/freeze.json', sprintf('%J\n', emergency_freeze_state), 0o600);
+	if (!f_aw.ok) {
+		warn(sprintf('CRITICAL: in-memory emergency freeze active (%s), but failed to persist freeze.json (%s)\n', reason, f_aw.error || ''));
+	}
+	return { frozen: true, freeze_persisted: !!f_aw.ok, freeze_persist_failed: !f_aw.ok, f_aw: f_aw };
 }
 
 function acquire_lock(owner, op) {
@@ -857,17 +868,20 @@ function fw_check_and_reload(snap_raw, cb) {
 				let cur_fw = fs.readfile('/etc/config/firewall');
 				let fw_restored = aw.ok && st_fw && st_fw.type == 'file' && (st_fw.mode & 0o7777) == 0o644 && cur_fw == snap_raw;
 				if (!fw_restored) {
-					let f_aw = atomic_write(ETC_DIR + '/freeze.json', sprintf('%J\n', { frozen: true, reason: 'fw_check_and_reload restore failed', ts: now_iso() }), 0o600);
-					if (!f_aw.ok) warn('CRITICAL: failed to persist freeze.json after firewall restore failure\n');
-					audit_append('system', 'fw_check_and_reload', '/etc/config/firewall', 'rollback_failed', sprintf('aw_ok=%s error=%s tmp=%s', aw.ok ? '1' : '0', aw.error || '', aw.tmp_path || ''));
+					let fr = enter_emergency_freeze('fw_check_and_reload restore failed');
+					audit_append('system', 'fw_check_and_reload', '/etc/config/firewall', 'rollback_failed', sprintf('aw_ok=%s error=%s tmp=%s freeze_persisted=%s', aw.ok ? '1' : '0', aw.error || '', aw.tmp_path || '', fr.freeze_persisted ? '1' : '0'));
 					cb({
 						ok: false,
 						error_code: 'INTERNAL',
 						rolled_back: false,
 						rollback_failed: true,
+						freeze_persisted: fr.freeze_persisted,
+						freeze_persist_failed: fr.freeze_persist_failed,
 						cleanup_failed: !!aw.cleanup_failed,
 						tmp_path: aw.cleanup_failed ? (aw.tmp_path || '') : '',
-						message_ar: 'فشل حرج: فشل فحص قواعد fw4 وفشل استعادة /etc/config/firewall — تم تجميد التعديلات'
+						message_ar: fr.freeze_persist_failed
+							? 'فشل حرج: فشل فحص fw4 وفشل استعادة الجدار الناري وفشل حفظ freeze.json — تم تفعيل التجميد بالذاكرة'
+							: 'فشل حرج: فشل فحص قواعد fw4 وفشل استعادة /etc/config/firewall — تم تجميد التعديلات'
 					});
 					return;
 				}
@@ -880,6 +894,115 @@ function fw_check_and_reload(snap_raw, cb) {
 		}
 		exec_argv_async('/etc/init.d/firewall', ['reload'], 12000, CAP_GENERAL, cb);
 	});
+}
+
+function handle_sys_sysupgrade_conf_save(params, actor, reply_cb) {
+	let raw_paths = params.paths;
+	if (type(raw_paths) != 'array' || length(raw_paths) > 128) {
+		release_lock();
+		reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'قائمة مسارات sysupgrade.conf غير صالحة' });
+		return;
+	}
+	let seen = {};
+	let clean_paths = [];
+	for (let item in raw_paths) {
+		let p = trim('' + item);
+		if (p == '' || substr(p, 0, 1) == '#') continue;
+		if (!nms_archive.is_safe_sysupgrade_path(p)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'مسار غير مسموح به في sysupgrade.conf: ' + p });
+			return;
+		}
+		if (!seen[p]) {
+			seen[p] = true;
+			push(clean_paths, p);
+		}
+	}
+	let st_orig = fs.lstat(SYSUPGRADE_CONF_PATH);
+	if (st_orig && st_orig.type != 'file') {
+		release_lock();
+		reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: ملف sysupgrade.conf ليس ملفاً عادياً' });
+		return;
+	}
+	let existing_raw = '';
+	if (st_orig) {
+		existing_raw = fs.readfile(SYSUPGRADE_CONF_PATH);
+		if (existing_raw == null) {
+			release_lock();
+			audit_append(actor, 'sys_sysupgrade_conf_save', SYSUPGRADE_CONF_PATH, 'failed', 'Failed to read existing sysupgrade.conf');
+			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'تعذر قراءة ملف sysupgrade.conf الأصلي — تم الإيقاف لحماية المحتوى الأصلي' });
+			return;
+		}
+	}
+	let orig_mode = st_orig ? (st_orig.mode & 0o7777) : 0o644;
+	let orig_uid = st_orig ? st_orig.uid : null;
+	let orig_gid = st_orig ? st_orig.gid : null;
+	let body_txt = nms_archive.merge_sysupgrade_conf(existing_raw, clean_paths);
+	if (!atomic_write_or_reply(SYSUPGRADE_CONF_PATH, body_txt, orig_mode, orig_uid, orig_gid, actor, 'sys_sysupgrade_conf_save', reply_cb)) {
+		return;
+	}
+	let st_new = fs.lstat(SYSUPGRADE_CONF_PATH);
+	let verify_txt = fs.readfile(SYSUPGRADE_CONF_PATH);
+	if (!st_new || st_new.type != 'file' || (st_new.mode & 0o7777) != orig_mode ||
+	    (orig_uid != null && (st_new.uid != orig_uid || st_new.gid != orig_gid)) ||
+	    verify_txt != body_txt) {
+		let rb_ok = false;
+		if (st_orig) {
+			let rb_aw = atomic_write(SYSUPGRADE_CONF_PATH, existing_raw, orig_mode, orig_uid, orig_gid);
+			let st_rb = fs.lstat(SYSUPGRADE_CONF_PATH);
+			let rb_txt = fs.readfile(SYSUPGRADE_CONF_PATH);
+			rb_ok = rb_aw.ok && st_rb && st_rb.type == 'file' && (st_rb.mode & 0o7777) == orig_mode &&
+				(orig_uid == null || (st_rb.uid == orig_uid && st_rb.gid == orig_gid)) &&
+				rb_txt == existing_raw;
+		} else {
+			if (!fs.stat(SYSUPGRADE_CONF_PATH) || fs.unlink(SYSUPGRADE_CONF_PATH)) {
+				rb_ok = !fs.stat(SYSUPGRADE_CONF_PATH);
+			}
+		}
+		release_lock();
+		if (rb_ok) {
+			audit_append(actor, 'sys_sysupgrade_conf_save', SYSUPGRADE_CONF_PATH, 'rolled_back', 'Post-write verification failed; original restored');
+			reply_cb({ ok: false, error_code: 'INTERNAL', rolled_back: true, message_ar: 'فشل التحقق النهائي من ملف sysupgrade.conf وتمت استعادة النسخة الأصلية بنجاح' });
+		} else {
+			audit_append(actor, 'sys_sysupgrade_conf_save', SYSUPGRADE_CONF_PATH, 'rollback_failed', 'CRITICAL: post-write verification and rollback both failed');
+			reply_cb({ ok: false, error_code: 'INTERNAL', rolled_back: false, rollback_failed: true, message_ar: 'فشل حرج: فشل التحقق النهائي وفشل التراجع عن sysupgrade.conf' });
+		}
+		return;
+	}
+	release_lock();
+	audit_append(actor, 'sys_sysupgrade_conf_save', SYSUPGRADE_CONF_PATH, 'committed', 'entries=' + length(clean_paths));
+	reply_cb({ ok: true, path: SYSUPGRADE_CONF_PATH, entries: clean_paths, count: length(clean_paths), message_ar: 'تم حفظ إعدادات sysupgrade.conf بأمان مع الحفاظ على التعليقات' });
+}
+
+function handle_rollback_revert(base, meta, actor, reply_cb) {
+	let bak = fs.readfile(base + '.bak');
+	if (bak == null || !meta.cfg_path) {
+		release_lock();
+		audit_append(actor, 'rollback_revert', meta.kind || 'config', 'rollback_failed', 'Missing backup payload or target path');
+		reply_cb({ ok: false, error_code: 'INTERNAL', rollback_failed: true, message_ar: 'فشل التراجع: تعذر قراءة النسخة الاحتياطية (تم الإبقاء على ملفات الاستعادة)' });
+		return;
+	}
+	let aw = atomic_write(meta.cfg_path, bak, 0o644);
+	if (!aw.ok) {
+		release_lock();
+		audit_append(actor, 'rollback_revert', meta.kind || 'config', 'rollback_failed', sprintf('error=%s orig=%s tmp=%s', aw.error || '', aw.orig_error || '', aw.tmp_path || ''));
+		reply_cb({ ok: false, error_code: 'INTERNAL', rollback_failed: true, error: aw.error || 'write_failed', orig_error: aw.orig_error || '', cleanup_failed: !!aw.cleanup_failed, tmp_path: aw.cleanup_failed ? (aw.tmp_path || '') : '', message_ar: 'فشل التراجع أثناء كتابة الملف (تم الإبقاء على ملفات الاستعادة)' });
+		return;
+	}
+	let st_rb_cfg = fs.lstat(meta.cfg_path);
+	let cur_rb_cfg = fs.readfile(meta.cfg_path);
+	if (!st_rb_cfg || st_rb_cfg.type != 'file' || (st_rb_cfg.mode & 0o7777) != 0o644 || cur_rb_cfg != bak) {
+		release_lock();
+		audit_append(actor, 'rollback_revert', meta.kind || 'config', 'rollback_failed', 'Post-restore verification failed');
+		reply_cb({ ok: false, error_code: 'INTERNAL', rollback_failed: true, message_ar: 'فشل التحقق بعد التراجع (تم الإبقاء على ملفات الاستعادة)' });
+		return;
+	}
+	if (meta.reload_cmd) system(meta.reload_cmd + ' >/dev/null 2>&1');
+	fs.unlink(base + '.pending');
+	fs.unlink(base + '.bak');
+	release_lock();
+	audit_append(actor, 'rollback_revert', meta.kind || 'config', 'committed', 'Reverted pending change');
+	reply_cb({ ok: true, message_ar: 'تم التراجع عن التغيير واستعادة الإعداد السابق بنجاح' });
 }
 
 function adguard_sync_rule(action_type, rule_str, actor) {
@@ -2243,6 +2366,7 @@ function handle_rpc(req, reply_cb) {
 			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'يتطلب فك التجميد تأكيد مطابقة الحالة يدوياً' });
 			return;
 		}
+		emergency_freeze_state = null;
 		if (fs.stat(ETC_DIR + '/freeze.json')) fs.unlink(ETC_DIR + '/freeze.json');
 		audit_append(actor, 'freeze_clear', 'system', 'committed', 'Admin acknowledged reconciliation');
 		reply_cb({ ok: true, message_ar: 'تم رفع حالة التجميد بعد التحقق الإداري' });
@@ -2496,14 +2620,21 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 	let file_ok = rb_aw.ok && st_r && st_r.type == 'file' && (st_r.mode & 0o7777) == 0o600 && cur_r == snap_raw;
 	apply_bridge_block_rules(prev_rules, function(rb) {
 		let all_ok = file_ok && rb.ok;
+		let fr = null;
 		if (!all_ok) {
-			let f_aw = atomic_write(ETC_DIR + '/freeze.json', sprintf('%J\n', { frozen: true, reason: reason_prefix + ' rollback failed', ts: now_iso() }), 0o600);
-			if (!f_aw.ok) warn('CRITICAL: failed to persist freeze.json\n');
-			audit_append(actor, verb, target_id, 'rollback_failed', sprintf('file_ok=%s apply_ok=%s err=%s', file_ok ? '1' : '0', rb.ok ? '1' : '0', rb_aw.error || ''));
+			fr = enter_emergency_freeze(reason_prefix + ' rollback failed');
+			audit_append(actor, verb, target_id, 'rollback_failed', sprintf('file_ok=%s apply_ok=%s err=%s freeze_persisted=%s', file_ok ? '1' : '0', rb.ok ? '1' : '0', rb_aw.error || '', fr.freeze_persisted ? '1' : '0'));
 		} else {
 			audit_append(actor, verb, target_id, 'rolled_back', 'Persisted client rules file and applied firewall state verified');
 		}
-		cb({ all_ok: all_ok, file_ok: file_ok, apply_ok: !!rb.ok, rb_aw: rb_aw });
+		cb({
+			all_ok: all_ok,
+			file_ok: file_ok,
+			apply_ok: !!rb.ok,
+			rb_aw: rb_aw,
+			freeze_persisted: fr ? fr.freeze_persisted : false,
+			freeze_persist_failed: fr ? fr.freeze_persist_failed : false
+		});
 	});
 }
 
@@ -2545,6 +2676,8 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 						error_code: 'INTERNAL',
 						rolled_back: rb.all_ok,
 						rollback_failed: !rb.all_ok,
+						freeze_persisted: rb.freeze_persisted,
+						freeze_persist_failed: rb.freeze_persist_failed,
 						message_ar: rb.all_ok ? 'تعذر تطبيق الحظر وتم التراجع تلقائياً والتحقق منه' : 'فشل حرج: تعذر تطبيق الحظر وفشل التراجع — تم تجميد التعديلات'
 					});
 				});
@@ -2560,6 +2693,8 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 							error_code: 'INTERNAL',
 							rolled_back: rb.all_ok,
 							rollback_failed: !rb.all_ok,
+							freeze_persisted: rb.freeze_persisted,
+							freeze_persist_failed: rb.freeze_persist_failed,
 							message_ar: rb.all_ok ? 'فشل التحقق من قاعدة الحظر وتم التراجع والتحقق منه' : 'فشل حرج: فشل التحقق وفشل التراجع — تم تجميد التعديلات'
 						});
 					});
@@ -2637,6 +2772,8 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 						error_code: 'INTERNAL',
 						rolled_back: rb.all_ok,
 						rollback_failed: !rb.all_ok,
+						freeze_persisted: rb.freeze_persisted,
+						freeze_persist_failed: rb.freeze_persist_failed,
 						message_ar: rb.all_ok ? 'تعذر تطبيق قاعدة حد السرعة وتم التراجع والتحقق منه' : 'فشل حرج: تعذر تطبيق حد السرعة وفشل التراجع — تم تجميد التعديلات'
 					});
 				});
@@ -3762,81 +3899,7 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 	}
 
 	if (verb == 'sys_sysupgrade_conf_save') {
-		let raw_paths = params.paths;
-		if (type(raw_paths) != 'array' || length(raw_paths) > 128) {
-			release_lock();
-			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'قائمة مسارات sysupgrade.conf غير صالحة' });
-			return;
-		}
-		let seen = {};
-		let clean_paths = [];
-		for (let item in raw_paths) {
-			let p = trim('' + item);
-			if (p == '' || substr(p, 0, 1) == '#') continue;
-			if (!nms_archive.is_safe_sysupgrade_path(p)) {
-				release_lock();
-				reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'مسار غير مسموح به في sysupgrade.conf: ' + p });
-				return;
-			}
-			if (!seen[p]) {
-				seen[p] = true;
-				push(clean_paths, p);
-			}
-		}
-		let st_orig = fs.lstat(SYSUPGRADE_CONF_PATH);
-		if (st_orig && st_orig.type != 'file') {
-			release_lock();
-			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: ملف sysupgrade.conf ليس ملفاً عادياً' });
-			return;
-		}
-		let existing_raw = '';
-		if (st_orig) {
-			existing_raw = fs.readfile(SYSUPGRADE_CONF_PATH);
-			if (existing_raw == null) {
-				release_lock();
-				audit_append(actor, 'sys_sysupgrade_conf_save', SYSUPGRADE_CONF_PATH, 'failed', 'Failed to read existing sysupgrade.conf');
-				reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'تعذر قراءة ملف sysupgrade.conf الأصلي — تم الإيقاف لحماية المحتوى الأصلي' });
-				return;
-			}
-		}
-		let orig_mode = st_orig ? (st_orig.mode & 0o7777) : 0o644;
-		let orig_uid = st_orig ? st_orig.uid : null;
-		let orig_gid = st_orig ? st_orig.gid : null;
-		let body_txt = nms_archive.merge_sysupgrade_conf(existing_raw, clean_paths);
-		if (!atomic_write_or_reply(SYSUPGRADE_CONF_PATH, body_txt, orig_mode, orig_uid, orig_gid, actor, 'sys_sysupgrade_conf_save', reply_cb)) {
-			return;
-		}
-		let st_new = fs.lstat(SYSUPGRADE_CONF_PATH);
-		let verify_txt = fs.readfile(SYSUPGRADE_CONF_PATH);
-		if (!st_new || st_new.type != 'file' || (st_new.mode & 0o7777) != orig_mode ||
-		    (orig_uid != null && (st_new.uid != orig_uid || st_new.gid != orig_gid)) ||
-		    verify_txt != body_txt) {
-			let rb_ok = false;
-			if (st_orig) {
-				let rb_aw = atomic_write(SYSUPGRADE_CONF_PATH, existing_raw, orig_mode, orig_uid, orig_gid);
-				let st_rb = fs.lstat(SYSUPGRADE_CONF_PATH);
-				let rb_txt = fs.readfile(SYSUPGRADE_CONF_PATH);
-				rb_ok = rb_aw.ok && st_rb && st_rb.type == 'file' && (st_rb.mode & 0o7777) == orig_mode &&
-					(orig_uid == null || (st_rb.uid == orig_uid && st_rb.gid == orig_gid)) &&
-					rb_txt == existing_raw;
-			} else {
-				if (!fs.stat(SYSUPGRADE_CONF_PATH) || fs.unlink(SYSUPGRADE_CONF_PATH)) {
-					rb_ok = !fs.stat(SYSUPGRADE_CONF_PATH);
-				}
-			}
-			release_lock();
-			if (rb_ok) {
-				audit_append(actor, 'sys_sysupgrade_conf_save', SYSUPGRADE_CONF_PATH, 'rolled_back', 'Post-write verification failed; original restored');
-				reply_cb({ ok: false, error_code: 'INTERNAL', rolled_back: true, message_ar: 'فشل التحقق النهائي من ملف sysupgrade.conf وتمت استعادة النسخة الأصلية بنجاح' });
-			} else {
-				audit_append(actor, 'sys_sysupgrade_conf_save', SYSUPGRADE_CONF_PATH, 'rollback_failed', 'CRITICAL: post-write verification and rollback both failed');
-				reply_cb({ ok: false, error_code: 'INTERNAL', rolled_back: false, rollback_failed: true, message_ar: 'فشل حرج: فشل التحقق النهائي وفشل التراجع عن sysupgrade.conf' });
-			}
-			return;
-		}
-		release_lock();
-		audit_append(actor, 'sys_sysupgrade_conf_save', SYSUPGRADE_CONF_PATH, 'committed', 'entries=' + length(clean_paths));
-		reply_cb({ ok: true, path: SYSUPGRADE_CONF_PATH, entries: clean_paths, count: length(clean_paths), message_ar: 'تم حفظ إعدادات sysupgrade.conf بأمان مع الحفاظ على التعليقات' });
+		handle_sys_sysupgrade_conf_save(params, actor, reply_cb);
 		return;
 	}
 
@@ -3960,28 +4023,7 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 			reply_cb({ ok: true, message_ar: 'تم اعتماد التغيير بشكل دائم' });
 			return;
 		}
-		let bak = fs.readfile(base + '.bak');
-		if (bak == null || !meta.cfg_path) {
-			release_lock();
-			audit_append(actor, 'rollback_revert', meta.kind || 'config', 'rollback_failed', 'Missing backup payload or target path');
-			reply_cb({ ok: false, error_code: 'INTERNAL', rollback_failed: true, message_ar: 'فشل التراجع: تعذر قراءة النسخة الاحتياطية (تم الإبقاء على ملفات الاستعادة)' });
-			return;
-		}
-		if (!atomic_write_or_reply(meta.cfg_path, bak, 0o644, null, null, actor, 'rollback_revert', reply_cb)) return;
-		let st_rb_cfg = fs.lstat(meta.cfg_path);
-		let cur_rb_cfg = fs.readfile(meta.cfg_path);
-		if (!st_rb_cfg || st_rb_cfg.type != 'file' || (st_rb_cfg.mode & 0o7777) != 0o644 || cur_rb_cfg != bak) {
-			release_lock();
-			audit_append(actor, 'rollback_revert', meta.kind || 'config', 'rollback_failed', 'Post-restore verification failed');
-			reply_cb({ ok: false, error_code: 'INTERNAL', rollback_failed: true, message_ar: 'فشل التحقق بعد التراجع (تم الإبقاء على ملفات الاستعادة)' });
-			return;
-		}
-		if (meta.reload_cmd) system(meta.reload_cmd + ' >/dev/null 2>&1');
-		fs.unlink(base + '.pending');
-		fs.unlink(base + '.bak');
-		release_lock();
-		audit_append(actor, 'rollback_revert', meta.kind || 'config', 'committed', 'Reverted pending change');
-		reply_cb({ ok: true, message_ar: 'تم التراجع عن التغيير واستعادة الإعداد السابق بنجاح' });
+		handle_rollback_revert(base, meta, actor, reply_cb);
 		return;
 	}
 
