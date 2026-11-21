@@ -1565,7 +1565,7 @@ function handle_phase3c_verb(verb, params, actor, reply_cb, p3c_env) {
 						})();
 						let ch_dfs = nms_fw_wifi.parse_iw_phy_channels_dfs(ch_out);
 						let c_entry = rt_channel != '' ? ch_dfs[rt_channel] : null;
-						let dfs_eval = nms_fw_wifi.evaluate_dfs_runtime_state(hst, c_entry, rt_channel, rt_freq);
+						let dfs_eval = nms_fw_wifi.evaluate_dfs_runtime_state(hst, c_entry, rt_channel, rt_freq, resolved_phy);
 						dfs_verified = dfs_eval.ok === true;
 						if (!dfs_verified) dfs_error = dfs_eval.error || 'لم يتم التحقق التشغيلي من اكتمال DFS/CAC';
 					}
