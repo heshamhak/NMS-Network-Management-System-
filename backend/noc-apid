@@ -11,8 +11,13 @@ const HELPER_SOCK = getenv('NOC_HELPER_SOCK') || '/tmp/noc-console/helper.sock';
 const RUN_DIR = getenv('NOC_RUN_DIR') || '/tmp/noc-console';
 const LEASES_PATH = getenv('NOC_LEASES_PATH') || '/tmp/dhcp.leases';
 const WEB_ROOT = getenv('NOC_WEB_ROOT') || '/www';
+const BIND_HOST = getenv('NOC_BIND_HOST') || '';
 const BIND_PORT = +(getenv('NOC_HTTP_PORT') || 8780);
-const TLS_ACTIVE = getenv('NOC_TLS_ACTIVE') == '1';
+const HTTPS_PORT = +(getenv('NOC_HTTPS_PORT') || 8743);
+const TLS_CERT_PATH = getenv('NOC_TLS_CERT') || '/etc/noc-console/tls.crt';
+const TLS_KEY_PATH = getenv('NOC_TLS_KEY') || '/etc/noc-console/tls.key';
+// SEC-01: Never enable TLS_ACTIVE / Secure cookies from a flag alone; require loopback bind + verified TLS terminator + cert/key
+const TLS_ACTIVE = (getenv('NOC_TLS_VERIFIED') == '1') && (BIND_HOST == '127.0.0.1') && !!fs.stat(TLS_CERT_PATH) && !!fs.stat(TLS_KEY_PATH);
 const STAGING_MODE = getenv('NOC_STAGING_MODE') == '1';
 
 const MAX_HEADER_BYTES = 8192;
@@ -777,11 +782,13 @@ function is_origin_allowed(headers, require_present) {
 	let hn = get_sys_hostname();
 	let allowed = {};
 	allowed[sprintf('http://%s:%d', lan, BIND_PORT)] = true;
-	allowed[sprintf('https://%s:%d', lan, BIND_PORT)] = true;
 	allowed[sprintf('http://%s:%d', hn, BIND_PORT)] = true;
-	allowed[sprintf('https://%s:%d', hn, BIND_PORT)] = true;
 	allowed[sprintf('http://%s.lan:%d', hn, BIND_PORT)] = true;
-	allowed[sprintf('https://%s.lan:%d', hn, BIND_PORT)] = true;
+	if (TLS_ACTIVE) {
+		allowed[sprintf('https://%s:%d', lan, HTTPS_PORT)] = true;
+		allowed[sprintf('https://%s:%d', hn, HTTPS_PORT)] = true;
+		allowed[sprintf('https://%s.lan:%d', hn, HTTPS_PORT)] = true;
+	}
 	if (STAGING_MODE) {
 		allowed[sprintf('http://127.0.0.1:%d', BIND_PORT)] = true;
 		allowed[sprintf('http://localhost:%d', BIND_PORT)] = true;
@@ -1098,6 +1105,9 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 		let cur_s = get_session(headers);
 		call_helper('auth_status', {}, 'preauth', remote_ip, function(res) {
 			res.authenticated = !!cur_s;
+			res.tls_active = TLS_ACTIVE;
+			res.transport = TLS_ACTIVE ? 'https_tls' : 'http_lan_only';
+			res.https_port = HTTPS_PORT;
 			if (cur_s) {
 				res.username = cur_s.username;
 				res.role = cur_s.role;
@@ -1874,7 +1884,7 @@ let http_handle = null;
 let bind_retry_timer = null;
 
 function start_http_server(attempt) {
-	let lan_ip = get_lan_ip();
+	let lan_ip = (BIND_HOST != '') ? BIND_HOST : get_lan_ip();
 	let sa = sock.sockaddr({ address: lan_ip, port: BIND_PORT });
 	let s = sock.create(sock.AF_INET, sock.SOCK_STREAM);
 	let bound = false;

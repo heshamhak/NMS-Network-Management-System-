@@ -7,20 +7,21 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-GATEWAY = os.environ.get("NOC_GATEWAY", "root@192.168.1.1")
+LIVE_MODE = "--live" in sys.argv
+GATEWAY = os.environ.get("NOC_GATEWAY", "")
 
 SHIPPED_FILES = [
-    "index.html",
-    "launcher_index.html",
-    "styles.css",
-    "app.js",
-    "noc-helperd",
-    "noc-apid",
-    "pro-api",
+    "frontend/index.html",
+    "frontend/launcher_index.html",
+    "frontend/styles.css",
+    "frontend/app.js",
+    "frontend/nms-i18n.js",
+    "backend/noc-helperd",
+    "backend/noc-apid",
     "init.d/noc-helperd",
     "init.d/noc-apid",
     "schemas/noc_schemas.json",
-    "glossary_ar.json",
+    "frontend/glossary_ar.json",
 ]
 
 failures = []
@@ -36,11 +37,11 @@ def fail(msg):
 
 # 1. JS syntax + CSS / Brand / Emoji / CSP Hygiene
 print("=== Phase 1: Static Hygiene, CSP, Brand & Emoji Checks ===")
-rc = subprocess.run(["node", "--check", os.path.join(ROOT, "app.js")], capture_output=True, text=True)
+rc = subprocess.run(["node", "--check", os.path.join(ROOT, "frontend/app.js")], capture_output=True, text=True)
 if rc.returncode == 0:
-    ok("node --check app.js syntax valid")
+    ok("node --check frontend/app.js syntax valid")
 else:
-    fail(f"node --check app.js failed: {rc.stderr}")
+    fail(f"node --check frontend/app.js failed: {rc.stderr}")
 
 emoji_re = re.compile(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]")
 banned_word = base64.b64decode("b3BlbndydA==").decode("ascii")
@@ -67,7 +68,7 @@ if os.path.exists(p1_report):
     else:
         ok("P1_forensic_baseline_report.md: 0 emojis")
 
-for html_rel in ("index.html", "launcher_index.html"):
+for html_rel in ("frontend/index.html", "frontend/launcher_index.html"):
     htxt = open(os.path.join(ROOT, html_rel), "r", encoding="utf-8").read()
     if re.search(r"https?://|googleapis|gstatic", htxt, re.I):
         fail(f"External URL/CDN link found in {html_rel}")
@@ -78,14 +79,14 @@ for html_rel in ("index.html", "launcher_index.html"):
     else:
         ok(f"{html_rel}: 0 inline JS event attributes")
 
-index_txt = open(os.path.join(ROOT, "index.html"), "r", encoding="utf-8").read()
+index_txt = open(os.path.join(ROOT, "frontend/index.html"), "r", encoding="utf-8").read()
 inline_scripts = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>", index_txt, re.I)
 if inline_scripts:
     fail(f"Inline <script> tag found in index.html: {inline_scripts}")
 else:
     ok("index.html: strict script-src 'self' compatible (no inline scripts)")
 
-app_txt = open(os.path.join(ROOT, "app.js"), "r", encoding="utf-8").read()
+app_txt = open(os.path.join(ROOT, "frontend/app.js"), "r", encoding="utf-8").read()
 if ".innerHTML" in app_txt or "eval(" in app_txt or "new Function" in app_txt:
     fail("Unsafe DOM/eval pattern found in app.js")
 else:
@@ -125,7 +126,7 @@ for fg, bg, thresh, desc in pairs:
     else:
         fail(f"WCAG contrast too low for {desc}: {r:.2f}:1 < {thresh}:1")
 
-css_txt = open(os.path.join(ROOT, "styles.css"), "r", encoding="utf-8").read()
+css_txt = open(os.path.join(ROOT, "frontend/styles.css"), "r", encoding="utf-8").read()
 css_clean = re.sub(r"/\*.*?\*/", "", css_txt, flags=re.S)
 allowed_blue_lines = ["--ctrl-active", "--ctrl-primary", "--ctrl-hover", "#2563eb", "#3b82f6", "#1d4ed8"]
 for m in re.finditer(r"([^{}]+)\{([^{}]+)\}", css_clean):
@@ -168,7 +169,7 @@ if (accept({ boot_id: 'bootA', resource: 'overview', seq: 6 }, 0) !== 'STALE_EPO
 if (accept({ boot_id: 'bootB', resource: 'overview', seq: 1 }, 1) !== 'ACCEPT') process.exit(5);
 console.log('SPLINE_AND_P13_OK');
 """
-r_spline = subprocess.run(["node", "-e", node_spline_test, os.path.join(ROOT, "app.js")], capture_output=True, text=True)
+r_spline = subprocess.run(["node", "-e", node_spline_test, os.path.join(ROOT, "frontend/app.js")], capture_output=True, text=True)
 if r_spline.returncode == 0 and "SPLINE_AND_P13_OK" in r_spline.stdout:
     ok("Fritsch-Carlson spline zero-overshoot & P13 boot_id/seq/epoch checks passed")
 else:
@@ -177,7 +178,7 @@ else:
 # 4. Schema Consistency Self-Check
 print("=== Phase 4: Canonical JSON Schema & Glossary Consistency ===")
 schema = json.load(open(os.path.join(ROOT, "schemas/noc_schemas.json"), "r", encoding="utf-8"))
-glossary = json.load(open(os.path.join(ROOT, "glossary_ar.json"), "r", encoding="utf-8"))
+glossary = json.load(open(os.path.join(ROOT, "frontend/glossary_ar.json"), "r", encoding="utf-8"))
 req_resources = {"overview", "adguard", "clients", "network", "sqm", "firewall", "docker", "tailscale", "services", "diagnostics", "auth"}
 schema_res = set(schema["$defs"]["ResourceEnum"]["enum"])
 if req_resources.issubset(schema_res):
@@ -419,6 +420,11 @@ chmod 0600 /tmp/noc_p15_stage/etc/staging.attestation
 touch /tmp/noc_p15_stage/leases
 """
 
+if not (LIVE_MODE and GATEWAY):
+    print("[SKIP] Live gateway staging skipped (pass --live with NOC_GATEWAY=user@host to run)")
+    print(f"\n=== SUMMARY: {len(passes)} passed, {len(failures)} failed ===")
+    sys.exit(1 if failures else 0)
+
 subprocess.run(["ssh", "-o", "BatchMode=yes", GATEWAY, remote_cmd], check=True)
 
 stage_run_sh = """#!/bin/sh
@@ -484,11 +490,11 @@ with tempfile.TemporaryDirectory() as td:
     os.chmod(sh_p, 0o755)
     subprocess.run(
         ["scp", "-q", "-O",
-         os.path.join(ROOT, "noc-helperd"),
-         os.path.join(ROOT, "noc-apid"),
-         os.path.join(ROOT, "index.html"),
-         os.path.join(ROOT, "styles.css"),
-         os.path.join(ROOT, "app.js"),
+         os.path.join(ROOT, "backend/noc-helperd"),
+         os.path.join(ROOT, "backend/noc-apid"),
+         os.path.join(ROOT, "frontend/index.html"),
+         os.path.join(ROOT, "frontend/styles.css"),
+         os.path.join(ROOT, "frontend/app.js"),
          drv_p, sh_p, pc_p,
          f"{GATEWAY}:/tmp/noc_p15_stage/"],
         check=True
