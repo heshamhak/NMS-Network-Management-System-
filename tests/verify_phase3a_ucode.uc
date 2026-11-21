@@ -303,10 +303,42 @@ let spy_after_muts = helperd_aw.spy_mutations;
 let fc_bad_reply = null;
 helperd_aw.enforce_mutation_gate('freeze_clear', {}, 'admin', function(r) { fc_bad_reply = r; });
 let frz_still_active = helperd_aw.get_freeze_state().frozen === true;
-// Attempt freeze_clear with explicit confirmation -> must succeed and lift freeze
+
+// Case B: Persistent removal failure (freeze.json is a directory so unlink fails) -> must fail, keep freeze active, no committed audit, reject subsequent mutations
+let audit_len_before_fc_fail = length(helperd_aw.test_audits);
+let fc_unlink_fail_reply = null;
+helperd_aw.enforce_mutation_gate('freeze_clear', { confirm_reconciled: true }, 'admin', function(r) { fc_unlink_fail_reply = r; });
+let fc_fail_audit = helperd_aw.test_audits[length(helperd_aw.test_audits) - 1];
+let post_fc_fail_mut1 = null;
+helperd_aw.enforce_mutation_gate('sys_sysupgrade_conf_save', { paths: ['/etc/noc-console/'] }, 'admin', function(r) { post_fc_fail_mut1 = r; });
+let post_fc_fail_mut2 = null;
+helperd_aw.enforce_mutation_gate('sys_reboot', { confirm: 'CONFIRM_REBOOT' }, 'admin', function(r) { post_fc_fail_mut2 = r; });
+check(
+	fc_unlink_fail_reply != null && !fc_unlink_fail_reply.ok && fc_unlink_fail_reply.freeze_clear_failed === true
+	&& !!fs.stat(frz_etc + '/freeze.json') && helperd_aw.get_freeze_state().frozen === true
+	&& length(helperd_aw.test_audits) > audit_len_before_fc_fail && fc_fail_audit.action == 'freeze_clear' && fc_fail_audit.result == 'failed'
+	&& post_fc_fail_mut1 != null && post_fc_fail_mut1.status == 409 && post_fc_fail_mut2 != null && post_fc_fail_mut2.status == 409,
+	'P3A-HELPERD[freeze_clear_unlink_fail_preserves_freeze_and_blocks_mutations]',
+	sprintf('fc_fail=%J audit=%J m1=%J m2=%J', fc_unlink_fail_reply, fc_fail_audit, post_fc_fail_mut1, post_fc_fail_mut2)
+);
+
+// Case C: No persistent freeze file -> confirmed freeze_clear clears in-memory state
+fs.rmdir(frz_etc + '/freeze.json');
 let fc_ok_reply = null;
 helperd_aw.enforce_mutation_gate('freeze_clear', { confirm_reconciled: true }, 'admin', function(r) { fc_ok_reply = r; });
 let frz_cleared = helperd_aw.get_freeze_state().frozen === false;
+
+// Case A: Persistent freeze.json exists and unlink succeeds -> file removed, in-memory cleared, committed audit recorded
+helperd_aw.enter_emergency_freeze('test_persistent_clear');
+let fc_pers_ok_reply = null;
+helperd_aw.enforce_mutation_gate('freeze_clear', { confirm_reconciled: true }, 'admin', function(r) { fc_pers_ok_reply = r; });
+let fc_pers_audit = helperd_aw.test_audits[length(helperd_aw.test_audits) - 1];
+check(
+	fc_pers_ok_reply != null && fc_pers_ok_reply.ok === true && !fs.stat(frz_etc + '/freeze.json')
+	&& helperd_aw.get_freeze_state().frozen === false && fc_pers_audit.action == 'freeze_clear' && fc_pers_audit.result == 'committed',
+	'P3A-HELPERD[freeze_clear_persistent_ok_verified]',
+	sprintf('reply=%J audit=%J', fc_pers_ok_reply, fc_pers_audit)
+);
 
 check(
 	fw_frz_res != null && !fw_frz_res.ok && fw_frz_res.rollback_failed === true && fw_frz_res.freeze_persist_failed === true && fw_frz_res.freeze_persisted === false

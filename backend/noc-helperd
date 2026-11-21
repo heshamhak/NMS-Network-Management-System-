@@ -485,8 +485,21 @@ function enforce_mutation_gate(verb, params, actor, reply_cb) {
 			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'يتطلب فك التجميد تأكيد مطابقة الحالة يدوياً' });
 			return false;
 		}
+		let frz_path = ETC_DIR + '/freeze.json';
+		if (fs.stat(frz_path)) {
+			if (!fs.unlink(frz_path) || fs.stat(frz_path)) {
+				audit_append(actor, 'freeze_clear', 'system', 'failed', 'Failed to remove persistent freeze.json');
+				reply_cb({ ok: false, error_code: 'INTERNAL', freeze_clear_failed: true, message_ar: 'فشل حذف ملف التجميد الدائم freeze.json — تم الإبقاء على حالة التجميد' });
+				return false;
+			}
+		}
 		emergency_freeze_state = null;
-		if (fs.stat(ETC_DIR + '/freeze.json')) fs.unlink(ETC_DIR + '/freeze.json');
+		let post_st = get_freeze_state();
+		if (post_st && post_st.frozen) {
+			audit_append(actor, 'freeze_clear', 'system', 'failed', 'Post-clear freeze verification remained frozen');
+			reply_cb({ ok: false, error_code: 'INTERNAL', freeze_clear_failed: true, message_ar: 'فشل التحقق من رفع حالة التجميد' });
+			return false;
+		}
 		audit_append(actor, 'freeze_clear', 'system', 'committed', 'Admin acknowledged reconciliation');
 		reply_cb({ ok: true, message_ar: 'تم رفع حالة التجميد بعد التحقق الإداري' });
 		return false;
