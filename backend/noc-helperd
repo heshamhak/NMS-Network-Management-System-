@@ -1552,6 +1552,7 @@ function handle_phase3c_verb(verb, params, actor, reply_cb, p3c_env) {
 					}
 
 					let dfs_verified = false;
+					let dfs_error = '';
 					if (params.dfs && is_up && ifname != '' && resolved_phy != '') {
 						let hst = call_ubus('hostapd.' + ifname, 'get_status');
 						let ch_out = env.exec_iw_phy_channels ? env.exec_iw_phy_channels(resolved_phy) : (function() {
@@ -1564,11 +1565,11 @@ function handle_phase3c_verb(verb, params, actor, reply_cb, p3c_env) {
 						})();
 						let ch_dfs = nms_fw_wifi.parse_iw_phy_channels_dfs(ch_out);
 						let c_entry = rt_channel != '' ? ch_dfs[rt_channel] : null;
-						let phy_dfs_ok = !!(c_entry && c_entry.radar && (c_entry.dfs_state == 'available' || c_entry.dfs_state == 'usable'));
-						let hostapd_dfs_ok = !!(hst && (hst.status == 'ENABLED' || hst.status == 'DFS') && (hst.cac_time_seconds != null || hst.status == 'DFS'));
-						if (phy_dfs_ok && hostapd_dfs_ok) dfs_verified = true;
+						let dfs_eval = nms_fw_wifi.evaluate_dfs_runtime_state(hst, c_entry, rt_channel, rt_freq);
+						dfs_verified = dfs_eval.ok === true;
+						if (!dfs_verified) dfs_error = dfs_eval.error || 'لم يتم التحقق التشغيلي من اكتمال DFS/CAC';
 					}
-					return { up: is_up, country: rt_country, channel: rt_channel, freq: rt_freq, dfs_verified: dfs_verified };
+					return { up: is_up, country: rt_country, channel: rt_channel, freq: rt_freq, dfs_verified: dfs_verified, dfs_error: dfs_error };
 				})();
 				if (!rt || type(rt.up) != 'bool') return { ok: false, error: 'تعذر التحقق من حالة الراديو الفعلية بعد إعادة التحميل' };
 				let exp_up = !params.disabled;
@@ -1584,7 +1585,7 @@ function handle_phase3c_verb(verb, params, actor, reply_cb, p3c_env) {
 						return { ok: false, error: 'القناة الفعلية على الراديو لا تطابق المطلوب' };
 					}
 					if (params.dfs && rt.dfs_verified !== true) {
-						return { ok: false, error: 'لم يتم التحقق التشغيلي من حالة DFS/CAC الفعلية على الراديو' };
+						return { ok: false, error: rt.dfs_error || 'لم يتم التحقق التشغيلي من حالة DFS/CAC الفعلية على الراديو' };
 					}
 				}
 			} else if (verb == 'wifi_iface_save') {

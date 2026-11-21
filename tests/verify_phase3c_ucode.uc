@@ -218,6 +218,43 @@ let r_dfs_unver = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', chan
 });
 check(!r_dfs_unver.ok && r_dfs_unver.rolled_back === true && fs.readfile(uci_dir + '/wireless') == snap_wf_rt, 'P3C-RT[reject_configured_dfs_without_operational_dfs_evidence]', sprintf('%J', r_dfs_unver));
 
+// DFS CAC in progress (hostapd status=DFS, cac_time_left_seconds=42, iw DFS state: usable) -> MUST roll back!
+let r_dfs_cac_prog = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 20, dfs: true, disabled: false }, {
+	ubus_call: function(obj, method) {
+		if (obj == 'network.wireless' && method == 'status') return { radio1: { up: true, interfaces: [{ section: 'guest_5g', ifname: 'phy2-ap0' }] } };
+		if (obj == 'hostapd.phy2-ap0' && method == 'get_status') return { status: 'DFS', freq: 5500, channel: 100, cac_time_seconds: 60, cac_time_left_seconds: 42 };
+		return null;
+	},
+	exec_iw_phy_channels: function() { return "Band 2:\n\t* 5500.0 MHz [100] (20.0 dBm) (radar detection)\n\t  DFS state: usable\n"; }
+});
+check(!r_dfs_cac_prog.ok && r_dfs_cac_prog.rolled_back === true && fs.readfile(uci_dir + '/wireless') == snap_wf_rt, 'P3C-DFS[reject_cac_in_progress_status_dfs_and_usable]', sprintf('%J', r_dfs_cac_prog));
+
+// DFS state: usable even if hostapd reports ENABLED -> MUST roll back!
+let r_dfs_usable = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 20, dfs: true, disabled: false }, {
+	exec_iw_phy_channels: function() { return "Band 2:\n\t* 5500.0 MHz [100] (20.0 dBm) (radar detection)\n\t  DFS state: usable\n"; }
+});
+check(!r_dfs_usable.ok && r_dfs_usable.rolled_back === true && fs.readfile(uci_dir + '/wireless') == snap_wf_rt, 'P3C-DFS[reject_usable_even_when_hostapd_enabled]', sprintf('%J', r_dfs_usable));
+
+// Missing cac_time_left_seconds (even with status=ENABLED and cac_time_seconds=60) -> MUST roll back!
+let r_dfs_no_left = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 20, dfs: true, disabled: false }, {
+	ubus_call: function(obj, method) {
+		if (obj == 'network.wireless' && method == 'status') return { radio1: { up: true, interfaces: [{ section: 'guest_5g', ifname: 'phy2-ap0' }] } };
+		if (obj == 'hostapd.phy2-ap0' && method == 'get_status') return { status: 'ENABLED', freq: 5500, channel: 100, cac_time_seconds: 60 };
+		return null;
+	}
+});
+check(!r_dfs_no_left.ok && r_dfs_no_left.rolled_back === true && fs.readfile(uci_dir + '/wireless') == snap_wf_rt, 'P3C-DFS[reject_missing_cac_time_left_seconds]', sprintf('%J', r_dfs_no_left));
+
+// Stale hostapd status (freq=5180 on ch 100) -> MUST roll back!
+let r_dfs_stale = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 20, dfs: true, disabled: false }, {
+	ubus_call: function(obj, method) {
+		if (obj == 'network.wireless' && method == 'status') return { radio1: { up: true, interfaces: [{ section: 'guest_5g', ifname: 'phy2-ap0' }] } };
+		if (obj == 'hostapd.phy2-ap0' && method == 'get_status') return { status: 'ENABLED', freq: 5180, channel: 36, cac_time_seconds: 60, cac_time_left_seconds: 0 };
+		return null;
+	}
+});
+check(!r_dfs_stale.ok && r_dfs_stale.rolled_back === true && fs.readfile(uci_dir + '/wireless') == snap_wf_rt, 'P3C-DFS[reject_stale_hostapd_freq_mismatch]', sprintf('%J', r_dfs_stale));
+
 // Missing runtime channel/country from iw dev / iw reg -> MUST roll back (never silently skipped)!
 let r_rt_missing = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 20, dfs: true, disabled: false }, {
 	exec_iw_dev: function() { return "Interface phy2-ap0\n\twiphy 2\n\ttype AP\n"; }

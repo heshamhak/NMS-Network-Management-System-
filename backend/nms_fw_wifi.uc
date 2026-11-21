@@ -301,6 +301,38 @@ export function parse_iw_phy_channels_dfs(iw_ch_out) {
 	return ch_dfs;
 };
 
+export function evaluate_dfs_runtime_state(hst, ch_entry, active_channel, active_freq) {
+	if (!ch_entry || ch_entry.disabled) {
+		return { ok: false, state: 'unverified', error: 'تعذر قراءة حالة قناة DFS من iw phy channels أو القناة معطلة' };
+	}
+	if (ch_entry.dfs_state == 'unavailable') {
+		return { ok: false, state: 'radar_unavailable', error: 'تم اكتشاف رادار أو القناة في حالة حظر (DFS state: unavailable)' };
+	}
+	if (!ch_entry.radar) {
+		return { ok: false, state: 'non_dfs', error: 'القناة النشطة لا تدعم كشف الرادار (non-DFS)' };
+	}
+	if (!hst || type(hst) != 'object') {
+		return { ok: false, state: 'unverified', error: 'تعذر قراءة حالة hostapd عبر ubus — التحقق من DFS غير مدعوم أو فاشل' };
+	}
+	if (hst.freq == null || +hst.freq <= 0) {
+		return { ok: false, state: 'unverified', error: 'حالة hostapd تفتقر إلى التردد الفعلي للتحقق من عدم تقادمها' };
+	}
+	let exp_freq = (active_freq && +active_freq > 0) ? +active_freq : +ch_entry.freq;
+	if (+hst.freq != exp_freq) {
+		return { ok: false, state: 'stale_mismatch', error: sprintf('عدم تطابق تردد hostapd (%d) مع القناة الفعلية (%d)', +hst.freq, exp_freq) };
+	}
+	if (hst.channel != null && active_channel != '' && ('' + hst.channel) != ('' + active_channel)) {
+		return { ok: false, state: 'stale_mismatch', error: 'عدم تطابق قناة hostapd مع القناة الفعلية للراديو' };
+	}
+	if (hst.status == 'DFS' || (hst.cac_time_left_seconds != null && +hst.cac_time_left_seconds > 0) || ch_entry.dfs_state == 'usable') {
+		return { ok: false, state: 'cac_in_progress', error: 'فحص الرادار (DFS CAC) ما زال جارياً أو لم يكتمل بعد' };
+	}
+	if (hst.status != 'ENABLED' || ch_entry.dfs_state != 'available' || hst.cac_time_seconds == null || +hst.cac_time_seconds <= 0 || hst.cac_time_left_seconds === null || hst.cac_time_left_seconds === '' || +hst.cac_time_left_seconds !== 0) {
+		return { ok: false, state: 'unverified', error: 'بيانات اكتمال DFS/CAC غير مكتملة أو متناقضة — تم الرفض الآمن' };
+	}
+	return { ok: true, state: 'cac_completed' };
+};
+
 export function validate_wifi_radio_against_caps(cfg, parsed_caps) {
 	let base = validate_wifi_radio_cfg(cfg);
 	if (!base.ok) return base;
