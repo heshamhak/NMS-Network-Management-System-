@@ -470,6 +470,41 @@ function enter_emergency_freeze(reason) {
 	return { frozen: true, freeze_persisted: !!f_aw.ok, freeze_persist_failed: !f_aw.ok, f_aw: f_aw };
 }
 
+function enforce_mutation_gate(verb, params, actor, reply_cb) {
+	let stg = check_staging_guard();
+	if (!stg.ok) { reply_cb(stg); return false; }
+
+	let stor = check_storage_budget();
+	if (!stor.ok && verb != 'freeze_clear') {
+		reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'المساحة المتاحة غير كافية لضمان سجل التراجع والتدقيق الآمن' });
+		return false;
+	}
+
+	if (verb == 'freeze_clear') {
+		if (!params.confirm_reconciled) {
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'يتطلب فك التجميد تأكيد مطابقة الحالة يدوياً' });
+			return false;
+		}
+		emergency_freeze_state = null;
+		if (fs.stat(ETC_DIR + '/freeze.json')) fs.unlink(ETC_DIR + '/freeze.json');
+		audit_append(actor, 'freeze_clear', 'system', 'committed', 'Admin acknowledged reconciliation');
+		reply_cb({ ok: true, message_ar: 'تم رفع حالة التجميد بعد التحقق الإداري' });
+		return false;
+	}
+
+	let freeze = get_freeze_state();
+	if (freeze.frozen) {
+		reply_cb({ ok: false, status: 409, error_code: 'VALIDATION', message_ar: 'جميع التعديلات مجمدة حالياً بسبب فشل استرجاع سابق — يتطلب مراجعة المدير' });
+		return false;
+	}
+
+	if (!acquire_lock(actor, verb).ok) {
+		reply_cb({ ok: false, status: 409, error_code: 'VALIDATION', message_ar: 'توجد عملية تعديل أخرى قيد التنفيذ حالياً، يرجى الانتظار' });
+		return false;
+	}
+	return true;
+}
+
 function acquire_lock(owner, op) {
 	let lp = RUN_DIR + '/mutation.lock';
 	let now_m = now_mono_ms();
@@ -2352,35 +2387,7 @@ function handle_rpc(req, reply_cb) {
 		return;
 	}
 
-	let stg = check_staging_guard();
-	if (!stg.ok) { reply_cb(stg); return; }
-
-	let stor = check_storage_budget();
-	if (!stor.ok && verb != 'freeze_clear') {
-		reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'المساحة المتاحة غير كافية لضمان سجل التراجع والتدقيق الآمن' });
-		return;
-	}
-
-	if (verb == 'freeze_clear') {
-		if (!params.confirm_reconciled) {
-			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'يتطلب فك التجميد تأكيد مطابقة الحالة يدوياً' });
-			return;
-		}
-		emergency_freeze_state = null;
-		if (fs.stat(ETC_DIR + '/freeze.json')) fs.unlink(ETC_DIR + '/freeze.json');
-		audit_append(actor, 'freeze_clear', 'system', 'committed', 'Admin acknowledged reconciliation');
-		reply_cb({ ok: true, message_ar: 'تم رفع حالة التجميد بعد التحقق الإداري' });
-		return;
-	}
-
-	let freeze = get_freeze_state();
-	if (freeze.frozen) {
-		reply_cb({ ok: false, status: 409, error_code: 'VALIDATION', message_ar: 'جميع التعديلات مجمدة حالياً بسبب فشل استرجاع سابق — يتطلب مراجعة المدير' });
-		return;
-	}
-
-	if (!acquire_lock(actor, verb).ok) {
-		reply_cb({ ok: false, status: 409, error_code: 'VALIDATION', message_ar: 'توجد عملية تعديل أخرى قيد التنفيذ حالياً، يرجى الانتظار' });
+	if (!enforce_mutation_gate(verb, params, actor, reply_cb)) {
 		return;
 	}
 

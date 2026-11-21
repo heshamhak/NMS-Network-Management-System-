@@ -276,12 +276,12 @@ check(
 	sprintf('reply=%J mutations=%d', su_reply, helperd_aw.spy_mutations)
 );
 
-// 9. Fail-safe in-memory freeze when freeze.json persistence fails -> subsequent mutations blocked & freeze_persist_failed reported
+// 9. Fail-safe in-memory freeze when freeze.json persistence fails -> subsequent privileged mutations rejected!
 let frz_etc = vec_dir + '/frz_fail_etc';
 fs.mkdir(frz_etc);
 fs.mkdir(frz_etc + '/freeze.json'); // directory obstruction causes atomic_write(freeze.json) rename to fail!
 helperd_aw.clear_freeze_mem();
-helperd_aw.set_mock({ ok: false }, { ok: true }, frz_etc, null, null);
+helperd_aw.set_mock({ ok: false }, { ok: true }, frz_etc, su_path, null);
 fs.unlink(fw_cfg);
 fs.mkdir(fw_cfg);
 let fw_frz_res = null;
@@ -289,12 +289,35 @@ helperd_aw.fw_check_and_reload('GOOD_FW\n', function(r) { fw_frz_res = r; });
 fs.rmdir(fw_cfg);
 if (orig_fw != null) fs.writefile(fw_cfg, orig_fw);
 let frz_state_now = helperd_aw.get_freeze_state();
+
+// Attempt actual privileged mutations through production enforce_mutation_gate after freeze.json failed
+helperd_aw.set_mock({ ok: true }, { ok: true }, frz_etc, su_path, null);
+let mut1_reply = null;
+if (helperd_aw.enforce_mutation_gate('sys_sysupgrade_conf_save', { paths: ['/etc/noc-console/'] }, 'admin', function(r) { mut1_reply = r; })) {
+	helperd_aw.handle_sys_sysupgrade_conf_save({ paths: ['/etc/noc-console/'] }, 'admin', function(r) { mut1_reply = r; });
+}
+let mut2_reply = null;
+let mut2_allowed = helperd_aw.enforce_mutation_gate('sys_reboot', { confirm: 'CONFIRM_REBOOT' }, 'admin', function(r) { mut2_reply = r; });
+let spy_after_muts = helperd_aw.spy_mutations;
+// Attempt freeze_clear without confirmation -> must be rejected and keep freeze active
+let fc_bad_reply = null;
+helperd_aw.enforce_mutation_gate('freeze_clear', {}, 'admin', function(r) { fc_bad_reply = r; });
+let frz_still_active = helperd_aw.get_freeze_state().frozen === true;
+// Attempt freeze_clear with explicit confirmation -> must succeed and lift freeze
+let fc_ok_reply = null;
+helperd_aw.enforce_mutation_gate('freeze_clear', { confirm_reconciled: true }, 'admin', function(r) { fc_ok_reply = r; });
+let frz_cleared = helperd_aw.get_freeze_state().frozen === false;
+
 check(
-	fw_frz_res != null && !fw_frz_res.ok && fw_frz_res.rollback_failed === true && fw_frz_res.freeze_persist_failed === true && fw_frz_res.freeze_persisted === false && frz_state_now.frozen === true,
+	fw_frz_res != null && !fw_frz_res.ok && fw_frz_res.rollback_failed === true && fw_frz_res.freeze_persist_failed === true && fw_frz_res.freeze_persisted === false
+	&& frz_state_now.frozen === true
+	&& mut1_reply != null && !mut1_reply.ok && mut1_reply.status == 409 && spy_after_muts == 0 && fs.readfile(su_path) == su_orig
+	&& !mut2_allowed && mut2_reply != null && !mut2_reply.ok && mut2_reply.status == 409
+	&& fc_bad_reply != null && !fc_bad_reply.ok && frz_still_active
+	&& fc_ok_reply != null && fc_ok_reply.ok && frz_cleared,
 	'P3A-HELPERD[freeze_persist_fail_enforces_in_memory_freeze]',
-	sprintf('res=%J freeze_state=%J', fw_frz_res, frz_state_now)
+	sprintf('res=%J mut1=%J mut2=%J fc_bad=%J fc_ok=%J spy=%d', fw_frz_res, mut1_reply, mut2_reply, fc_bad_reply, fc_ok_reply, spy_after_muts)
 );
-helperd_aw.clear_freeze_mem();
 
 // 10. Production handle_rollback_revert: failure preserves .bak/.pending, success verifies & cleans up
 let rbr_dir = vec_dir + '/rbr_test';

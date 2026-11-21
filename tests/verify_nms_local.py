@@ -973,7 +973,7 @@ if has_openwrt_chroot or ucode_bin:
             shutil.copy2(archive_uc_path, os.path.join(chroot_stage, "nms_archive.uc"))
             # Extract exact production helpers & handlers from backend/noc-helperd
             m_aw = re.search(r"(function atomic_write\(.*?\n\}\n\nfunction atomic_write_or_reply\(.*?\n\})", helperd_src, re.DOTALL)
-            m_frz = re.search(r"(function get_freeze_state\(.*?\n\}\n\nfunction enter_emergency_freeze\(.*?\n\})", helperd_src, re.DOTALL)
+            m_frz = re.search(r"(function get_freeze_state\(.*?\n\}\n\nfunction enter_emergency_freeze\(.*?\n\}\n\nfunction enforce_mutation_gate\(.*?\n\})", helperd_src, re.DOTALL)
             m_fw = re.search(r"(function fw_check_and_reload\(.*?\n\})", helperd_src, re.DOTALL)
             m_su = re.search(r"(function handle_sys_sysupgrade_conf_save\(.*?\n\})", helperd_src, re.DOTALL)
             m_rr = re.search(r"(function handle_rollback_revert\(.*?\n\})", helperd_src, re.DOTALL)
@@ -1016,6 +1016,9 @@ if has_openwrt_chroot or ucode_bin:
                     "function release_lock() { test_locks_released++; }\n"
                     "function exec_argv_async(exe, argv, t, c, cb) { cb(mock_exec_res); }\n"
                     "function apply_bridge_block_rules(rules, cb) { cb(mock_apply_res); }\n"
+                    "function check_staging_guard() { return { ok: true }; }\n"
+                    "function check_storage_budget() { return { ok: true }; }\n"
+                    "function acquire_lock(o, op) { return { ok: true }; }\n"
                     "function set_mock(ec, ap, ed, su_p, null_p) { ETC_DIR = ed; mock_exec_res = ec; mock_apply_res = ap; if (su_p != null) SYSUPGRADE_CONF_PATH = su_p; mock_readfile_null_path = null_p; spy_mutations = 0; }\n"
                     "function clear_freeze_mem() { emergency_freeze_state = null; }\n"
                     + m_aw.group(1) + "\n"
@@ -1024,7 +1027,7 @@ if has_openwrt_chroot or ucode_bin:
                     + m_su.group(1) + "\n"
                     + m_rr.group(1) + "\n"
                     + m_rb.group(1) + "\n"
-                    + "\nexport { atomic_write, atomic_write_or_reply, get_freeze_state, enter_emergency_freeze, fw_check_and_reload, handle_sys_sysupgrade_conf_save, handle_rollback_revert, rollback_client_rules, set_mock, clear_freeze_mem };\n"
+                    + "\nexport { atomic_write, atomic_write_or_reply, get_freeze_state, enter_emergency_freeze, enforce_mutation_gate, fw_check_and_reload, handle_sys_sysupgrade_conf_save, handle_rollback_revert, rollback_client_rules, set_mock, clear_freeze_mem };\n"
                 )
             shutil.copy2(os.path.join(ROOT, "tests/verify_phase3a_ucode.uc"), os.path.join(chroot_stage, "verify_phase3a_ucode.uc"))
             try:
