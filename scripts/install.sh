@@ -382,6 +382,10 @@ install_managed_file() {
 
   if [ -e "$_dst" ] || [ -L "$_dst" ]; then
     _orig_mode="$(stat -c '%a' "$_dst" 2>/dev/null || echo '644')"
+    _orig_uid="$(stat -c '%u' "$_dst" 2>/dev/null || echo '')"
+    _orig_gid="$(stat -c '%g' "$_dst" 2>/dev/null || echo '')"
+    _orig_owner=""
+    [ -n "$_orig_uid" ] && [ -n "$_orig_gid" ] && _orig_owner="${_orig_uid}:${_orig_gid}"
     _already_nms=0
     if [ -f "$MANIFEST_FILE" ] && grep -Fxq "$_dst_rel" "$MANIFEST_FILE" 2>/dev/null; then
       _already_nms=1
@@ -389,7 +393,7 @@ install_managed_file() {
     if [ "$_already_nms" -eq 0 ] && ! grep -q "^${_dst_rel}|" "$TMP_RESTORE" 2>/dev/null; then
       _perm_bak_name="$(printf '%s' "$_dst_rel" | tr '/' '_')"
       cp -p "$_dst" "${BACKUP_DIR}/${_perm_bak_name}"
-      echo "${_dst_rel}|${_orig_mode}|${_perm_bak_name}" >> "$TMP_RESTORE"
+      echo "${_dst_rel}|${_orig_mode}|${_perm_bak_name}|${_orig_owner}" >> "$TMP_RESTORE"
     fi
   fi
 

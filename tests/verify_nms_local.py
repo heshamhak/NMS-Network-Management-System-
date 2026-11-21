@@ -626,8 +626,12 @@ start_service
             srv.shutdown()
             srv.server_close()
 
-    # Test uninstall failure handling first: temporarily move one backup file aside, run uninstall, expect failure & preserved manifest
-    bak_index = os.path.join(etc_dir, "preexisting_backup/_www_pro_index.html")
+    # 5a. Uninstall failure: missing backup -> UNINSTALL FAILED, nonzero exit, manifest & remaining backups preserved
+    bak_dir = os.path.join(etc_dir, "preexisting_backup")
+    bak_index = os.path.join(bak_dir, "_www_pro_index.html")
+    bak_apid = os.path.join(bak_dir, "_usr_libexec_noc-apid")
+    bak_init = os.path.join(bak_dir, "_etc_init.d_noc-apid")
+    restore_manifest = os.path.join(etc_dir, "restorable_files.manifest")
     bak_tmp = os.path.join(td, "bak_hold")
     shutil.move(bak_index, bak_tmp)
     r_un_fail = subprocess.run(["sh", os.path.join(ROOT, "scripts/uninstall.sh")], env=env, capture_output=True, text=True)
@@ -635,21 +639,117 @@ start_service
             and "UNINSTALL ERROR: missing backup" in r_un_fail.stderr
             and "UNINSTALL FAILED" in r_un_fail.stderr
             and "NMS uninstalled cleanly." not in r_un_fail.stdout
-            and os.path.isfile(os.path.join(etc_dir, "restorable_files.manifest"))):
-        ok("UNINSTALL-INTEGRITY: missing backup triggers UNINSTALL FAILED, nonzero exit, and preserves manifest")
+            and os.path.isfile(restore_manifest)
+            and os.path.isfile(bak_apid)
+            and os.path.isfile(bak_init)):
+        ok("UNINSTALL-INTEGRITY[missing_backup]: UNINSTALL FAILED, nonzero exit, manifest & backups preserved")
     else:
-        fail("UNINSTALL-INTEGRITY: uninstall did not fail cleanly on missing backup")
-
-    # Restore the backup file and run uninstall again -> must succeed and restore all 3 collisions byte-for-byte
+        fail("UNINSTALL-INTEGRITY[missing_backup]: uninstall did not preserve recovery metadata on missing backup")
     shutil.move(bak_tmp, bak_index)
-    r_un = subprocess.run(["sh", os.path.join(ROOT, "scripts/uninstall.sh")], env=env, capture_output=True, text=True)
-    if (r_un.returncode == 0
-            and open(col_apid, "rb").read() == col_apid_bytes and stat.S_IMODE(os.stat(col_apid).st_mode) == 0o700
-            and open(col_init, "rb").read() == col_init_bytes and stat.S_IMODE(os.stat(col_init).st_mode) == 0o750
-            and open(col_index, "rb").read() == col_index_bytes and stat.S_IMODE(os.stat(col_index).st_mode) == 0o600):
-        ok("INS-03: byte-for-byte restoration of backend, init.d, and frontend collisions")
+
+    # 5b. Uninstall failure: file restoration failure (cp fails on preexisting_backup)
+    un_bin_cp = os.path.join(td, "un_bin_cp")
+    os.makedirs(un_bin_cp, exist_ok=True)
+    real_cp = shutil.which("cp")
+    open(os.path.join(un_bin_cp, "cp"), "w").write(
+        f"#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in */preexisting_backup/_www_pro_index.html) exit 1 ;; esac; done\nexec {real_cp} \"$@\"\n"
+    )
+    os.chmod(os.path.join(un_bin_cp, "cp"), 0o755)
+    env_un_cp = env.copy()
+    env_un_cp["PATH"] = f"{un_bin_cp}:{env['PATH']}"
+    r_un_cp = subprocess.run(["sh", os.path.join(ROOT, "scripts/uninstall.sh")], env=env_un_cp, capture_output=True, text=True)
+    if (r_un_cp.returncode != 0
+            and "UNINSTALL ERROR: failed to restore" in r_un_cp.stderr
+            and "UNINSTALL FAILED" in r_un_cp.stderr
+            and "NMS uninstalled cleanly." not in r_un_cp.stdout
+            and os.path.isfile(restore_manifest)
+            and os.path.isfile(bak_index) and os.path.isfile(bak_apid) and os.path.isfile(bak_init)):
+        ok("UNINSTALL-INTEGRITY[file_restore]: UNINSTALL FAILED, manifest & all backups preserved")
     else:
-        fail("INS-03: byte-for-byte collision restoration failed")
+        fail("UNINSTALL-INTEGRITY[file_restore]: failed to detect file restore error or preserve backups")
+
+    # 5c. Uninstall failure: permission restoration failure (chmod fails on col_index)
+    un_bin_chmod = os.path.join(td, "un_bin_chmod")
+    os.makedirs(un_bin_chmod, exist_ok=True)
+    real_chmod = shutil.which("chmod")
+    open(os.path.join(un_bin_chmod, "chmod"), "w").write(
+        f"#!/bin/sh\nif [ \"$2\" = \"{col_index}\" ]; then exit 1; fi\nexec {real_chmod} \"$@\"\n"
+    )
+    os.chmod(os.path.join(un_bin_chmod, "chmod"), 0o755)
+    env_un_chmod = env.copy()
+    env_un_chmod["PATH"] = f"{un_bin_chmod}:{env['PATH']}"
+    r_un_chmod = subprocess.run(["sh", os.path.join(ROOT, "scripts/uninstall.sh")], env=env_un_chmod, capture_output=True, text=True)
+    if (r_un_chmod.returncode != 0
+            and "UNINSTALL ERROR: failed to restore" in r_un_chmod.stderr
+            and "UNINSTALL FAILED" in r_un_chmod.stderr
+            and "NMS uninstalled cleanly." not in r_un_chmod.stdout
+            and os.path.isfile(restore_manifest)
+            and os.path.isfile(bak_index) and os.path.isfile(bak_apid) and os.path.isfile(bak_init)):
+        ok("UNINSTALL-INTEGRITY[perm_restore]: UNINSTALL FAILED, manifest & all backups preserved")
+    else:
+        fail("UNINSTALL-INTEGRITY[perm_restore]: failed to detect perm restore error or preserve backups")
+
+    # 5d. Uninstall failure: ownership restoration failure (chown fails on col_index)
+    un_bin_chown = os.path.join(td, "un_bin_chown")
+    os.makedirs(un_bin_chown, exist_ok=True)
+    real_chown = shutil.which("chown")
+    open(os.path.join(un_bin_chown, "chown"), "w").write(
+        f"#!/bin/sh\nif [ \"$2\" = \"{col_index}\" ]; then exit 1; fi\nexec {real_chown} \"$@\"\n"
+    )
+    os.chmod(os.path.join(un_bin_chown, "chown"), 0o755)
+    env_un_chown = env.copy()
+    env_un_chown["PATH"] = f"{un_bin_chown}:{env['PATH']}"
+    r_un_chown = subprocess.run(["sh", os.path.join(ROOT, "scripts/uninstall.sh")], env=env_un_chown, capture_output=True, text=True)
+    if (r_un_chown.returncode != 0
+            and "UNINSTALL ERROR: failed to restore ownership" in r_un_chown.stderr
+            and "UNINSTALL FAILED" in r_un_chown.stderr
+            and "NMS uninstalled cleanly." not in r_un_chown.stdout
+            and os.path.isfile(restore_manifest)
+            and os.path.isfile(bak_index) and os.path.isfile(bak_apid) and os.path.isfile(bak_init)):
+        ok("UNINSTALL-INTEGRITY[owner_restore]: UNINSTALL FAILED, manifest & all backups preserved")
+    else:
+        fail("UNINSTALL-INTEGRITY[owner_restore]: failed to detect ownership restore error or preserve backups")
+
+    # 5e. Uninstall failure: backup deletion failure (rm fails on bak_index in isolated copy)
+    td_cleanup = os.path.join(td, "cleanup_copy")
+    shutil.copytree(td, td_cleanup, ignore=shutil.ignore_patterns("cleanup_copy"))
+    env_cleanup = env.copy()
+    env_cleanup["NMS_ROOT_PREFIX"] = td_cleanup
+    bak_index_c = os.path.join(td_cleanup, "etc/noc-console/preexisting_backup/_www_pro_index.html")
+    restore_manifest_c = os.path.join(td_cleanup, "etc/noc-console/restorable_files.manifest")
+    un_bin_rm = os.path.join(td, "un_bin_rm")
+    os.makedirs(un_bin_rm, exist_ok=True)
+    real_rm = shutil.which("rm")
+    open(os.path.join(un_bin_rm, "rm"), "w").write(
+        f"#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in */preexisting_backup/_www_pro_index.html) exit 1 ;; esac; done\nexec {real_rm} \"$@\"\n"
+    )
+    os.chmod(os.path.join(un_bin_rm, "rm"), 0o755)
+    env_cleanup["PATH"] = f"{un_bin_rm}:{env['PATH']}"
+    r_un_rm = subprocess.run(["sh", os.path.join(ROOT, "scripts/uninstall.sh")], env=env_cleanup, capture_output=True, text=True)
+    if (r_un_rm.returncode != 0
+            and f"UNINSTALL ERROR: failed to clean backup {bak_index_c}" in r_un_rm.stderr
+            and "UNINSTALL FAILED" in r_un_rm.stderr
+            and "NMS uninstalled cleanly." not in r_un_rm.stdout
+            and os.path.isfile(restore_manifest_c)
+            and os.path.isfile(bak_index_c)):
+        ok("UNINSTALL-INTEGRITY[backup_cleanup]: UNINSTALL FAILED, exact failed backup reported, manifest preserved")
+    else:
+        fail("UNINSTALL-INTEGRITY[backup_cleanup]: failed to report backup cleanup error or preserve manifest")
+
+    # 5f. Successful restoration and backup cleanup -> byte-for-byte, mode, UID/GID verified, manifest & backups cleaned
+    exp_uid_gid = f"{os.getuid()}:{os.getgid()}"
+    r_un = subprocess.run(["sh", os.path.join(ROOT, "scripts/uninstall.sh")], env=env, capture_output=True, text=True)
+    st_apid, st_init, st_index = os.stat(col_apid), os.stat(col_init), os.stat(col_index)
+    if (r_un.returncode == 0
+            and "NMS uninstalled cleanly." in r_un.stdout
+            and open(col_apid, "rb").read() == col_apid_bytes and stat.S_IMODE(st_apid.st_mode) == 0o700 and f"{st_apid.st_uid}:{st_apid.st_gid}" == exp_uid_gid
+            and open(col_init, "rb").read() == col_init_bytes and stat.S_IMODE(st_init.st_mode) == 0o750 and f"{st_init.st_uid}:{st_init.st_gid}" == exp_uid_gid
+            and open(col_index, "rb").read() == col_index_bytes and stat.S_IMODE(st_index.st_mode) == 0o600 and f"{st_index.st_uid}:{st_index.st_gid}" == exp_uid_gid
+            and not os.path.exists(restore_manifest)
+            and not os.path.exists(bak_apid) and not os.path.exists(bak_init) and not os.path.exists(bak_index)):
+        ok("INS-03: byte-for-byte, mode, and UID/GID restoration + clean backup/manifest removal")
+    else:
+        fail("INS-03: byte-for-byte / mode / UID:GID collision restoration or cleanup failed")
 
 print(f"\n=== SUMMARY: {len(passes)} passed, {len(failures)} failed ===")
 sys.exit(1 if failures else 0)

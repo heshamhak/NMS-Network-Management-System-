@@ -72,11 +72,11 @@ fi
 echo "[3/4] Restoring any pre-existing user files..."
 RESTORE_ERR=0
 if [ -f "$RESTORE_FILE" ]; then
-  while IFS='|' read -r rel_path orig_mode bak_name || [ -n "$rel_path" ]; do
+  while IFS='|' read -r rel_path orig_mode bak_name orig_owner || [ -n "$rel_path" ]; do
     [ -z "$rel_path" ] && continue
     target="${ROOT_PREFIX}${rel_path}"
     bak_src="${BACKUP_DIR}/${bak_name}"
-    if [ ! -f "$bak_src" ]; then
+    if [ -z "$bak_name" ] || [ ! -f "$bak_src" ]; then
       echo "UNINSTALL ERROR: missing backup $bak_src for $target" >&2
       RESTORE_ERR=1
       UNINSTALL_ERR=1
@@ -88,21 +88,39 @@ if [ -f "$RESTORE_FILE" ]; then
       UNINSTALL_ERR=1
       continue
     fi
+    if [ -n "$orig_owner" ] && [ "$orig_owner" != ":" ]; then
+      if ! chown "$orig_owner" "$target"; then
+        echo "UNINSTALL ERROR: failed to restore ownership $orig_owner on $target" >&2
+        RESTORE_ERR=1
+        UNINSTALL_ERR=1
+        continue
+      fi
+    fi
     cur_mode="$(stat -c '%a' "$target" 2>/dev/null || echo '')"
-    if ! cmp -s "$bak_src" "$target" || [ "$cur_mode" != "$orig_mode" ]; then
-      echo "UNINSTALL ERROR: verification failed for restored $target (mode=${cur_mode}/${orig_mode})" >&2
+    cur_owner="$(stat -c '%u:%g' "$target" 2>/dev/null || echo '')"
+    if ! cmp -s "$bak_src" "$target" || [ "$cur_mode" != "$orig_mode" ] || { [ -n "$orig_owner" ] && [ "$orig_owner" != ":" ] && [ "$cur_owner" != "$orig_owner" ]; }; then
+      echo "UNINSTALL ERROR: verification failed for restored $target (mode=${cur_mode}/${orig_mode}, owner=${cur_owner}/${orig_owner})" >&2
       RESTORE_ERR=1
       UNINSTALL_ERR=1
       continue
     fi
   done < "$RESTORE_FILE"
   if [ "$RESTORE_ERR" -eq 0 ]; then
-    while IFS= read -r line; do
-      [ -n "$line" ] || continue
-      bak_src=$(printf '%s' "$line" | cut -f1)
-      rm -f "$bak_src" || { echo "UNINSTALL ERROR: failed to clean backup $bak_src" >&2; UNINSTALL_ERR=1; }
+    CLEANUP_ERR=0
+    while IFS='|' read -r _rel _mode bak_name _owner || [ -n "$_rel" ]; do
+      [ -n "$bak_name" ] || continue
+      bak_src="${BACKUP_DIR}/${bak_name}"
+      if ! rm -f "$bak_src"; then
+        echo "UNINSTALL ERROR: failed to clean backup $bak_src" >&2
+        CLEANUP_ERR=1
+        UNINSTALL_ERR=1
+      fi
     done < "$RESTORE_FILE"
-    rm -f "$RESTORE_FILE" || { echo "UNINSTALL ERROR: failed to remove $RESTORE_FILE" >&2; UNINSTALL_ERR=1; }
+    if [ "$CLEANUP_ERR" -eq 0 ]; then
+      rm -f "$RESTORE_FILE" || { echo "UNINSTALL ERROR: failed to remove $RESTORE_FILE" >&2; UNINSTALL_ERR=1; }
+    else
+      echo "UNINSTALL WARNING: preserving $RESTORE_FILE due to backup cleanup errors." >&2
+    fi
   else
     echo "UNINSTALL WARNING: preserving $RESTORE_FILE and backups due to restoration errors." >&2
   fi
