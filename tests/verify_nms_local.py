@@ -754,12 +754,13 @@ start_service
 print("=== 6. Phase 3A: Sysupgrade Backup, Archive Security, sysupgrade.conf & APK/OPKG Parity ===")
 helperd_src = open(os.path.join(ROOT, "backend/noc-helperd")).read()
 apid_src = open(os.path.join(ROOT, "backend/noc-apid")).read()
+archive_uc_path = os.path.join(ROOT, "backend/nms_archive.uc")
+archive_uc_src = open(archive_uc_path).read() if os.path.isfile(archive_uc_path) else ""
 
-# 6a. Structural wiring checks in noc-helperd and noc-apid
+# 6a. Structural wiring checks in nms_archive.uc, noc-helperd, and noc-apid
 req_helper_syms = [
+    "import * as nms_archive from '/usr/libexec/nms_archive.uc';",
     "function detect_pkg_manager()",
-    "function is_safe_sysupgrade_path(",
-    "function validate_archive_entries(",
     "function validate_backup_archive(",
     "if (verb == 'sys_backup_validate')",
     "if (verb == 'sys_sysupgrade_conf_get')",
@@ -767,123 +768,100 @@ req_helper_syms = [
     "'-b', tmp_tar",
     "['list-installed']",
     "['list-upgradable']",
+    "fs.lstat(SYSUPGRADE_CONF_PATH)",
+    "nms_archive.merge_sysupgrade_conf(",
+    "if (!atomic_write(",
+]
+req_uc_syms = [
+    "export function validate_tar_stream(",
+    "export function normalize_archive_rel_path(",
+    "export function resolve_symlink_target(",
+    "export function is_safe_sysupgrade_path(",
+    "export function merge_sysupgrade_conf(",
 ]
 missing_syms = [s for s in req_helper_syms if s not in helperd_src]
+missing_uc = [s for s in req_uc_syms if s not in archive_uc_src]
 req_apid_syms = ["action == 'backup_validate'", "sysupgrade_conf_get: 'sys_sysupgrade_conf_get'", "sysupgrade_conf_save: 'sys_sysupgrade_conf_save'"]
 missing_apid = [s for s in req_apid_syms if s not in apid_src]
-if not missing_syms and not missing_apid:
-    ok("P3A-STRUCT: noc-helperd & noc-apid Phase 3A verbs, sysupgrade -b, and apk/opkg abstraction present")
+if not missing_syms and not missing_uc and not missing_apid:
+    ok("P3A-STRUCT: nms_archive.uc, noc-helperd, and noc-apid Phase 3A contracts & checked atomic_write present")
 else:
-    fail(f"P3A-STRUCT: missing symbols helper={missing_syms}, apid={missing_apid}")
+    fail(f"P3A-STRUCT: missing symbols helper={missing_syms}, uc={missing_uc}, apid={missing_apid}")
 
-# 6b. Real tar/gzip archive integrity & path-traversal tests on Debian host
-import tarfile, io, re as _re
+# 6b. Production ucode archive validator execution (ONLY if ucode runtime is installed; never duplicated in Python)
+import tarfile, io
 
-def host_validate_tar_tv(tar_path):
-    r = subprocess.run(["tar", "-tvzf", tar_path], capture_output=True, text=True)
-    if r.returncode != 0:
-        return False, ["tar -tvzf failed (corrupted or partial archive)"]
-    entries, errs = [], []
-    allowed_prefixes = ("etc/", "root/", "usr/local/", "www/", "lib/uci/")
-    for raw in r.stdout.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        t_ch = line[0]
-        if t_ch in ("c", "b", "p", "s"):
-            errs.append(f"unsafe type {t_ch}")
-            continue
-        m = _re.match(r"^\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(.+)$", line)
-        if not m:
-            errs.append("unparseable tar line")
-            continue
-        rest = m.group(1).strip()
-        ep, lt = rest, ""
-        if t_ch == "l" and " -> " in rest:
-            ep, lt = [x.strip() for x in rest.split(" -> ", 1)]
-        elif t_ch == "h" and " link to " in rest:
-            ep, lt = [x.strip() for x in rest.split(" link to ", 1)]
-        if ep.startswith("/"):
-            errs.append(f"absolute path: {ep}")
-            continue
-        if ep.startswith("./"):
-            ep = ep[2:]
-        if ep in ("", "."):
-            continue
-        if "\\" in ep or "\0" in ep or _re.search(r"(^|/)\.\.(/|$)", ep):
-            errs.append(f"traversal: {ep}")
-            continue
-        if lt and ("\\" in lt or _re.search(r"(^|/)\.\.(/|$)", lt) or lt.startswith(("/proc/", "/sys/", "/dev/", "/tmp/", "/run/"))):
-            errs.append(f"unsafe symlink: {ep} -> {lt}")
-            continue
-        if not any(ep.startswith(ap) or ep + "/" == ap for ap in allowed_prefixes):
-            errs.append(f"out of scope: {ep}")
-            continue
-        entries.append(ep)
-    if not entries and not errs:
-        errs.append("empty archive")
-    return (len(errs) == 0 and len(entries) > 0), errs
+ucode_bin = shutil.which("ucode")
+if ucode_bin:
+    with tempfile.TemporaryDirectory() as td_arc:
+        def make_tar(fname, builder):
+            p = os.path.join(td_arc, fname)
+            with tarfile.open(p, "w") as tf:
+                builder(tf)
+            return p
 
-with tempfile.TemporaryDirectory() as td_arc:
-    # Valid archive
-    valid_tgz = os.path.join(td_arc, "valid.tar.gz")
-    with tarfile.open(valid_tgz, "w:gz") as tf:
-        info = tarfile.TarInfo("etc/config/network")
-        data = b"config interface 'lan'\n"
-        info.size = len(data)
-        tf.addfile(info, io.BytesIO(data))
-        sinfo = tarfile.TarInfo("etc/TZ")
-        sinfo.type = tarfile.SYMTYPE
-        sinfo.linkname = "UTC"
-        tf.addfile(sinfo)
-    v_ok, v_err = host_validate_tar_tv(valid_tgz)
-    ok("P3A-ARCHIVE[valid]: valid tar.gz with config & safe symlink accepted") if v_ok else fail(f"P3A-ARCHIVE[valid]: {v_err}")
+        def add_reg(tf, name, data=b"x\n"):
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
 
-    # Traversal, absolute path, symlink escape, out-of-scope, partial/corrupt gzip, empty
-    bad_cases = []
-    trav_tgz = os.path.join(td_arc, "trav.tar.gz")
-    with tarfile.open(trav_tgz, "w:gz") as tf:
-        ti = tarfile.TarInfo("etc/../../etc/passwd")
-        ti.size = 4
-        tf.addfile(ti, io.BytesIO(b"root"))
-    bad_cases.append(("traversal", trav_tgz))
+        def add_sym(tf, name, target):
+            si = tarfile.TarInfo(name)
+            si.type = tarfile.SYMTYPE
+            si.linkname = target
+            tf.addfile(si)
 
-    abs_tgz = os.path.join(td_arc, "abs.tar.gz")
-    with tarfile.open(abs_tgz, "w:gz") as tf:
-        ti = tarfile.TarInfo("/etc/shadow")
-        ti.size = 4
-        tf.addfile(ti, io.BytesIO(b"root"))
-    bad_cases.append(("absolute_path", abs_tgz))
+        def add_hard(tf, name, target):
+            hi = tarfile.TarInfo(name)
+            hi.type = tarfile.LNKTYPE
+            hi.linkname = target
+            tf.addfile(hi)
 
-    sym_tgz = os.path.join(td_arc, "sym.tar.gz")
-    with tarfile.open(sym_tgz, "w:gz") as tf:
-        si = tarfile.TarInfo("etc/badlink")
-        si.type = tarfile.SYMTYPE
-        si.linkname = "../../etc/shadow"
-        tf.addfile(si)
-    bad_cases.append(("symlink_escape", sym_tgz))
+        valid_tar = make_tar("valid.tar", lambda tf: (
+            add_reg(tf, "etc/config/network"),
+            add_reg(tf, "etc/my file -> with arrow.conf"),
+            add_sym(tf, "etc/rc.d/S10boot", "../init.d/boot"),
+            add_hard(tf, "etc/config/network.bak", "etc/config/network"),
+        ))
+        abs_sym = make_tar("abs_sym.tar", lambda tf: add_sym(tf, "etc/bad", "/etc/shadow"))
+        abs_hard = make_tar("abs_hard.tar", lambda tf: add_hard(tf, "etc/badh", "/etc/passwd"))
+        rel_esc = make_tar("rel_esc.tar", lambda tf: add_sym(tf, "etc/sub/esc", "../../etc/shadow"))
+        nested_trav = make_tar("nested_trav.tar", lambda tf: add_reg(tf, "etc/a/../../b"))
+        nl_name = make_tar("nl_name.tar", lambda tf: add_reg(tf, "etc/bad\nname"))
+        out_scope = make_tar("out_scope.tar", lambda tf: add_reg(tf, "tmp/evil.sh"))
+        partial_tar = os.path.join(td_arc, "partial.tar")
+        open(partial_tar, "wb").write(open(valid_tar, "rb").read()[:300])
+        empty_tar = make_tar("empty.tar", lambda tf: None)
 
-    scope_tgz = os.path.join(td_arc, "scope.tar.gz")
-    with tarfile.open(scope_tgz, "w:gz") as tf:
-        ti = tarfile.TarInfo("tmp/evil.sh")
-        ti.size = 4
-        tf.addfile(ti, io.BytesIO(b"echo"))
-    bad_cases.append(("out_of_scope", scope_tgz))
+        harness_uc = os.path.join(td_arc, "test_archive.uc")
+        open(harness_uc, "w").write(
+            f"import * as fs from 'fs';\n"
+            f"import * as na from '{archive_uc_path}';\n"
+            f"let r = na.validate_tar_stream(fs.readfile(ARGV[0]) || '');\n"
+            f"printf('%J\\n', r);\n"
+        )
 
-    partial_tgz = os.path.join(td_arc, "partial.tar.gz")
-    open(partial_tgz, "wb").write(open(valid_tgz, "rb").read()[:20])
-    bad_cases.append(("partial_write_corrupt", partial_tgz))
+        for label, path, expect_valid in [
+            ("valid_spaces_arrows_links", valid_tar, True),
+            ("abs_symlink", abs_sym, False),
+            ("abs_hardlink", abs_hard, False),
+            ("rel_symlink_escape", rel_esc, False),
+            ("nested_traversal", nested_trav, False),
+            ("newline_filename", nl_name, False),
+            ("out_of_scope", out_scope, False),
+            ("partial_write", partial_tar, False),
+            ("empty_archive", empty_tar, False),
+        ]:
+            ru = subprocess.run([ucode_bin, harness_uc, path], capture_output=True, text=True)
+            res = json.loads(ru.stdout) if ru.returncode == 0 and ru.stdout.strip() else {"valid": None}
+            if res.get("valid") is expect_valid:
+                ok(f"P3A-UCODE[{label}]: valid={expect_valid}")
+            else:
+                fail(f"P3A-UCODE[{label}]: expected valid={expect_valid}, got {ru.stdout} {ru.stderr}")
+else:
+    print("[SKIP] P3A-UCODE: ucode runtime unavailable on Debian host; production archive validator NOT executed")
 
-    empty_tgz = os.path.join(td_arc, "empty.tar.gz")
-    with tarfile.open(empty_tgz, "w:gz") as tf:
-        pass
-    bad_cases.append(("empty_archive", empty_tgz))
-
-    for cname, cpath in bad_cases:
-        c_ok, c_errs = host_validate_tar_tv(cpath)
-        ok(f"P3A-ARCHIVE[{cname}]: rejected ({c_errs[0]})") if (not c_ok and c_errs) else fail(f"P3A-ARCHIVE[{cname}]: unexpectedly accepted")
-
-# 6c. sysupgrade.conf path safety & idempotency + APK/OPKG fixture detection
+# 6c. APK/OPKG fixture detection
 with tempfile.TemporaryDirectory() as td_pm:
     apk_bin = os.path.join(td_pm, "apk")
     opkg_bin = os.path.join(td_pm, "opkg")
