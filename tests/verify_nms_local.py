@@ -983,12 +983,15 @@ if has_openwrt_chroot or ucode_bin:
             m_su = re.search(r"(function handle_sys_sysupgrade_conf_save\(.*?\n\})", helperd_src, re.DOTALL)
             m_rr = re.search(r"(function handle_rollback_revert\(.*?\n\})", helperd_src, re.DOTALL)
             m_rb = re.search(r"(function rollback_client_rules\(.*?\n\})", helperd_src, re.DOTALL)
-            if not m_aw or not m_frz or not m_fw or not m_su or not m_rr or not m_rb:
+            m_net = re.search(r"(function array_eq\(.*?\n\}\n\nfunction handle_network_phase3b_verb\(.*?\n\})", helperd_src, re.DOTALL)
+            if not m_aw or not m_frz or not m_fw or not m_su or not m_rr or not m_rb or not m_net:
                 fail("P3A-HELPERD-EXTRACT: could not extract production helpers from noc-helperd")
             else:
                 open(os.path.join(chroot_stage, "helperd_aw_prod.uc"), "w").write(
                     "import * as real_fs from 'fs';\n"
+                    "import * as uci from 'uci';\n"
                     "import * as nms_archive from '/tmp/p3a_test/nms_archive.uc';\n"
+                    "import * as nms_network from '/tmp/p3a_test/nms_network.uc';\n"
                     "export let test_audits = [];\n"
                     "export let test_locks_released = 0;\n"
                     "export let test_warns = [];\n"
@@ -1032,7 +1035,8 @@ if has_openwrt_chroot or ucode_bin:
                     + m_su.group(1) + "\n"
                     + m_rr.group(1) + "\n"
                     + m_rb.group(1) + "\n"
-                    + "\nexport { atomic_write, atomic_write_or_reply, get_freeze_state, enter_emergency_freeze, enforce_mutation_gate, fw_check_and_reload, handle_sys_sysupgrade_conf_save, handle_rollback_revert, rollback_client_rules, set_mock, clear_freeze_mem };\n"
+                    + m_net.group(1) + "\n"
+                    + "\nexport { atomic_write, atomic_write_or_reply, get_freeze_state, enter_emergency_freeze, enforce_mutation_gate, fw_check_and_reload, handle_sys_sysupgrade_conf_save, handle_rollback_revert, rollback_client_rules, handle_network_phase3b_verb, set_mock, clear_freeze_mem };\n"
                 )
             shutil.copy2(os.path.join(ROOT, "tests/verify_phase3a_ucode.uc"), os.path.join(chroot_stage, "verify_phase3a_ucode.uc"))
             shutil.copy2(os.path.join(ROOT, "tests/verify_phase3b_ucode.uc"), os.path.join(chroot_stage, "verify_phase3b_ucode.uc"))

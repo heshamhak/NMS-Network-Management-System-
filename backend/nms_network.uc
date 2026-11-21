@@ -203,6 +203,31 @@ export function validate_ipv6_dhcp_cfg(cfg) {
 	return { ok: true, interface: iface, ra: ra, dhcpv6: dhcpv6, ndp: ndp };
 };
 
+function rollback_snaps(snaps, ops, do_reload) {
+	let rb_all_ok = true;
+	let cleanup_failed = false;
+	let tmp_path = '';
+	for (let s in snaps) {
+		if (s.existed) {
+			let aw = nms_archive.atomic_write_checked(s.path, s.raw, s.mode, s.uid, s.gid, ops.aw_ops);
+			if (aw.cleanup_failed) { cleanup_failed = true; tmp_path = aw.tmp_path || ''; }
+			let st_rb = ops.lstat(s.path);
+			let cur_rb = ops.readfile(s.path);
+			if (!aw.ok || !st_rb || st_rb.type != 'file' || (st_rb.mode & 0o7777) != s.mode ||
+			    (s.uid != null && (st_rb.uid != s.uid || st_rb.gid != s.gid)) || cur_rb != s.raw) {
+				rb_all_ok = false;
+			}
+		} else if (ops.stat(s.path)) {
+			if (!ops.unlink(s.path) || ops.stat(s.path)) rb_all_ok = false;
+		}
+	}
+	if (rb_all_ok && do_reload) {
+		let rb_rel = ops.reload_service();
+		if (!rb_rel || !rb_rel.ok) rb_all_ok = false;
+	}
+	return { ok: rb_all_ok, cleanup_failed: cleanup_failed, tmp_path: tmp_path };
+}
+
 export function apply_network_tx(cfg_paths, ops) {
 	// 1. Snapshot original files and metadata before any mutation
 	let snaps = [];
@@ -231,21 +256,22 @@ export function apply_network_tx(cfg_paths, ops) {
 	// 2. Apply UCI mutation
 	let ap = ops.apply_uci();
 	if (!ap || !ap.ok) {
-		// Ensure on-disk files are restored if apply_uci partially modified anything
-		let rb_err = false;
-		for (let s in snaps) {
-			if (s.existed) {
-				let aw = nms_archive.atomic_write_checked(s.path, s.raw, s.mode, s.uid, s.gid, ops.aw_ops);
-				let st_c = ops.lstat(s.path);
-				let cur_c = ops.readfile(s.path);
-				if (!aw.ok || !st_c || (st_c.mode & 0o7777) != s.mode || cur_c != s.raw) rb_err = true;
-			}
+		let rb = rollback_snaps(snaps, ops, false);
+		if (!rb.ok) {
+			let fr = ops.on_rollback_failed('apply_uci rollback failed');
+			return {
+				ok: false,
+				rolled_back: false,
+				rollback_failed: true,
+				freeze_persisted: fr ? !!fr.freeze_persisted : false,
+				freeze_persist_failed: fr ? !!fr.freeze_persist_failed : false,
+				cleanup_failed: rb.cleanup_failed,
+				tmp_path: rb.tmp_path,
+				error: 'apply_failed',
+				message_ar: 'فشل تطبيق تعديل UCI وفشل استعادة الحالة الأصلية — تم تفعيل التجميد الطارئ'
+			};
 		}
-		if (rb_err) {
-			ops.on_rollback_failed('apply_uci rollback failed');
-			return { ok: false, rolled_back: false, rollback_failed: true, error: 'apply_failed', message_ar: 'فشل تطبيق تعديل UCI وفشل استعادة الحالة الأصلية' };
-		}
-		return { ok: false, rolled_back: true, rollback_failed: false, error: 'apply_failed', message_ar: (ap && ap.error) || 'فشل تطبيق تعديل UCI وتم الحفاظ على الحالة الأصلية' };
+		return { ok: false, rolled_back: true, rollback_failed: false, error: 'apply_failed', message_ar: (ap && ap.error) || 'فشل تطبيق تعديل UCI وتم التراجع والتحقق من الحالة الأصلية' };
 	}
 
 	// 3. Pre-reload validation, service reload, and post-apply verification
@@ -274,28 +300,8 @@ export function apply_network_tx(cfg_paths, ops) {
 	}
 
 	// 4. Rollback every snapped file & verify bytes + metadata
-	let rb_all_ok = true;
-	let cleanup_failed = false;
-	let tmp_path = '';
-	for (let s in snaps) {
-		if (s.existed) {
-			let aw = nms_archive.atomic_write_checked(s.path, s.raw, s.mode, s.uid, s.gid, ops.aw_ops);
-			if (aw.cleanup_failed) { cleanup_failed = true; tmp_path = aw.tmp_path || ''; }
-			let st_rb = ops.lstat(s.path);
-			let cur_rb = ops.readfile(s.path);
-			if (!aw.ok || !st_rb || st_rb.type != 'file' || (st_rb.mode & 0o7777) != s.mode ||
-			    (s.uid != null && (st_rb.uid != s.uid || st_rb.gid != s.gid)) || cur_rb != s.raw) {
-				rb_all_ok = false;
-			}
-		} else if (ops.stat(s.path)) {
-			if (!ops.unlink(s.path) || ops.stat(s.path)) rb_all_ok = false;
-		}
-	}
-	if (rb_all_ok) {
-		let rb_rel = ops.reload_service();
-		if (!rb_rel || !rb_rel.ok) rb_all_ok = false;
-	}
-	if (!rb_all_ok) {
+	let rb = rollback_snaps(snaps, ops, true);
+	if (!rb.ok) {
 		let fr = ops.on_rollback_failed(fail_stage + ' rollback failed');
 		return {
 			ok: false,
@@ -303,8 +309,8 @@ export function apply_network_tx(cfg_paths, ops) {
 			rollback_failed: true,
 			freeze_persisted: fr ? !!fr.freeze_persisted : false,
 			freeze_persist_failed: fr ? !!fr.freeze_persist_failed : false,
-			cleanup_failed: cleanup_failed,
-			tmp_path: tmp_path,
+			cleanup_failed: rb.cleanup_failed,
+			tmp_path: rb.tmp_path,
 			error: fail_stage,
 			message_ar: 'فشل حرج: ' + fail_msg + ' وفشل التراجع — تم تفعيل التجميد الطارئ'
 		};
