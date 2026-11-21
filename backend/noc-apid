@@ -1635,7 +1635,8 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 				device_save: 'network_device_save',
 				bridge_vlan_save: 'network_bridge_vlan_save', bridge_vlan_delete: 'network_bridge_vlan_delete',
 				ipv6_save: 'network_ipv6_save',
-				wifi_scan: 'wifi_scan', wifi_save_uplink: 'wifi_save_uplink', wifi_save_ap: 'wifi_save_ap'
+				wifi_scan: 'wifi_scan', wifi_save_uplink: 'wifi_save_uplink', wifi_save_ap: 'wifi_save_ap',
+				wifi_radio_save: 'wifi_radio_save', wifi_iface_save: 'wifi_iface_save', wifi_iface_delete: 'wifi_iface_delete'
 			};
 			let nverb = net_vmap[sub] || '';
 			if (nverb == '') {
@@ -1661,6 +1662,8 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 			let fw_vmap = {
 				add_redirect: 'fw_add_redirect', delete_redirect: 'fw_delete_redirect', toggle_rule: 'fw_toggle_rule',
 				add_rule: 'fw_add_rule', delete_rule: 'fw_delete_rule', save_defaults: 'fw_save_defaults',
+				zone_save: 'fw_zone_save', zone_delete: 'fw_zone_delete',
+				forwarding_save: 'fw_forwarding_save', forwarding_delete: 'fw_forwarding_delete',
 				banip_save: 'banip_save_config', banip_list: 'banip_list_edit', upnp_save: 'upnp_save_config'
 			};
 			let fverb = fw_vmap[sub] || '';

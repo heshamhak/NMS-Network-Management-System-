@@ -972,10 +972,12 @@ if has_openwrt_chroot or ucode_bin:
             shutil.copytree(td_arc, chroot_stage)
             shutil.copy2(archive_uc_path, os.path.join(chroot_stage, "nms_archive.uc"))
             shutil.copy2(os.path.join(ROOT, "backend/nms_network.uc"), os.path.join(chroot_stage, "nms_network.uc"))
+            shutil.copy2(os.path.join(ROOT, "backend/nms_fw_wifi.uc"), os.path.join(chroot_stage, "nms_fw_wifi.uc"))
             # Copy modules to /usr/libexec inside chroot too so import '/usr/libexec/nms_archive.uc' resolves cleanly
             os.makedirs(os.path.join(openwrt_rootfs, "usr/libexec"), exist_ok=True)
             shutil.copy2(archive_uc_path, os.path.join(openwrt_rootfs, "usr/libexec/nms_archive.uc"))
             shutil.copy2(os.path.join(ROOT, "backend/nms_network.uc"), os.path.join(openwrt_rootfs, "usr/libexec/nms_network.uc"))
+            shutil.copy2(os.path.join(ROOT, "backend/nms_fw_wifi.uc"), os.path.join(openwrt_rootfs, "usr/libexec/nms_fw_wifi.uc"))
             # Extract exact production helpers & handlers from backend/noc-helperd
             m_aw = re.search(r"(function atomic_write\(.*?\n\}\n\nfunction atomic_write_or_reply\(.*?\n\})", helperd_src, re.DOTALL)
             m_frz = re.search(r"(function get_freeze_state\(.*?\n\}\n\nfunction enter_emergency_freeze\(.*?\n\}\n\nfunction enforce_mutation_gate\(.*?\n\})", helperd_src, re.DOTALL)
@@ -984,7 +986,8 @@ if has_openwrt_chroot or ucode_bin:
             m_rr = re.search(r"(function handle_rollback_revert\(.*?\n\})", helperd_src, re.DOTALL)
             m_rb = re.search(r"(function rollback_client_rules\(.*?\n\})", helperd_src, re.DOTALL)
             m_net = re.search(r"(function array_eq\(.*?\n\}\n\nfunction handle_network_phase3b_verb\(.*?\n\})", helperd_src, re.DOTALL)
-            if not m_aw or not m_frz or not m_fw or not m_su or not m_rr or not m_rb or not m_net:
+            m_p3c = re.search(r"(function handle_phase3c_verb\(.*?\n\})", helperd_src, re.DOTALL)
+            if not m_aw or not m_frz or not m_fw or not m_su or not m_rr or not m_rb or not m_net or not m_p3c:
                 fail("P3A-HELPERD-EXTRACT: could not extract production helpers from noc-helperd")
             else:
                 open(os.path.join(chroot_stage, "helperd_aw_prod.uc"), "w").write(
@@ -992,6 +995,7 @@ if has_openwrt_chroot or ucode_bin:
                     "import * as uci from 'uci';\n"
                     "import * as nms_archive from '/tmp/p3a_test/nms_archive.uc';\n"
                     "import * as nms_network from '/tmp/p3a_test/nms_network.uc';\n"
+                    "import * as nms_fw_wifi from '/tmp/p3a_test/nms_fw_wifi.uc';\n"
                     "export let test_audits = [];\n"
                     "export let test_locks_released = 0;\n"
                     "export let test_warns = [];\n"
@@ -1036,10 +1040,12 @@ if has_openwrt_chroot or ucode_bin:
                     + m_rr.group(1) + "\n"
                     + m_rb.group(1) + "\n"
                     + m_net.group(1) + "\n"
-                    + "\nexport { atomic_write, atomic_write_or_reply, get_freeze_state, enter_emergency_freeze, enforce_mutation_gate, fw_check_and_reload, handle_sys_sysupgrade_conf_save, handle_rollback_revert, rollback_client_rules, handle_network_phase3b_verb, set_mock, clear_freeze_mem };\n"
+                    + m_p3c.group(1) + "\n"
+                    + "\nexport { atomic_write, atomic_write_or_reply, get_freeze_state, enter_emergency_freeze, enforce_mutation_gate, fw_check_and_reload, handle_sys_sysupgrade_conf_save, handle_rollback_revert, rollback_client_rules, handle_network_phase3b_verb, handle_phase3c_verb, set_mock, clear_freeze_mem };\n"
                 )
             shutil.copy2(os.path.join(ROOT, "tests/verify_phase3a_ucode.uc"), os.path.join(chroot_stage, "verify_phase3a_ucode.uc"))
             shutil.copy2(os.path.join(ROOT, "tests/verify_phase3b_ucode.uc"), os.path.join(chroot_stage, "verify_phase3b_ucode.uc"))
+            shutil.copy2(os.path.join(ROOT, "tests/verify_phase3c_ucode.uc"), os.path.join(chroot_stage, "verify_phase3c_ucode.uc"))
             try:
                 ru = subprocess.run(
                     ["unshare", "-r", "/usr/sbin/chroot", openwrt_rootfs, "/usr/bin/ucode", "/tmp/p3a_test/verify_phase3a_ucode.uc", "/tmp/p3a_test/nms_archive.uc", "/tmp/p3a_test"],
@@ -1064,6 +1070,18 @@ if has_openwrt_chroot or ucode_bin:
                         fail(line[len("[FAIL] "):])
                 if ru3b.returncode != 0 and "UCODE3B_SUMMARY:" not in ru3b.stdout:
                     fail(f"P3B-UCODE: runner failed rc={ru3b.returncode}: {ru3b.stderr}")
+
+                ru3c = subprocess.run(
+                    ["unshare", "-r", "/usr/sbin/chroot", openwrt_rootfs, "/usr/bin/ucode", "/tmp/p3a_test/verify_phase3c_ucode.uc", "/tmp/p3a_test"],
+                    capture_output=True, text=True
+                )
+                for line in ru3c.stdout.splitlines():
+                    if line.startswith("[PASS] "):
+                        ok(line[len("[PASS] "):])
+                    elif line.startswith("[FAIL] "):
+                        fail(line[len("[FAIL] "):])
+                if ru3c.returncode != 0 and "UCODE3C_SUMMARY:" not in ru3c.stdout:
+                    fail(f"P3C-UCODE: runner failed rc={ru3c.returncode}: {ru3c.stderr}")
             finally:
                 shutil.rmtree(chroot_stage, ignore_errors=True)
 else:

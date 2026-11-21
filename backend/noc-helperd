@@ -8,6 +8,7 @@ import * as ubus from 'ubus';
 import * as uci from 'uci';
 import * as nms_archive from '/usr/libexec/nms_archive.uc';
 import * as nms_network from '/usr/libexec/nms_network.uc';
+import * as nms_fw_wifi from '/usr/libexec/nms_fw_wifi.uc';
 
 const ETC_DIR = getenv('NOC_ETC_DIR') || '/etc/noc-console';
 const RUN_DIR = getenv('NOC_RUN_DIR') || '/tmp/noc-console';
@@ -1278,6 +1279,211 @@ function handle_network_phase3b_verb(verb, params, actor, reply_cb, net_env) {
 	reply_cb(tx_res);
 }
 
+function handle_phase3c_verb(verb, params, actor, reply_cb, p3c_env) {
+	let env = p3c_env || {};
+	let cfg_dir = env.cfg_dir || '/etc/config';
+	let uci_dir = env.uci_dir || null;
+	let is_fw = index(verb, 'fw_') == 0;
+	let cfg_paths = is_fw ? [cfg_dir + '/firewall'] : [cfg_dir + '/wireless'];
+	let target_id = trim('' + (params.name || params.id || params.radio || params.src || 'phase3c'));
+
+	if (verb == 'fw_zone_save') {
+		let v = nms_fw_wifi.validate_fw_zone_cfg(params);
+		if (!v.ok) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: v.error }); return; }
+	} else if (verb == 'fw_zone_delete') {
+		let nm = trim('' + (params.name || ''));
+		if (!nms_fw_wifi.is_valid_zone_name(nm) || nm == 'lan' || nm == 'wan') {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يُسمح بحذف مناطق lan أو wan الأساسية' });
+			return;
+		}
+	} else if (verb == 'fw_forwarding_save') {
+		let v = nms_fw_wifi.validate_fw_forwarding_cfg(params);
+		if (!v.ok) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: v.error }); return; }
+	} else if (verb == 'fw_forwarding_delete') {
+		let sid = trim('' + (params.id || ''));
+		if (!match(sid, /^[a-zA-Z0-9_-]+$/)) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معرف التوجيه غير صالح' }); return; }
+	} else if (verb == 'wifi_radio_save') {
+		let v = nms_fw_wifi.validate_wifi_radio_cfg(params);
+		if (!v.ok) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: v.error }); return; }
+	} else if (verb == 'wifi_iface_save') {
+		let v = nms_fw_wifi.validate_wifi_iface_cfg(params);
+		if (!v.ok) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: v.error }); return; }
+	} else if (verb == 'wifi_iface_delete') {
+		let sid = trim('' + (params.id || ''));
+		if (!match(sid, /^[a-zA-Z0-9_-]+$/) || sid == 'default_radio0') {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'معرف الشبكة غير صالح أو محمي' });
+			return;
+		}
+	}
+
+	let expected_sid = '';
+	let tx_res = nms_network.apply_network_tx(cfg_paths, {
+		stat: fs.stat,
+		lstat: fs.lstat,
+		readfile: env.readfile || fs.readfile,
+		unlink: fs.unlink,
+		aw_ops: env.aw_ops || {
+			suffix: function() { return now_mono_ms() + '.' + urandom_hex(4); },
+			stat: fs.stat, unlink: fs.unlink, open: fs.open,
+			writefile: fs.writefile, chown: fs.chown, chmod: fs.chmod, rename: fs.rename
+		},
+		apply_uci: function() {
+			try {
+				let cur = uci_dir ? uci.cursor(uci_dir) : uci.cursor();
+				if (verb == 'fw_zone_save') {
+					let nm = trim('' + params.name);
+					let sid = null;
+					cur.foreach('firewall', 'zone', function(s) {
+						if (s.name == nm || s['.name'] == nm) { sid = s['.name']; return false; }
+					});
+					if (!sid) sid = 'zn_' + replace(nm, /[^a-zA-Z0-9_]/g, '_');
+					expected_sid = sid;
+					cur.set('firewall', sid, 'zone');
+					cur.set('firewall', sid, 'name', nm);
+					cur.set('firewall', sid, 'input', uc(trim('' + (params.input || 'REJECT'))));
+					cur.set('firewall', sid, 'output', uc(trim('' + (params.output || 'ACCEPT'))));
+					cur.set('firewall', sid, 'forward', uc(trim('' + (params.forward || 'REJECT'))));
+					if (params.network != null) cur.set('firewall', sid, 'network', params.network);
+					cur.set('firewall', sid, 'masq', params.masq ? '1' : '0');
+					cur.set('firewall', sid, 'mtu_fix', params.mtu_fix ? '1' : '0');
+					cur.commit('firewall');
+				} else if (verb == 'fw_zone_delete') {
+					let nm = trim('' + params.name);
+					let sid = null;
+					cur.foreach('firewall', 'zone', function(s) {
+						if (s.name == nm || s['.name'] == nm) { sid = s['.name']; return false; }
+					});
+					if (!sid) return { ok: false, error: 'المنطقة غير موجودة' };
+					expected_sid = sid;
+					cur.delete('firewall', sid);
+					cur.commit('firewall');
+				} else if (verb == 'fw_forwarding_save') {
+					let src = trim('' + params.src);
+					let dest = trim('' + params.dest);
+					let sid = trim('' + (params.id || ''));
+					if (sid == '') {
+						cur.foreach('firewall', 'forwarding', function(s) {
+							if (s.src == src && s.dest == dest) { sid = s['.name']; return false; }
+						});
+					}
+					if (sid == '') sid = 'fwd_' + src + '_' + dest;
+					expected_sid = sid;
+					cur.set('firewall', sid, 'forwarding');
+					cur.set('firewall', sid, 'src', src);
+					cur.set('firewall', sid, 'dest', dest);
+					cur.set('firewall', sid, 'enabled', params.enabled === false ? '0' : '1');
+					cur.commit('firewall');
+				} else if (verb == 'fw_forwarding_delete') {
+					let sid = trim('' + params.id);
+					expected_sid = sid;
+					if (cur.get('firewall', sid) != 'forwarding') return { ok: false, error: 'قسم التوجيه غير موجود' };
+					cur.delete('firewall', sid);
+					cur.commit('firewall');
+				} else if (verb == 'wifi_radio_save') {
+					let rad = trim('' + (params.radio || 'radio0'));
+					expected_sid = rad;
+					if (cur.get('wireless', rad) != 'wifi-device') return { ok: false, error: 'جهاز الراديو غير موجود: ' + rad };
+					cur.set('wireless', rad, 'band', lc(trim('' + params.band)));
+					cur.set('wireless', rad, 'channel', trim('' + params.channel));
+					cur.set('wireless', rad, 'htmode', uc(trim('' + params.htmode)));
+					cur.set('wireless', rad, 'country', uc(trim('' + params.country)));
+					if (params.txpower != null && params.txpower != '') cur.set('wireless', rad, 'txpower', '' + int(+params.txpower));
+					if (params.dfs != null) cur.set('wireless', rad, 'dfs', params.dfs ? '1' : '0');
+					cur.set('wireless', rad, 'disabled', params.disabled ? '1' : '0');
+					cur.commit('wireless');
+				} else if (verb == 'wifi_iface_save') {
+					let sid = trim('' + (params.id || ''));
+					if (sid == '') sid = 'wif_' + urandom_hex(4);
+					expected_sid = sid;
+					cur.set('wireless', sid, 'wifi-iface');
+					cur.set('wireless', sid, 'device', trim('' + (params.device || 'radio0')));
+					cur.set('wireless', sid, 'mode', lc(trim('' + (params.mode || 'ap'))));
+					cur.set('wireless', sid, 'network', trim('' + (params.network || 'lan')));
+					cur.set('wireless', sid, 'ssid', '' + params.ssid);
+					cur.set('wireless', sid, 'encryption', lc(trim('' + (params.encryption || 'sae-mixed'))));
+					if (params.encryption != 'none' && params.key) cur.set('wireless', sid, 'key', '' + params.key);
+					if (params.ieee80211w != null && params.ieee80211w != '') cur.set('wireless', sid, 'ieee80211w', '' + params.ieee80211w);
+					if (params.ieee80211r != null) cur.set('wireless', sid, 'ieee80211r', params.ieee80211r ? '1' : '0');
+					cur.set('wireless', sid, 'isolate', params.isolate ? '1' : '0');
+					cur.set('wireless', sid, 'hidden', params.hidden ? '1' : '0');
+					cur.set('wireless', sid, 'disabled', params.disabled ? '1' : '0');
+					cur.commit('wireless');
+				} else if (verb == 'wifi_iface_delete') {
+					let sid = trim('' + params.id);
+					expected_sid = sid;
+					if (cur.get('wireless', sid) != 'wifi-iface') return { ok: false, error: 'الشبكة اللاسلكية غير موجودة' };
+					cur.delete('wireless', sid);
+					cur.commit('wireless');
+				}
+				return { ok: true };
+			} catch (e) {
+				return { ok: false, error: 'فشل تحديث UCI للمرحلة 3C' };
+			}
+		},
+		validate_config: env.validate_fn || function() {
+			if (is_fw) return { ok: system('/sbin/fw4 check >/dev/null 2>&1') == 0, error: 'فشل فحص قواعد fw4' };
+			return { ok: system('/sbin/uci -q show wireless >/dev/null 2>&1') == 0, error: 'فشل التحقق من بنية UCI للواي فاي' };
+		},
+		reload_service: env.reload_fn || function() {
+			if (is_fw) return { ok: system('/etc/init.d/firewall reload >/dev/null 2>&1') == 0, error: 'فشل إعادة تحميل firewall' };
+			return { ok: system('/sbin/wifi reload >/dev/null 2>&1') == 0, error: 'فشل إعادة تحميل wifi' };
+		},
+		verify_applied: function() {
+			let cv = uci_dir ? uci.cursor(uci_dir) : uci.cursor();
+			if (verb == 'fw_zone_save') {
+				if (cv.get('firewall', expected_sid) != 'zone') return { ok: false, error: 'المنطقة غير موجودة بعد التطبيق' };
+				if (cv.get('firewall', expected_sid, 'name') != trim('' + params.name)) return { ok: false, error: 'عدم تطابق اسم المنطقة' };
+				if (cv.get('firewall', expected_sid, 'input') != uc(trim('' + (params.input || 'REJECT')))) return { ok: false, error: 'عدم تطابق input للمنطقة' };
+				if (cv.get('firewall', expected_sid, 'output') != uc(trim('' + (params.output || 'ACCEPT')))) return { ok: false, error: 'عدم تطابق output للمنطقة' };
+				if (cv.get('firewall', expected_sid, 'forward') != uc(trim('' + (params.forward || 'REJECT')))) return { ok: false, error: 'عدم تطابق forward للمنطقة' };
+				if (params.network != null && !array_eq(cv.get('firewall', expected_sid, 'network'), params.network)) return { ok: false, error: 'عدم تطابق شبكات المنطقة' };
+				if (cv.get('firewall', expected_sid, 'masq') != (params.masq ? '1' : '0')) return { ok: false, error: 'عدم تطابق masq للمنطقة' };
+				if (cv.get('firewall', expected_sid, 'mtu_fix') != (params.mtu_fix ? '1' : '0')) return { ok: false, error: 'عدم تطابق mtu_fix للمنطقة' };
+			} else if (verb == 'fw_zone_delete') {
+				if (cv.get('firewall', expected_sid) != null) return { ok: false, error: 'المنطقة ما زالت موجودة بعد الحذف' };
+			} else if (verb == 'fw_forwarding_save') {
+				if (cv.get('firewall', expected_sid) != 'forwarding') return { ok: false, error: 'التوجيه غير موجود بعد التطبيق' };
+				if (cv.get('firewall', expected_sid, 'src') != trim('' + params.src)) return { ok: false, error: 'عدم تطابق src للتوجيه' };
+				if (cv.get('firewall', expected_sid, 'dest') != trim('' + params.dest)) return { ok: false, error: 'عدم تطابق dest للتوجيه' };
+				if (cv.get('firewall', expected_sid, 'enabled') != (params.enabled === false ? '0' : '1')) return { ok: false, error: 'عدم تطابق enabled للتوجيه' };
+			} else if (verb == 'fw_forwarding_delete') {
+				if (cv.get('firewall', expected_sid) != null) return { ok: false, error: 'التوجيه ما زال موجوداً بعد الحذف' };
+			} else if (verb == 'wifi_radio_save') {
+				if (cv.get('wireless', expected_sid, 'band') != lc(trim('' + params.band))) return { ok: false, error: 'عدم تطابق band للراديو' };
+				if (cv.get('wireless', expected_sid, 'channel') != trim('' + params.channel)) return { ok: false, error: 'عدم تطابق channel للراديو' };
+				if (cv.get('wireless', expected_sid, 'htmode') != uc(trim('' + params.htmode))) return { ok: false, error: 'عدم تطابق htmode للراديو' };
+				if (cv.get('wireless', expected_sid, 'country') != uc(trim('' + params.country))) return { ok: false, error: 'عدم تطابق country للراديو' };
+				if (params.txpower != null && params.txpower != '' && cv.get('wireless', expected_sid, 'txpower') != ('' + int(+params.txpower))) return { ok: false, error: 'عدم تطابق txpower للراديو' };
+				if (params.dfs != null && cv.get('wireless', expected_sid, 'dfs') != (params.dfs ? '1' : '0')) return { ok: false, error: 'عدم تطابق dfs للراديو' };
+				if (cv.get('wireless', expected_sid, 'disabled') != (params.disabled ? '1' : '0')) return { ok: false, error: 'عدم تطابق disabled للراديو' };
+			} else if (verb == 'wifi_iface_save') {
+				if (cv.get('wireless', expected_sid) != 'wifi-iface') return { ok: false, error: 'الشبكة اللاسلكية غير موجودة بعد التطبيق' };
+				if (cv.get('wireless', expected_sid, 'device') != trim('' + (params.device || 'radio0'))) return { ok: false, error: 'عدم تطابق device للشبكة' };
+				if (cv.get('wireless', expected_sid, 'mode') != lc(trim('' + (params.mode || 'ap')))) return { ok: false, error: 'عدم تطابق mode للشبكة' };
+				if (cv.get('wireless', expected_sid, 'network') != trim('' + (params.network || 'lan'))) return { ok: false, error: 'عدم تطابق network للشبكة' };
+				if (cv.get('wireless', expected_sid, 'ssid') != ('' + params.ssid)) return { ok: false, error: 'عدم تطابق ssid للشبكة' };
+				if (cv.get('wireless', expected_sid, 'encryption') != lc(trim('' + (params.encryption || 'sae-mixed')))) return { ok: false, error: 'عدم تطابق encryption للشبكة' };
+				if (params.ieee80211w != null && params.ieee80211w != '' && cv.get('wireless', expected_sid, 'ieee80211w') != ('' + params.ieee80211w)) return { ok: false, error: 'عدم تطابق ieee80211w للشبكة' };
+				if (params.ieee80211r != null && cv.get('wireless', expected_sid, 'ieee80211r') != (params.ieee80211r ? '1' : '0')) return { ok: false, error: 'عدم تطابق ieee80211r للشبكة' };
+				if (cv.get('wireless', expected_sid, 'isolate') != (params.isolate ? '1' : '0')) return { ok: false, error: 'عدم تطابق isolate للشبكة' };
+				if (cv.get('wireless', expected_sid, 'hidden') != (params.hidden ? '1' : '0')) return { ok: false, error: 'عدم تطابق hidden للشبكة' };
+				if (cv.get('wireless', expected_sid, 'disabled') != (params.disabled ? '1' : '0')) return { ok: false, error: 'عدم تطابق disabled للشبكة' };
+			} else if (verb == 'wifi_iface_delete') {
+				if (cv.get('wireless', expected_sid) != null) return { ok: false, error: 'الشبكة اللاسلكية ما زالت موجودة بعد الحذف' };
+			}
+			return { ok: true };
+		},
+		on_rollback_failed: function(reason) {
+			return enter_emergency_freeze(reason);
+		}
+	});
+	release_lock();
+	audit_append(actor, verb, target_id, tx_res.ok ? 'committed' : (tx_res.rollback_failed ? 'rollback_failed' : 'rolled_back'), tx_res.message_ar || '');
+	reply_cb(tx_res);
+}
+
 function adguard_sync_rule(action_type, rule_str, actor) {
 	// Fetch current rules from loopback HTTP API first (preserving ALL user-created rules)
 	let st = adguard_http('GET', '/control/filtering/status', null);
@@ -1860,6 +2066,13 @@ function handle_rpc(req, reply_cb) {
 				tables_json: tb.ok ? tb.output : '[]',
 				defaults: fw_defaults,
 				zones: fw_zones,
+				forwardings: (function() {
+					let fw_fwds = [];
+					cur.foreach('firewall', 'forwarding', function(s) {
+						push(fw_fwds, { id: s['.name'], src: s.src || '', dest: s.dest || '', enabled: s.enabled != '0' });
+					});
+					return fw_fwds;
+				})(),
 				rules: fw_rules,
 				redirects: fw_redirects,
 				upnp_rules: upnp.rules || [],
@@ -2666,9 +2879,11 @@ function handle_rpc(req, reply_cb) {
 		'network_bridge_vlan_save': true, 'network_bridge_vlan_delete': true,
 		'network_ipv6_save': true,
 		'wifi_scan': true, 'wifi_save_uplink': true, 'wifi_save_ap': true,
+		'wifi_radio_save': true, 'wifi_iface_save': true, 'wifi_iface_delete': true,
 		'sqm_update': true,
 		'fw_add_redirect': true, 'fw_delete_redirect': true, 'fw_toggle_rule': true,
 		'fw_add_rule': true, 'fw_delete_rule': true, 'fw_save_defaults': true,
+		'fw_zone_save': true, 'fw_zone_delete': true, 'fw_forwarding_save': true, 'fw_forwarding_delete': true,
 		'banip_save_config': true, 'banip_list_edit': true, 'upnp_save_config': true,
 		'docker_control': true, 'tailscale_control': true,
 		'service_restart': true, 'service_action': true,
@@ -3725,6 +3940,13 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 	    verb == 'network_device_save' || verb == 'network_bridge_vlan_save' ||
 	    verb == 'network_bridge_vlan_delete' || verb == 'network_ipv6_save') {
 		handle_network_phase3b_verb(verb, params, actor, reply_cb, null);
+		return;
+	}
+
+	if (verb == 'fw_zone_save' || verb == 'fw_zone_delete' ||
+	    verb == 'fw_forwarding_save' || verb == 'fw_forwarding_delete' ||
+	    verb == 'wifi_radio_save' || verb == 'wifi_iface_save' || verb == 'wifi_iface_delete') {
+		handle_phase3c_verb(verb, params, actor, reply_cb, null);
 		return;
 	}
 
