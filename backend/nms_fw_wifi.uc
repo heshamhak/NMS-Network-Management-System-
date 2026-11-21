@@ -123,3 +123,124 @@ export function validate_wifi_iface_cfg(cfg) {
 	}
 	return { ok: true, device: device, mode: mode, network: net, ssid: ssid, encryption: enc };
 };
+
+export function parse_iw_phy_capabilities(iw_phy_out, iw_reg_out) {
+	let bands = {};
+	let cur_band = null;
+	let in_freqs = false;
+	for (let raw_ln in split(iw_phy_out || '', '\n')) {
+		let ln = trim(raw_ln);
+		if (match(ln, /^Band 1:/)) { cur_band = '2g'; bands['2g'] = { channels: {}, htmodes: { 'HT20': true, 'HT40': true } }; in_freqs = false; continue; }
+		if (match(ln, /^Band 2:/)) { cur_band = '5g'; bands['5g'] = { channels: {}, htmodes: { 'HT20': true, 'HT40': true } }; in_freqs = false; continue; }
+		if (match(ln, /^Band 4:/)) { cur_band = '6g'; bands['6g'] = { channels: {}, htmodes: { 'HE20': true, 'HE40': true } }; in_freqs = false; continue; }
+		if (!cur_band) continue;
+		if (index(ln, 'Frequencies:') == 0) { in_freqs = true; continue; }
+		if (index(ln, 'Bitrates') == 0 || index(ln, 'VHT Capabilities') == 0 || index(ln, 'HE Iftypes') == 0 || index(ln, 'EHT Iftypes') == 0) in_freqs = false;
+		if (index(ln, 'VHT Capabilities') >= 0) {
+			bands[cur_band].htmodes['VHT20'] = true;
+			bands[cur_band].htmodes['VHT40'] = true;
+			bands[cur_band].htmodes['VHT80'] = true;
+		}
+		if (index(ln, 'Supported Channel Width: 160 MHz') >= 0 || index(ln, 'VHT160') >= 0) {
+			bands[cur_band].htmodes['VHT160'] = true;
+			bands[cur_band].htmodes['HE160'] = true;
+		}
+		if (index(ln, 'HE Iftypes') >= 0 || index(ln, 'HE MAC Capabilities') >= 0) {
+			bands[cur_band].htmodes['HE20'] = true;
+			bands[cur_band].htmodes['HE40'] = true;
+			bands[cur_band].htmodes['HE80'] = true;
+		}
+		if (index(ln, 'EHT Iftypes') >= 0 || index(ln, 'EHT320') >= 0) {
+			bands[cur_band].htmodes['EHT20'] = true;
+			bands[cur_band].htmodes['EHT40'] = true;
+			bands[cur_band].htmodes['EHT80'] = true;
+			bands[cur_band].htmodes['EHT160'] = true;
+			if (index(ln, '320 MHz') >= 0 || index(ln, 'EHT320') >= 0) bands[cur_band].htmodes['EHT320'] = true;
+		}
+		if (in_freqs) {
+			let mf = match(ln, /^\*\s+([0-9.]+)\s+MHz\s+\[([0-9]+)\](\s+\(([0-9.]+)\s+dBm\))?(.*)$/);
+			if (mf) {
+				let freq = int(+mf[1]);
+				let ch = '' + int(+mf[2]);
+				let max_dbm = mf[4] != null && mf[4] != '' ? int(+mf[4]) : 20;
+				let flags = lc(mf[5] || '');
+				bands[cur_band].channels[ch] = {
+					freq: freq,
+					max_dbm: max_dbm,
+					radar: index(flags, 'radar detection') >= 0,
+					disabled: index(flags, 'disabled') >= 0,
+					no_ir: index(flags, 'no ir') >= 0
+				};
+			}
+		}
+	}
+	let reg = { country: '', dfs_region: '', rules: [] };
+	for (let raw_ln in split(iw_reg_out || '', '\n')) {
+		let ln = trim(raw_ln);
+		let mc = match(ln, /^country\s+([A-Z0-9]{2}):(\s+DFS-([A-Z]+))?/);
+		if (mc) { reg.country = mc[1]; reg.dfs_region = mc[3] || ''; continue; }
+		let mr = match(ln, /^\(([0-9]+)\s*-\s*([0-9]+)\s*@\s*([0-9]+)\),\s*\([^,]*,\s*([0-9]+)\),(.*)$/);
+		if (mr) {
+			push(reg.rules, {
+				start_mhz: int(+mr[1]),
+				end_mhz: int(+mr[2]),
+				max_bw: int(+mr[3]),
+				max_dbm: int(+mr[4]),
+				dfs: index(uc(mr[5] || ''), 'DFS') >= 0
+			});
+		}
+	}
+	return { bands: bands, reg: reg };
+};
+
+export function validate_wifi_radio_against_caps(cfg, parsed_caps) {
+	let base = validate_wifi_radio_cfg(cfg);
+	if (!base.ok) return base;
+	if (!parsed_caps || type(parsed_caps.bands) != 'object' || length(keys(parsed_caps.bands)) == 0) {
+		return { ok: false, error: 'تعذر اكتشاف قدرات الراديو الفعلية (iw phy) — تم الرفض الآمن' };
+	}
+	let band_info = parsed_caps.bands[base.band];
+	if (!band_info) {
+		return { ok: false, error: 'الراديو الفعلي لا يدعم نطاق التردد: ' + base.band };
+	}
+	if (!band_info.htmodes[base.htmode]) {
+		return { ok: false, error: 'الراديو الفعلي لا يدعم عرض النطاق: ' + base.htmode };
+	}
+	let reg = parsed_caps.reg || { country: '', dfs_region: '', rules: [] };
+	if (reg.country != '' && reg.country != '00' && base.country != reg.country && cfg.require_reg_match) {
+		return { ok: false, error: 'رمز الدولة المطلوب لا يطابق النطاق التنظيمي النشط: ' + reg.country };
+	}
+	let ch_info = null;
+	if (base.channel != 'auto') {
+		ch_info = band_info.channels[base.channel];
+		if (!ch_info || ch_info.disabled) {
+			return { ok: false, error: 'القناة ' + base.channel + ' غير مدعومة أو معطلة تنظيمياً على هذا الراديو' };
+		}
+		if (ch_info.radar && cfg.dfs === false) {
+			return { ok: false, error: 'القناة ' + base.channel + ' تتطلب تفعيل DFS (radar detection) إلزامياً' };
+		}
+		if (cfg.dfs && !ch_info.radar) {
+			return { ok: false, error: 'القناة ' + base.channel + ' ليست قناة DFS ولا تدعم كشف الرادار' };
+		}
+	} else if (cfg.dfs) {
+		let has_radar = false;
+		for (let k in keys(band_info.channels)) {
+			if (band_info.channels[k].radar && !band_info.channels[k].disabled) { has_radar = true; break; }
+		}
+		if (!has_radar) return { ok: false, error: 'لا توجد قنوات DFS صالحة على نطاق ' + base.band };
+	}
+	if (cfg.txpower != null && cfg.txpower != '') {
+		let txp = +cfg.txpower;
+		if (ch_info && txp > ch_info.max_dbm) {
+			return { ok: false, error: sprintf('قدرة الإرسال %d dBm تتجاوز حد العتاد للقناة (%d dBm)', txp, ch_info.max_dbm) };
+		}
+		if (ch_info && length(reg.rules) > 0) {
+			for (let rl in reg.rules) {
+				if (ch_info.freq >= rl.start_mhz && ch_info.freq <= rl.end_mhz && txp > rl.max_dbm) {
+					return { ok: false, error: sprintf('قدرة الإرسال %d dBm تتجاوز الحد التنظيمي (%d dBm)', txp, rl.max_dbm) };
+				}
+			}
+		}
+	}
+	return { ok: true, radio: base.radio, band: base.band, channel: base.channel, htmode: base.htmode, country: base.country };
+};

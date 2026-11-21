@@ -39,11 +39,18 @@ fs.chmod(uci_dir + '/firewall', 0o644);
 fs.writefile(uci_dir + '/wireless', base_wifi);
 fs.chmod(uci_dir + '/wireless', 0o644);
 
+let iw_phy_sample = "Wiphy phy1\n\tBand 1:\n\t\tFrequencies:\n\t\t\t* 2437.0 MHz [6] (20.0 dBm)\n\t\t\t* 2462.0 MHz [11] (20.0 dBm)\n\tBand 2:\n\t\tVHT Capabilities (0x338001b2):\n\t\tSupported Channel Width: 160 MHz\n\t\tHE Iftypes: AP\n\t\tFrequencies:\n\t\t\t* 5180.0 MHz [36] (20.0 dBm)\n\t\t\t* 5500.0 MHz [100] (20.0 dBm) (radar detection)\n\t\t\t* 5520.0 MHz [104] (disabled)\n";
+let iw_reg_sample = "global\ncountry DE: DFS-ETSI\n\t(2400 - 2483 @ 40), (N/A, 20), (N/A)\n\t(5150 - 5250 @ 80), (N/A, 20), (N/A)\n\t(5470 - 5725 @ 160), (N/A, 20), (0 ms), DFS\n";
+let parsed_caps = nms_fw_wifi.parse_iw_phy_capabilities(iw_phy_sample, iw_reg_sample);
+
 function run_p3c(verb, params, extra_env) {
 	let rep = null;
 	let env = {
 		cfg_dir: uci_dir,
 		uci_dir: uci_dir,
+		discover_wifi_caps: function(r) { return parsed_caps; },
+		read_wifi_runtime: function(r) { return { up: !params.disabled, country: params.country, channel: params.channel, dfs_active: !!params.dfs }; },
+		read_wifi_iface_runtime: function(sid) { return { operational: true, ssid: params.ssid }; },
 		validate_fn: function() { return { ok: true }; },
 		reload_fn: function() { return { ok: true }; }
 	};
@@ -128,6 +135,61 @@ let r_wf_mis = run_p3c('wifi_radio_save', { radio: 'radio0', band: '2g', channel
 	}
 });
 check(!r_wf_mis.ok && r_wf_mis.rolled_back === true && r_wf_mis.error == 'verify_failed' && fs.readfile(uci_dir + '/wireless') == snap_wifi, 'P3C-PROD[real_wifi_mismatch_triggers_rollback]', sprintf('%J', r_wf_mis));
+
+// 2d. Hardware & regulatory capability rejections + post-reload runtime mismatch + rollback failure freeze
+let r_bad_band = run_p3c('wifi_radio_save', { radio: 'radio1', band: '6g', channel: '1', htmode: 'HE80', country: 'DE', txpower: 20 });
+check(!r_bad_band.ok && r_bad_band.error_code == 'VALIDATION', 'P3C-CAP[reject_unsupported_band_6g]', sprintf('%J', r_bad_band));
+
+let r_bad_bw = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '36', htmode: 'EHT320', country: 'DE', txpower: 20 });
+check(!r_bad_bw.ok && r_bad_bw.error_code == 'VALIDATION', 'P3C-CAP[reject_unsupported_eht320]', sprintf('%J', r_bad_bw));
+
+let r_bad_txp = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 25, dfs: true });
+check(!r_bad_txp.ok && r_bad_txp.error_code == 'VALIDATION', 'P3C-CAP[reject_txpower_exceeds_reg_and_hw]', sprintf('%J', r_bad_txp));
+
+let r_bad_dfs_ch36 = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '36', htmode: 'HE80', country: 'DE', txpower: 20, dfs: true });
+check(!r_bad_dfs_ch36.ok && r_bad_dfs_ch36.error_code == 'VALIDATION', 'P3C-CAP[reject_dfs_on_non_radar_ch36]', sprintf('%J', r_bad_dfs_ch36));
+
+let r_no_dfs_ch100 = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 20, dfs: false });
+check(!r_no_dfs_ch100.ok && r_no_dfs_ch100.error_code == 'VALIDATION', 'P3C-CAP[reject_missing_dfs_on_radar_ch100]', sprintf('%J', r_no_dfs_ch100));
+
+// Post-reload runtime mismatch (UCI succeeds, reload succeeds, but runtime reports dfs_active=false / wrong channel -> MUST roll back!)
+let snap_wf_rt = fs.readfile(uci_dir + '/wireless');
+let r_rt_mis = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 20, dfs: true, disabled: false }, {
+	read_wifi_runtime: function(r) { return { up: true, country: 'DE', channel: '36', dfs_active: false }; }
+});
+check(!r_rt_mis.ok && r_rt_mis.rolled_back === true && r_rt_mis.error == 'verify_failed' && fs.readfile(uci_dir + '/wireless') == snap_wf_rt, 'P3C-PROD[runtime_dfs_channel_mismatch_triggers_rollback]', sprintf('%J', r_rt_mis));
+
+// Wireless reload failure -> MUST roll back wireless UCI config cleanly
+let rc_wf_rel = 0;
+let r_wf_rel = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 20, dfs: true, disabled: false }, {
+	reload_fn: function() {
+		rc_wf_rel++;
+		if (rc_wf_rel == 1) return { ok: false, error: 'wifi_reload_failed' };
+		return { ok: true };
+	}
+});
+check(!r_wf_rel.ok && r_wf_rel.rolled_back === true && fs.readfile(uci_dir + '/wireless') == snap_wf_rt, 'P3C-PROD[wifi_reload_failure_triggers_rollback]', sprintf('%J', r_wf_rel));
+
+// Wireless rollback failure -> MUST trigger emergency freeze
+let r_wf_rbf = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 20, dfs: true, disabled: false }, {
+	reload_fn: function() { return { ok: false, error: 'wifi_reload_failed' }; },
+	aw_ops: {
+		suffix: function() { return 'rbf'; },
+		stat: fs.stat,
+		unlink: fs.unlink,
+		open: fs.open,
+		writefile: fs.writefile,
+		chown: fs.chown,
+		chmod: fs.chmod,
+		rename: function(src, dst) {
+			if (dst == uci_dir + '/wireless') return null;
+			return fs.rename(src, dst);
+		},
+		error: function() { return 'EIO: simulated rollback rename failure'; }
+	}
+});
+check(!r_wf_rbf.ok && r_wf_rbf.rollback_failed === true && helperd_prod.get_freeze_state().frozen === true, 'P3C-PROD[wifi_rollback_failure_triggers_emergency_freeze]', sprintf('%J', r_wf_rbf));
+helperd_prod.clear_freeze_mem();
 
 printf('UCODE3C_SUMMARY: %d passed, %d failed\n', passed, failed);
 exit(failed == 0 ? 0 : 1);

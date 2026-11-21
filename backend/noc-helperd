@@ -1306,6 +1306,29 @@ function handle_phase3c_verb(verb, params, actor, reply_cb, p3c_env) {
 	} else if (verb == 'wifi_radio_save') {
 		let v = nms_fw_wifi.validate_wifi_radio_cfg(params);
 		if (!v.ok) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: v.error }); return; }
+		let caps = null;
+		if (env.discover_wifi_caps) {
+			caps = env.discover_wifi_caps(v.radio);
+		} else {
+			let cur_r = uci_dir ? uci.cursor(uci_dir) : uci.cursor();
+			let phy_idx = replace(v.radio, /^radio/, 'phy');
+			let phy_path = cur_r.get('wireless', v.radio, 'path') || '';
+			let phy_out = '';
+			let reg_out = '';
+			if (fs.stat('/usr/sbin/iw')) {
+				let tmp_p = RUN_DIR + '/iw_phy_' + urandom_hex(4);
+				let tmp_r = RUN_DIR + '/iw_reg_' + urandom_hex(4);
+				system(sprintf('/usr/sbin/iw phy %s info >%s 2>/dev/null', phy_idx, tmp_p));
+				system(sprintf('/usr/sbin/iw reg get >%s 2>/dev/null', tmp_r));
+				phy_out = fs.readfile(tmp_p) || '';
+				reg_out = fs.readfile(tmp_r) || '';
+				if (fs.stat(tmp_p)) fs.unlink(tmp_p);
+				if (fs.stat(tmp_r)) fs.unlink(tmp_r);
+			}
+			caps = nms_fw_wifi.parse_iw_phy_capabilities(phy_out, reg_out);
+		}
+		let vc = nms_fw_wifi.validate_wifi_radio_against_caps(params, caps);
+		if (!vc.ok) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: vc.error }); return; }
 	} else if (verb == 'wifi_iface_save') {
 		let v = nms_fw_wifi.validate_wifi_iface_cfg(params);
 		if (!v.ok) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: v.error }); return; }
@@ -1458,6 +1481,19 @@ function handle_phase3c_verb(verb, params, actor, reply_cb, p3c_env) {
 				if (params.txpower != null && params.txpower != '' && cv.get('wireless', expected_sid, 'txpower') != ('' + int(+params.txpower))) return { ok: false, error: 'عدم تطابق txpower للراديو' };
 				if (params.dfs != null && cv.get('wireless', expected_sid, 'dfs') != (params.dfs ? '1' : '0')) return { ok: false, error: 'عدم تطابق dfs للراديو' };
 				if (cv.get('wireless', expected_sid, 'disabled') != (params.disabled ? '1' : '0')) return { ok: false, error: 'عدم تطابق disabled للراديو' };
+				let rt = env.read_wifi_runtime ? env.read_wifi_runtime(expected_sid) : (function() {
+					let uctx = ubus.connect();
+					let ws = uctx ? uctx.call('network.wireless', 'status') : null;
+					if (uctx) try { uctx.disconnect(); } catch (e) {}
+					let rinfo = (ws && ws[expected_sid]) ? ws[expected_sid] : null;
+					return rinfo ? { up: !!rinfo.up, config: rinfo.config || {}, dfs_active: !!(rinfo.config && rinfo.config.dfs) } : null;
+				})();
+				if (!rt) return { ok: false, error: 'تعذر التحقق من حالة الراديو الفعلية بعد إعادة التحميل' };
+				let exp_up = !params.disabled;
+				if (rt.up !== exp_up) return { ok: false, error: 'حالة تشغيل الراديو الفعلية لا تطابق المطلوب' };
+				if (rt.country && uc(rt.country) != uc(trim('' + params.country))) return { ok: false, error: 'رمز الدولة الفعلي على الراديو لا يطابق المطلوب' };
+				if (trim('' + params.channel) != 'auto' && rt.channel && ('' + rt.channel) != trim('' + params.channel)) return { ok: false, error: 'القناة الفعلية على الراديو لا تطابق المطلوب' };
+				if (params.dfs && !rt.dfs_active) return { ok: false, error: 'ميزة DFS غير نشطة فعلياً على الراديو بعد إعادة التحميل' };
 			} else if (verb == 'wifi_iface_save') {
 				if (cv.get('wireless', expected_sid) != 'wifi-iface') return { ok: false, error: 'الشبكة اللاسلكية غير موجودة بعد التطبيق' };
 				if (cv.get('wireless', expected_sid, 'device') != trim('' + (params.device || 'radio0'))) return { ok: false, error: 'عدم تطابق device للشبكة' };
@@ -1470,6 +1506,21 @@ function handle_phase3c_verb(verb, params, actor, reply_cb, p3c_env) {
 				if (cv.get('wireless', expected_sid, 'isolate') != (params.isolate ? '1' : '0')) return { ok: false, error: 'عدم تطابق isolate للشبكة' };
 				if (cv.get('wireless', expected_sid, 'hidden') != (params.hidden ? '1' : '0')) return { ok: false, error: 'عدم تطابق hidden للشبكة' };
 				if (cv.get('wireless', expected_sid, 'disabled') != (params.disabled ? '1' : '0')) return { ok: false, error: 'عدم تطابق disabled للشبكة' };
+				let rt_if = env.read_wifi_iface_runtime ? env.read_wifi_iface_runtime(expected_sid) : (function() {
+					let uctx = ubus.connect();
+					let ws = uctx ? uctx.call('network.wireless', 'status') : null;
+					if (uctx) try { uctx.disconnect(); } catch (e) {}
+					let rad = trim('' + (params.device || 'radio0'));
+					let rinfo = (ws && ws[rad]) ? ws[rad] : null;
+					if (!rinfo || type(rinfo.interfaces) != 'array') return null;
+					for (let itf in rinfo.interfaces) {
+						if (itf.section == expected_sid) return { operational: !!rinfo.up, ssid: (itf.config && itf.config.ssid) || '' };
+					}
+					return null;
+				})();
+				if (!params.disabled && (!rt_if || !rt_if.operational || rt_if.ssid != ('' + params.ssid))) {
+					return { ok: false, error: 'الواجهة اللاسلكية غير نشطة فعلياً بعد إعادة التحميل' };
+				}
 			} else if (verb == 'wifi_iface_delete') {
 				if (cv.get('wireless', expected_sid) != null) return { ok: false, error: 'الشبكة اللاسلكية ما زالت موجودة بعد الحذف' };
 			}
