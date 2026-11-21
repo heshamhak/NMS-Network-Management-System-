@@ -770,6 +770,7 @@ req_helper_syms = [
     "['list-upgradable']",
     "fs.lstat(SYSUPGRADE_CONF_PATH)",
     "nms_archive.merge_sysupgrade_conf(",
+    "nms_archive.atomic_write_checked(",
     "if (!atomic_write(",
 ]
 req_uc_syms = [
@@ -778,6 +779,7 @@ req_uc_syms = [
     "export function resolve_symlink_target(",
     "export function is_safe_sysupgrade_path(",
     "export function merge_sysupgrade_conf(",
+    "export function atomic_write_checked(",
 ]
 missing_syms = [s for s in req_helper_syms if s not in helperd_src]
 missing_uc = [s for s in req_uc_syms if s not in archive_uc_src]
@@ -788,11 +790,14 @@ if not missing_syms and not missing_uc and not missing_apid:
 else:
     fail(f"P3A-STRUCT: missing symbols helper={missing_syms}, uc={missing_uc}, apid={missing_apid}")
 
-# 6b. Production ucode archive validator execution (ONLY if ucode runtime is installed; never duplicated in Python)
-import tarfile, io
+# 6b. Production ucode archive validator & atomic_write_checked execution inside isolated OpenWrt x86_64 rootfs
+import tarfile, io, struct
 
+openwrt_rootfs = "/tmp/openwrt-x86-64-rootfs"
+has_openwrt_chroot = os.path.isfile(os.path.join(openwrt_rootfs, "usr/bin/ucode"))
 ucode_bin = shutil.which("ucode")
-if ucode_bin:
+
+if has_openwrt_chroot or ucode_bin:
     with tempfile.TemporaryDirectory() as td_arc:
         def make_tar(fname, builder):
             p = os.path.join(td_arc, fname)
@@ -817,6 +822,39 @@ if ucode_bin:
             hi.linkname = target
             tf.addfile(hi)
 
+        def fix_chksum(hdr_bytes):
+            b = bytearray(hdr_bytes)
+            b[148:156] = b"        "
+            chk = sum(b)
+            b[148:156] = f"{chk:06o}\0 ".encode("ascii")
+            return bytes(b)
+
+        def raw_tar_block(name, tflag=b"0", size=0, linkname=b"", payload=b""):
+            b = bytearray(512)
+            b[0:len(name)] = name
+            b[100:108] = b"0000644\0"
+            b[108:116] = b"0000000\0"
+            b[116:124] = b"0000000\0"
+            b[124:136] = f"{size:011o}\0".encode("ascii")
+            b[136:148] = b"00000000000\0"
+            b[156:157] = tflag
+            b[157:157 + len(linkname)] = linkname
+            b[257:263] = b"ustar\0"
+            b[263:265] = b"00"
+            out = fix_chksum(b)
+            if payload:
+                pad = (512 - (len(payload) % 512)) % 512
+                out += payload + (b"\x00" * pad)
+            return out
+
+        def pax_rec(k, v):
+            body = f" {k}={v}\n".encode("utf-8")
+            # compute total length including digits
+            l = len(body) + 2
+            while len(f"{l}".encode("ascii")) + len(body) != l:
+                l = len(f"{l}".encode("ascii")) + len(body)
+            return f"{l}".encode("ascii") + body
+
         valid_tar = make_tar("valid.tar", lambda tf: (
             add_reg(tf, "etc/config/network"),
             add_reg(tf, "etc/my file -> with arrow.conf"),
@@ -825,7 +863,8 @@ if ucode_bin:
         ))
         abs_sym = make_tar("abs_sym.tar", lambda tf: add_sym(tf, "etc/bad", "/etc/shadow"))
         abs_hard = make_tar("abs_hard.tar", lambda tf: add_hard(tf, "etc/badh", "/etc/passwd"))
-        rel_esc = make_tar("rel_esc.tar", lambda tf: add_sym(tf, "etc/sub/esc", "../../etc/shadow"))
+        rel_esc = make_tar("rel_esc.tar", lambda tf: add_sym(tf, "etc/sub/esc", "../../../etc/shadow"))
+        rel_scope = make_tar("rel_scope.tar", lambda tf: add_sym(tf, "etc/sub/esc2", "../../tmp/evil"))
         nested_trav = make_tar("nested_trav.tar", lambda tf: add_reg(tf, "etc/a/../../b"))
         nl_name = make_tar("nl_name.tar", lambda tf: add_reg(tf, "etc/bad\nname"))
         out_scope = make_tar("out_scope.tar", lambda tf: add_reg(tf, "tmp/evil.sh"))
@@ -833,33 +872,107 @@ if ucode_bin:
         open(partial_tar, "wb").write(open(valid_tar, "rb").read()[:300])
         empty_tar = make_tar("empty.tar", lambda tf: None)
 
-        harness_uc = os.path.join(td_arc, "test_archive.uc")
-        open(harness_uc, "w").write(
-            f"import * as fs from 'fs';\n"
-            f"import * as na from '{archive_uc_path}';\n"
-            f"let r = na.validate_tar_stream(fs.readfile(ARGV[0]) || '');\n"
-            f"printf('%J\\n', r);\n"
+        # 1. Bad TAR checksum
+        bad_chk_data = bytearray(open(valid_tar, "rb").read())
+        bad_chk_data[148] = ord("9")
+        open(os.path.join(td_arc, "bad_chksum.tar"), "wb").write(bad_chk_data)
+
+        # 2. Invalid octal size field
+        bad_oct = bytearray(raw_tar_block(b"etc/x", size=2))
+        bad_oct[124:136] = b"00000000099\0"
+        bad_oct = bytearray(fix_chksum(bad_oct[:512])) + bad_oct[512:] + b"\x00" * 1024
+        open(os.path.join(td_arc, "bad_octal.tar"), "wb").write(bad_oct)
+
+        # 3. Malformed PAX record (missing '=')
+        bad_pax_payload = b"11 badrecord\n"
+        open(os.path.join(td_arc, "bad_pax.tar"), "wb").write(
+            raw_tar_block(b"PaxHeader/x", tflag=b"x", size=len(bad_pax_payload), payload=bad_pax_payload)
+            + raw_tar_block(b"etc/x") + b"\x00" * 1024
         )
 
-        for label, path, expect_valid in [
-            ("valid_spaces_arrows_links", valid_tar, True),
-            ("abs_symlink", abs_sym, False),
-            ("abs_hardlink", abs_hard, False),
-            ("rel_symlink_escape", rel_esc, False),
-            ("nested_traversal", nested_trav, False),
-            ("newline_filename", nl_name, False),
-            ("out_of_scope", out_scope, False),
-            ("partial_write", partial_tar, False),
-            ("empty_archive", empty_tar, False),
-        ]:
-            ru = subprocess.run([ucode_bin, harness_uc, path], capture_output=True, text=True)
-            res = json.loads(ru.stdout) if ru.returncode == 0 and ru.stdout.strip() else {"valid": None}
-            if res.get("valid") is expect_valid:
-                ok(f"P3A-UCODE[{label}]: valid={expect_valid}")
-            else:
-                fail(f"P3A-UCODE[{label}]: expected valid={expect_valid}, got {ru.stdout} {ru.stderr}")
+        # 4. Global PAX overriding path (rejected) vs valid global PAX mtime (accepted)
+        gpax_bad = pax_rec("path", "/etc/shadow")
+        open(os.path.join(td_arc, "gpax_bad.tar"), "wb").write(
+            raw_tar_block(b"pax_global_header", tflag=b"g", size=len(gpax_bad), payload=gpax_bad)
+            + raw_tar_block(b"etc/x") + b"\x00" * 1024
+        )
+        gpax_ok = pax_rec("mtime", "1700000000")
+        open(os.path.join(td_arc, "gpax_ok.tar"), "wb").write(
+            raw_tar_block(b"pax_global_header", tflag=b"g", size=len(gpax_ok), payload=gpax_ok)
+            + raw_tar_block(b"etc/x") + b"\x00" * 1024
+        )
+
+        # 5. GNU longname (valid vs traversal vs empty)
+        long_ok = b"etc/" + (b"a" * 110) + b".conf\0"
+        open(os.path.join(td_arc, "gnu_long_ok.tar"), "wb").write(
+            raw_tar_block(b"././@LongLink", tflag=b"L", size=len(long_ok), payload=long_ok)
+            + raw_tar_block(b"etc/short") + b"\x00" * 1024
+        )
+        long_bad = b"etc/../../etc/shadow\0"
+        open(os.path.join(td_arc, "gnu_long_trav.tar"), "wb").write(
+            raw_tar_block(b"././@LongLink", tflag=b"L", size=len(long_bad), payload=long_bad)
+            + raw_tar_block(b"etc/short") + b"\x00" * 1024
+        )
+
+        # 6. Missing end-of-archive zero blocks (only 1 zero block instead of 2)
+        open(os.path.join(td_arc, "missing_eof.tar"), "wb").write(
+            raw_tar_block(b"etc/x") + b"\x00" * 512
+        )
+
+        # 7. Conflicting PAX path vs GNU longname
+        pax_conf = pax_rec("path", "etc/a")
+        gnu_conf = b"etc/b\0"
+        open(os.path.join(td_arc, "conflicting_meta.tar"), "wb").write(
+            raw_tar_block(b"PaxHeader/x", tflag=b"x", size=len(pax_conf), payload=pax_conf)
+            + raw_tar_block(b"././@LongLink", tflag=b"L", size=len(gnu_conf), payload=gnu_conf)
+            + raw_tar_block(b"etc/c") + b"\x00" * 1024
+        )
+
+        cases = [
+            {"name": "valid_spaces_arrows_links", "file": "valid.tar", "expect_valid": True},
+            {"name": "abs_symlink", "file": "abs_sym.tar", "expect_valid": False},
+            {"name": "abs_hardlink", "file": "abs_hard.tar", "expect_valid": False},
+            {"name": "rel_symlink_escape_root", "file": "rel_esc.tar", "expect_valid": False},
+            {"name": "rel_symlink_escape_scope", "file": "rel_scope.tar", "expect_valid": False},
+            {"name": "nested_traversal", "file": "nested_trav.tar", "expect_valid": False},
+            {"name": "newline_filename", "file": "nl_name.tar", "expect_valid": False},
+            {"name": "out_of_scope", "file": "out_scope.tar", "expect_valid": False},
+            {"name": "partial_write", "file": "partial.tar", "expect_valid": False},
+            {"name": "empty_archive", "file": "empty.tar", "expect_valid": False},
+            {"name": "bad_checksum", "file": "bad_chksum.tar", "expect_valid": False},
+            {"name": "bad_octal_size", "file": "bad_octal.tar", "expect_valid": False},
+            {"name": "malformed_pax", "file": "bad_pax.tar", "expect_valid": False},
+            {"name": "global_pax_path_override", "file": "gpax_bad.tar", "expect_valid": False},
+            {"name": "global_pax_valid_mtime", "file": "gpax_ok.tar", "expect_valid": True},
+            {"name": "gnu_longname_valid", "file": "gnu_long_ok.tar", "expect_valid": True},
+            {"name": "gnu_longname_traversal", "file": "gnu_long_trav.tar", "expect_valid": False},
+            {"name": "missing_eof_markers", "file": "missing_eof.tar", "expect_valid": False},
+            {"name": "conflicting_pax_gnu", "file": "conflicting_meta.tar", "expect_valid": False},
+        ]
+        open(os.path.join(td_arc, "manifest.json"), "w").write(json.dumps({"cases": cases}))
+
+        if has_openwrt_chroot:
+            chroot_stage = os.path.join(openwrt_rootfs, "tmp/p3a_test")
+            shutil.rmtree(chroot_stage, ignore_errors=True)
+            shutil.copytree(td_arc, chroot_stage)
+            shutil.copy2(archive_uc_path, os.path.join(chroot_stage, "nms_archive.uc"))
+            shutil.copy2(os.path.join(ROOT, "tests/verify_phase3a_ucode.uc"), os.path.join(chroot_stage, "verify_phase3a_ucode.uc"))
+            try:
+                ru = subprocess.run(
+                    ["unshare", "-r", "/usr/sbin/chroot", openwrt_rootfs, "/usr/bin/ucode", "/tmp/p3a_test/verify_phase3a_ucode.uc", "/tmp/p3a_test/nms_archive.uc", "/tmp/p3a_test"],
+                    capture_output=True, text=True
+                )
+                for line in ru.stdout.splitlines():
+                    if line.startswith("[PASS] "):
+                        ok(line[len("[PASS] "):])
+                    elif line.startswith("[FAIL] "):
+                        fail(line[len("[FAIL] "):])
+                if ru.returncode != 0 and "UCODE_SUMMARY:" not in ru.stdout:
+                    fail(f"P3A-UCODE: runner failed rc={ru.returncode}: {ru.stderr}")
+            finally:
+                shutil.rmtree(chroot_stage, ignore_errors=True)
 else:
-    print("[SKIP] P3A-UCODE: ucode runtime unavailable on Debian host; production archive validator NOT executed")
+    print("[SKIP] P3A-UCODE: ucode runtime unavailable; production archive validator NOT executed")
 
 # 6c. APK/OPKG fixture detection
 with tempfile.TemporaryDirectory() as td_pm:

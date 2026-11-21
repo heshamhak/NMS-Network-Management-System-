@@ -84,30 +84,16 @@ function read_json(path, fallback) {
 }
 
 function atomic_write(path, content, mode, uid, gid) {
-	let tmp = path + '.tmp.' + now_mono_ms() + '.' + urandom_hex(4);
-	let cleanup = function() {
-		if (fs.stat(tmp)) fs.unlink(tmp);
-	};
-	let w = fs.writefile(tmp, content);
-	if (w == null || w != length(content)) {
-		cleanup();
-		return false;
-	}
-	if (uid != null && gid != null) {
-		if (!fs.chown(tmp, uid, gid)) {
-			cleanup();
-			return false;
-		}
-	}
-	if (!fs.chmod(tmp, mode || 0o600)) {
-		cleanup();
-		return false;
-	}
-	if (!fs.rename(tmp, path)) {
-		cleanup();
-		return false;
-	}
-	return true;
+	let r = nms_archive.atomic_write_checked(path, content, mode, uid, gid, {
+		suffix: function() { return now_mono_ms() + '.' + urandom_hex(4); },
+		stat: fs.stat,
+		unlink: fs.unlink,
+		writefile: fs.writefile,
+		chown: fs.chown,
+		chmod: fs.chmod,
+		rename: fs.rename
+	});
+	return r.ok;
 }
 
 const SYSUPGRADE_CONF_PATH = '/etc/sysupgrade.conf';
