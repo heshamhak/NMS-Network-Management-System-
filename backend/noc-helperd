@@ -88,6 +88,7 @@ function atomic_write(path, content, mode, uid, gid) {
 		suffix: function() { return now_mono_ms() + '.' + urandom_hex(4); },
 		stat: fs.stat,
 		unlink: fs.unlink,
+		open: fs.open,
 		writefile: fs.writefile,
 		chown: fs.chown,
 		chmod: fs.chmod,

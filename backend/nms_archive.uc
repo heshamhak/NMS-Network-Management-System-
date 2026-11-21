@@ -328,26 +328,43 @@ export function merge_sysupgrade_conf(existing_raw, new_paths) {
 export function atomic_write_checked(path, content, mode, uid, gid, ops) {
 	let tmp = path + '.tmp.' + ops.suffix();
 	let cleanup = function() {
-		if (ops.stat(tmp)) ops.unlink(tmp);
+		if (ops.stat(tmp)) {
+			if (!ops.unlink(tmp)) return false;
+			if (ops.stat(tmp)) return false;
+		}
+		return true;
 	};
-	let w = ops.writefile(tmp, content);
-	if (w == null || w != length(content)) {
-		cleanup();
-		return { ok: false, error: 'write_failed', tmp_path: tmp };
+	let fail_with = function(orig_err) {
+		if (!cleanup()) {
+			return { ok: false, error: 'cleanup_failed', orig_error: orig_err, cleanup_failed: true, tmp_path: tmp };
+		}
+		return { ok: false, error: orig_err, cleanup_failed: false, tmp_path: tmp };
+	};
+	let w = null;
+	if (ops.open) {
+		let fh = ops.open(tmp, 'w', 0o600);
+		if (!fh) return fail_with('write_failed');
+		w = fh.write(content);
+		let cls = fh.close();
+		if (w == null || w != length(content) || cls === false) {
+			return fail_with('write_failed');
+		}
+	} else {
+		w = ops.writefile(tmp, content);
+		if (w == null || w != length(content)) {
+			return fail_with('write_failed');
+		}
 	}
 	if (uid != null && gid != null) {
 		if (!ops.chown(tmp, uid, gid)) {
-			cleanup();
-			return { ok: false, error: 'chown_failed', tmp_path: tmp };
+			return fail_with('chown_failed');
 		}
 	}
 	if (!ops.chmod(tmp, mode || 0o600)) {
-		cleanup();
-		return { ok: false, error: 'chmod_failed', tmp_path: tmp };
+		return fail_with('chmod_failed');
 	}
 	if (!ops.rename(tmp, path)) {
-		cleanup();
-		return { ok: false, error: 'rename_failed', tmp_path: tmp };
+		return fail_with('rename_failed');
 	}
-	return { ok: true, error: '', tmp_path: tmp };
+	return { ok: true, error: '', cleanup_failed: false, tmp_path: tmp };
 };

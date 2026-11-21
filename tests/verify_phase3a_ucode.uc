@@ -37,18 +37,36 @@ fs.chmod(target, 0o640);
 let merged = nms_archive.merge_sysupgrade_conf(fs.readfile(target), ['/etc/noc-console/', '/etc/dropbear/']);
 check(index(merged, '# User comment kept') == 0 && index(merged, '/etc/noc-console/') > 0, 'P3A-AW[merge_comments]', merged);
 
-function make_ops(fail_mode) {
+let seen_restricted_mode = null;
+
+function make_ops(fail_mode, fail_unlink) {
 	return {
 		suffix: function() { return 'test1234'; },
 		stat: fs.stat,
-		unlink: fs.unlink,
-		writefile: function(p, c) {
-			if (fail_mode == 'write') return null;
-			if (fail_mode == 'partial') {
-				fs.writefile(p, substr(c, 0, 5));
-				return 5;
+		unlink: function(p) {
+			if (fail_unlink) return false;
+			return fs.unlink(p);
+		},
+		open: function(p, flags, m) {
+			if (fail_mode == 'write') {
+				let fh_empty = fs.open(p, flags, m);
+				if (fh_empty) fh_empty.close();
+				return null;
 			}
-			return fs.writefile(p, c);
+			let real_fh = fs.open(p, flags, m);
+			if (!real_fh) return null;
+			let st0 = fs.stat(p);
+			seen_restricted_mode = st0 ? (st0.mode & 0o7777) : null;
+			return {
+				write: function(c) {
+					if (fail_mode == 'partial') {
+						real_fh.write(substr(c, 0, 5));
+						return 5;
+					}
+					return real_fh.write(c);
+				},
+				close: function() { return real_fh.close(); }
+			};
 		},
 		chown: function(p, u, g) {
 			if (fail_mode == 'chown') return false;
@@ -65,23 +83,44 @@ function make_ops(fail_mode) {
 	};
 }
 
+let expected_err = {
+	write: 'write_failed',
+	partial: 'write_failed',
+	chown: 'chown_failed',
+	chmod: 'chmod_failed',
+	rename: 'rename_failed'
+};
+
 for (let fm in ['write', 'partial', 'chown', 'chmod', 'rename']) {
-	let r_fail = nms_archive.atomic_write_checked(target, merged, 0o640, 0, 0, make_ops(fm));
-	let tmp_gone = !fs.stat(target + '.tmp.test1234');
+	// Case A: failure with successful cleanup
+	let r_fail = nms_archive.atomic_write_checked(target, merged, 0o640, 0, 0, make_ops(fm, false));
+	let tmp_gone = !fs.stat(r_fail.tmp_path);
 	let intact = fs.readfile(target) == orig_content;
 	let st = fs.stat(target);
 	let mode_intact = st && ((st.mode & 0o7777) == 0o640);
-	check(!r_fail.ok && tmp_gone && intact && mode_intact, 'P3A-AW[fail_' + fm + ']', sprintf('r=%J tmp_gone=%J intact=%J mode=%o', r_fail, tmp_gone, intact, st ? (st.mode & 0o7777) : 0));
+	check(!r_fail.ok && r_fail.error == expected_err[fm] && !r_fail.cleanup_failed && tmp_gone && intact && mode_intact,
+		'P3A-AW[fail_' + fm + '_cleanup_ok]',
+		sprintf('r=%J tmp_gone=%J intact=%J mode=%o', r_fail, tmp_gone, intact, st ? (st.mode & 0o7777) : 0));
+
+	// Case B: failure followed by unlink failure -> must report cleanup_failed + tmp_path
+	let r_cu = nms_archive.atomic_write_checked(target, merged, 0o640, 0, 0, make_ops(fm, true));
+	let tmp_still_exists = !!fs.stat(r_cu.tmp_path);
+	let intact_b = fs.readfile(target) == orig_content;
+	check(!r_cu.ok && r_cu.error == 'cleanup_failed' && r_cu.orig_error == expected_err[fm] && r_cu.cleanup_failed && r_cu.tmp_path == target + '.tmp.test1234' && tmp_still_exists && intact_b,
+		'P3A-AW[fail_' + fm + '_unlink_fail]',
+		sprintf('r=%J tmp_exists=%J intact=%J', r_cu, tmp_still_exists, intact_b));
+	if (tmp_still_exists) fs.unlink(r_cu.tmp_path);
 }
 
-// Successful atomic replacement
-let r_ok = nms_archive.atomic_write_checked(target, merged, 0o640, 0, 0, make_ops('none'));
+// Successful atomic replacement + verify restrictive 0600 temp mode before write
+seen_restricted_mode = null;
+let r_ok = nms_archive.atomic_write_checked(target, merged, 0o640, 0, 0, make_ops('none', false));
 let st_ok = fs.stat(target);
 let tmp_ok_gone = !fs.stat(target + '.tmp.test1234');
 check(
-	r_ok.ok && tmp_ok_gone && fs.readfile(target) == merged && st_ok && ((st_ok.mode & 0o7777) == 0o640) && st_ok.uid == 0 && st_ok.gid == 0,
+	r_ok.ok && seen_restricted_mode == 0o600 && tmp_ok_gone && fs.readfile(target) == merged && st_ok && ((st_ok.mode & 0o7777) == 0o640) && st_ok.uid == 0 && st_ok.gid == 0,
 	'P3A-AW[success_preserve_comments_mode_owner]',
-	sprintf('r=%J mode=%o uid=%J gid=%J', r_ok, st_ok ? (st_ok.mode & 0o7777) : 0, st_ok ? st_ok.uid : -1, st_ok ? st_ok.gid : -1)
+	sprintf('r=%J tmp_mode=%o mode=%o uid=%J gid=%J', r_ok, seen_restricted_mode || 0, st_ok ? (st_ok.mode & 0o7777) : 0, st_ok ? st_ok.uid : -1, st_ok ? st_ok.gid : -1)
 );
 
 printf('UCODE_SUMMARY: %d passed, %d failed\n', passed, failed);
