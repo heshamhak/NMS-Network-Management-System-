@@ -16,6 +16,7 @@ done
 
 ROOT_PREFIX="${NMS_ROOT_PREFIX:-}"
 SKIP_SERVICE_START="${NMS_SKIP_SERVICE_START:-0}"
+SKIP_PKG_INSTALL="${NMS_SKIP_PKG_INSTALL:-0}"
 FAIL_POINT="${NMS_TEST_FAIL_POINT:-}"
 SERVICE_RUNNER="${NMS_SERVICE_RUNNER:-}"
 
@@ -44,7 +45,7 @@ TLS_PKGS="socat openssl-util"
 
 # --- Stage 0: Irreversible System Prerequisite Installation (Pre-Transaction) ---
 echo "[0/6] Checking system prerequisites (non-transactional OS packages)..."
-if [ -z "$ROOT_PREFIX" ]; then
+if [ -z "$ROOT_PREFIX" ] && [ "$SKIP_PKG_INSTALL" -ne 1 ]; then
   if ! command -v ucode >/dev/null 2>&1; then
     if command -v apk >/dev/null 2>&1; then
       apk update >/dev/null 2>&1 || true
@@ -84,7 +85,7 @@ fi
 TLS_READY=0
 if command -v socat >/dev/null 2>&1 && socat -V 2>&1 | grep -qi openssl && command -v openssl >/dev/null 2>&1; then
   TLS_READY=1
-elif [ -z "$ROOT_PREFIX" ]; then
+elif [ -z "$ROOT_PREFIX" ] && [ "$SKIP_PKG_INSTALL" -ne 1 ]; then
   if command -v apk >/dev/null 2>&1; then
     apk add $TLS_PKGS >/dev/null 2>&1 || true
   elif command -v opkg >/dev/null 2>&1; then
@@ -331,7 +332,7 @@ if ! grep -q '^noc-api:' "$PASSWD_FILE" 2>/dev/null; then
   echo "noc-api:x:${UID_NUM}:${NOC_GID:-65001}:NMS API Daemon:/tmp/noc-console:/bin/false" >> "$PASSWD_FILE"
 fi
 
-if [ -z "$ROOT_PREFIX" ]; then
+if [ -z "$ROOT_PREFIX" ] && [ "$SKIP_PKG_INSTALL" -ne 1 ]; then
   chown -R noc-api:noc-api "$RUN_DIR"
 fi
 
