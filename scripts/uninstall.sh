@@ -82,8 +82,8 @@ if [ -f "$RESTORE_FILE" ]; then
       UNINSTALL_ERR=1
       continue
     fi
-    if ! mkdir -p "$(dirname "$target")" || ! cp -p "$bak_src" "$target" || ! chmod "$orig_mode" "$target"; then
-      echo "UNINSTALL ERROR: failed to restore $target with mode $orig_mode" >&2
+    if ! mkdir -p "$(dirname "$target")" || ! cp -p "$bak_src" "$target"; then
+      echo "UNINSTALL ERROR: failed to restore $target" >&2
       RESTORE_ERR=1
       UNINSTALL_ERR=1
       continue
@@ -95,6 +95,12 @@ if [ -f "$RESTORE_FILE" ]; then
         UNINSTALL_ERR=1
         continue
       fi
+    fi
+    if ! chmod "$orig_mode" "$target"; then
+      echo "UNINSTALL ERROR: failed to restore mode $orig_mode on $target" >&2
+      RESTORE_ERR=1
+      UNINSTALL_ERR=1
+      continue
     fi
     cur_mode="$(stat -c '%a' "$target" 2>/dev/null || echo '')"
     cur_owner="$(stat -c '%u:%g' "$target" 2>/dev/null || echo '')"

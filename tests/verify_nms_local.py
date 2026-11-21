@@ -543,13 +543,13 @@ with tempfile.TemporaryDirectory() as td:
     col_apid = os.path.join(td, "usr/libexec/noc-apid")
     col_apid_bytes = b"USER_APID_BIN\n"
     open(col_apid, "wb").write(col_apid_bytes)
-    os.chmod(col_apid, 0o700)
+    os.chmod(col_apid, 0o4755)
 
     os.makedirs(os.path.join(td, "etc/init.d"), exist_ok=True)
     col_init = os.path.join(td, "etc/init.d/noc-apid")
     col_init_bytes = b"USER_INIT_SCRIPT\n"
     open(col_init, "wb").write(col_init_bytes)
-    os.chmod(col_init, 0o750)
+    os.chmod(col_init, 0o2755)
 
     web_pro = os.path.join(td, "www/pro")
     os.makedirs(web_pro, exist_ok=True)
@@ -742,14 +742,14 @@ start_service
     st_apid, st_init, st_index = os.stat(col_apid), os.stat(col_init), os.stat(col_index)
     if (r_un.returncode == 0
             and "NMS uninstalled cleanly." in r_un.stdout
-            and open(col_apid, "rb").read() == col_apid_bytes and stat.S_IMODE(st_apid.st_mode) == 0o700 and f"{st_apid.st_uid}:{st_apid.st_gid}" == exp_uid_gid
-            and open(col_init, "rb").read() == col_init_bytes and stat.S_IMODE(st_init.st_mode) == 0o750 and f"{st_init.st_uid}:{st_init.st_gid}" == exp_uid_gid
+            and open(col_apid, "rb").read() == col_apid_bytes and stat.S_IMODE(st_apid.st_mode) == 0o4755 and f"{st_apid.st_uid}:{st_apid.st_gid}" == exp_uid_gid
+            and open(col_init, "rb").read() == col_init_bytes and stat.S_IMODE(st_init.st_mode) == 0o2755 and f"{st_init.st_uid}:{st_init.st_gid}" == exp_uid_gid
             and open(col_index, "rb").read() == col_index_bytes and stat.S_IMODE(st_index.st_mode) == 0o600 and f"{st_index.st_uid}:{st_index.st_gid}" == exp_uid_gid
             and not os.path.exists(restore_manifest)
             and not os.path.exists(bak_apid) and not os.path.exists(bak_init) and not os.path.exists(bak_index)):
-        ok("INS-03: byte-for-byte, mode, and UID/GID restoration + clean backup/manifest removal")
+        ok("INS-03: byte-for-byte, setuid (4755), setgid (2755), and UID/GID restoration + clean backup/manifest removal")
     else:
-        fail("INS-03: byte-for-byte / mode / UID:GID collision restoration or cleanup failed")
+        fail("INS-03: byte-for-byte / setuid / setgid / UID:GID collision restoration or cleanup failed")
 
 print(f"\n=== SUMMARY: {len(passes)} passed, {len(failures)} failed ===")
 sys.exit(1 if failures else 0)
