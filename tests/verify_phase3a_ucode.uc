@@ -150,5 +150,55 @@ check(
 );
 if (reply_tmp_exists) fs.unlink(target + '.tmp.test1234');
 
+// 4. auth_bootstrap failure-injection: bootstrap.json & bootstrap.token MUST be preserved when auth.json write fails
+let bs_dir = vec_dir + '/bs_test';
+fs.mkdir(bs_dir);
+fs.writefile(bs_dir + '/bootstrap.json', '{"token_hash":"abc"}\n');
+fs.writefile(bs_dir + '/bootstrap.token', 'secret-tok\n');
+let bs_reply = null;
+let bs_aw = helperd_aw.atomic_write(bs_dir + '/auth.json', '{"users":{}}\n', 0o600, null, null, make_ops('rename', true));
+if (!bs_aw.ok) {
+	bs_reply = { ok: false, error_code: 'INTERNAL', error: bs_aw.error, orig_error: bs_aw.orig_error, cleanup_failed: bs_aw.cleanup_failed, tmp_path: bs_aw.tmp_path };
+} else {
+	if (fs.stat(bs_dir + '/bootstrap.json')) fs.unlink(bs_dir + '/bootstrap.json');
+	if (fs.stat(bs_dir + '/bootstrap.token')) fs.unlink(bs_dir + '/bootstrap.token');
+	bs_reply = { ok: true };
+}
+let bs_tmp_exists = !!fs.stat(bs_dir + '/auth.json.tmp.test1234');
+check(
+	bs_reply != null && !bs_reply.ok && bs_reply.cleanup_failed && !!fs.stat(bs_dir + '/bootstrap.json') && !!fs.stat(bs_dir + '/bootstrap.token') && !fs.stat(bs_dir + '/auth.json'),
+	'P3A-HELPERD[auth_bootstrap_failure_preserves_bootstrap_files]',
+	sprintf('bs_reply=%J', bs_reply)
+);
+if (bs_tmp_exists) fs.unlink(bs_dir + '/auth.json.tmp.test1234');
+
+// 5. sys_sysupgrade_conf_save post-write verification failure + rollback success & rollback failure
+let rb_dir = vec_dir + '/rb_test';
+fs.mkdir(rb_dir);
+let rb_target = rb_dir + '/sysupgrade.conf';
+let rb_orig = '# Original comment\n/etc/dropbear/\n';
+fs.writefile(rb_target, rb_orig);
+fs.chmod(rb_target, 0o640);
+let st_orig_rb = fs.lstat(rb_target);
+// Simulate replacement succeeded, but post-write verification detected mismatch -> rollback must restore rb_orig + mode 0o640
+fs.writefile(rb_target, '# Corrupted content\n');
+fs.chmod(rb_target, 0o600);
+let rb_aw_ok = helperd_aw.atomic_write(rb_target, rb_orig, 0o640, st_orig_rb.uid, st_orig_rb.gid);
+let st_after_rb = fs.lstat(rb_target);
+check(
+	rb_aw_ok.ok && fs.readfile(rb_target) == rb_orig && (st_after_rb.mode & 0o7777) == 0o640 && st_after_rb.uid == st_orig_rb.uid && st_after_rb.gid == st_orig_rb.gid,
+	'P3A-HELPERD[sysupgrade_conf_post_verify_rollback_ok]',
+	sprintf('rb_aw=%J mode=%o', rb_aw_ok, st_after_rb ? (st_after_rb.mode & 0o7777) : 0)
+);
+// Simulate rollback itself failing (unlink fail on rename fail) -> must report rollback failure and preserve tmp_path
+let rb_aw_fail = helperd_aw.atomic_write(rb_target, rb_orig, 0o640, st_orig_rb.uid, st_orig_rb.gid, make_ops('rename', true));
+let rb_tmp_exists = !!fs.stat(rb_target + '.tmp.test1234');
+check(
+	!rb_aw_fail.ok && rb_aw_fail.cleanup_failed && rb_tmp_exists,
+	'P3A-HELPERD[sysupgrade_conf_rollback_failure_detected]',
+	sprintf('rb_aw_fail=%J tmp=%J', rb_aw_fail, rb_tmp_exists)
+);
+if (rb_tmp_exists) fs.unlink(rb_target + '.tmp.test1234');
+
 printf('UCODE_SUMMARY: %d passed, %d failed\n', passed, failed);
 exit(failed == 0 ? 0 : 1);

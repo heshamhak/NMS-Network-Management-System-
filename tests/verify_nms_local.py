@@ -793,6 +793,18 @@ if not missing_syms and not missing_uc and not missing_apid:
 else:
     fail(f"P3A-STRUCT: missing symbols helper={missing_syms}, uc={missing_uc}, apid={missing_apid}")
 
+# Verify zero unchecked atomic_write( calls in backend/noc-helperd
+unchecked_aw = [
+    f"{idx}:{ln.strip()}"
+    for idx, ln in enumerate(helperd_src.splitlines(), 1)
+    if "atomic_write(" in ln and not ln.strip().startswith("function atomic_write(")
+    and "let aw" not in ln and "let rb_aw" not in ln and "let f_aw" not in ln
+]
+if not unchecked_aw:
+    ok("P3A-AW-AUDIT: 0 unchecked atomic_write() calls in backend/noc-helperd")
+else:
+    fail(f"P3A-AW-AUDIT: found unchecked atomic_write() calls: {unchecked_aw}")
+
 # 6b. Production ucode archive validator & atomic_write_checked execution inside isolated OpenWrt x86_64 rootfs
 import tarfile, io, struct, re
 

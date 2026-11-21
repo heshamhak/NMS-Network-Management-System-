@@ -196,7 +196,8 @@ function get_hmac_key() {
 	let k = fs.readfile(kp);
 	if (k && length(k) >= 32) return k;
 	k = urandom_hex(32);
-	atomic_write(kp, k, 0o600);
+	let aw = atomic_write(kp, k, 0o600);
+	if (!aw.ok) return null;
 	return k;
 }
 
@@ -278,8 +279,9 @@ function begin_rollback(kind, cfg_path, reload_cmd) {
 	if (raw == null) return '';
 	let tok = urandom_hex(8);
 	let base = RUN_DIR + '/rb_' + tok;
-	atomic_write(base + '.bak', raw, 0o600);
-	atomic_write(base + '.pending', sprintf('%J\n', { kind: kind, cfg_path: cfg_path, reload_cmd: reload_cmd, ts: time() }), 0o600);
+	let aw1 = atomic_write(base + '.bak', raw, 0o600);
+	let aw2 = atomic_write(base + '.pending', sprintf('%J\n', { kind: kind, cfg_path: cfg_path, reload_cmd: reload_cmd, ts: time() }), 0o600);
+	if (!aw1.ok || !aw2.ok) return '';
 	system(sprintf('(sleep 60; if [ -f "%s.pending" ]; then cp "%s.bak" "%s" && %s >/dev/null 2>&1; rm -f "%s.pending" "%s.bak"; fi) >/dev/null 2>&1 &', base, base, cfg_path, reload_cmd, base, base));
 	return tok;
 }
@@ -345,8 +347,9 @@ function issue_bootstrap_token() {
 		expires_epoch: time() + 600,
 		created_at: now_iso()
 	};
-	atomic_write(ETC_DIR + '/bootstrap.json', sprintf('%J\n', payload), 0o600);
-	atomic_write(ETC_DIR + '/bootstrap.token', tok + '\n', 0o600);
+	let aw1 = atomic_write(ETC_DIR + '/bootstrap.json', sprintf('%J\n', payload), 0o600);
+	let aw2 = atomic_write(ETC_DIR + '/bootstrap.token', tok + '\n', 0o600);
+	if (!aw1.ok || !aw2.ok) return false;
 	return tok;
 }
 
@@ -417,7 +420,9 @@ function record_auth_failure(client_ip, acct) {
 		}
 		grp[key] = rec;
 	}
-	atomic_write(p, sprintf('%J\n', st), 0o600);
+	let aw = atomic_write(p, sprintf('%J\n', st), 0o600);
+	if (!aw.ok) return false;
+	return true;
 }
 
 function clear_auth_failure(client_ip, acct) {
@@ -425,7 +430,9 @@ function clear_auth_failure(client_ip, acct) {
 	let st = read_json(p, { ips: {}, accts: {} });
 	delete st.ips[client_ip || 'unknown'];
 	delete st.accts[acct || 'admin'];
-	atomic_write(p, sprintf('%J\n', st), 0o600);
+	let aw = atomic_write(p, sprintf('%J\n', st), 0o600);
+	if (!aw.ok) return false;
+	return true;
 }
 
 // --- Staging Attestation Guard (P15 / P17) ---
@@ -459,7 +466,8 @@ function acquire_lock(owner, op) {
 	if (cur && (now_m - (+cur.acquired_mono_ms || 0)) <= (+cur.ttl_ms || LOCK_TTL_MS)) {
 		return { ok: false, holder: cur };
 	}
-	atomic_write(lp, sprintf('%J\n', { owner: owner, op: op, acquired_mono_ms: now_m, ttl_ms: LOCK_TTL_MS }), 0o600);
+	let aw = atomic_write(lp, sprintf('%J\n', { owner: owner, op: op, acquired_mono_ms: now_m, ttl_ms: LOCK_TTL_MS }), 0o600);
+	if (!aw.ok) return { ok: false, error: aw.error };
 	return { ok: true };
 }
 
@@ -769,7 +777,8 @@ function apply_bridge_block_rules(rules_obj, cb) {
 	push(lines, '}');
 
 	let nft_path = ETC_DIR + '/noc_block.nft';
-	atomic_write(nft_path, join('\n', lines) + '\n', 0o600);
+	let aw = atomic_write(nft_path, join('\n', lines) + '\n', 0o600);
+	if (!aw.ok) return false;
 	exec_argv_async('/usr/sbin/nft', ['-f', nft_path], 5000, CAP_GENERAL, cb);
 }
 
@@ -842,7 +851,7 @@ const CRON_TEMPLATES = {
 function fw_check_and_reload(snap_raw, cb) {
 	exec_argv_async('/sbin/fw4', ['check'], 6000, CAP_GENERAL, function(chk) {
 		if (!chk.ok) {
-			if (snap_raw != null) atomic_write('/etc/config/firewall', snap_raw, 0o644);
+			if (snap_raw != null) { let aw = atomic_write('/etc/config/firewall', snap_raw, 0o644); if (!aw.ok) warn('ERROR: firewall snapshot restore write failed\n'); }
 			cb({ ok: false, error_code: 'VALIDATION', message_ar: 'فشل فحص قواعد fw4 وتم التراجع التلقائي' });
 			return;
 		}
@@ -962,7 +971,20 @@ function handle_rpc(req, reply_cb) {
 				return;
 			}
 			let rec = { version: 1, alg: 'pbkdf2-hmac-sha256', iter: PBKDF2_ITER, users: { admin: { role: 'admin', salt_hex: salt, dk_hex: dk } } };
-			atomic_write(ETC_DIR + '/auth.json', sprintf('%J\n', rec), 0o600);
+			let aw = atomic_write(ETC_DIR + '/auth.json', sprintf('%J\n', rec), 0o600);
+			if (!aw.ok) {
+				audit_append('admin', 'auth_bootstrap_complete', 'admin', aw.cleanup_failed ? 'cleanup_failed' : 'failed', sprintf('error=%s orig=%s tmp=%s', aw.error || '', aw.orig_error || '', aw.tmp_path || ''));
+				reply_cb({
+					ok: false,
+					error_code: 'INTERNAL',
+					error: aw.error || 'write_failed',
+					orig_error: aw.orig_error || '',
+					cleanup_failed: !!aw.cleanup_failed,
+					tmp_path: aw.cleanup_failed ? (aw.tmp_path || '') : '',
+					message_ar: 'فشل حفظ بيانات اعتماد المدير (تم الحفاظ على رمز التهيئة)'
+				});
+				return;
+			}
 			if (fs.stat(ETC_DIR + '/bootstrap.json')) fs.unlink(ETC_DIR + '/bootstrap.json');
 			if (fs.stat(ETC_DIR + '/bootstrap.token')) fs.unlink(ETC_DIR + '/bootstrap.token');
 			clear_auth_failure(client_ip, 'bootstrap');
@@ -1053,7 +1075,12 @@ function handle_rpc(req, reply_cb) {
 			if (!dk) { reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل اشتقاق المفتاح' }); return; }
 			let doc = read_json(ETC_DIR + '/auth.json', auth_doc);
 			doc.users[uname] = { role: 'readonly', salt_hex: salt, dk_hex: dk };
-			atomic_write(ETC_DIR + '/auth.json', sprintf('%J\n', doc), 0o600);
+			let aw = atomic_write(ETC_DIR + '/auth.json', sprintf('%J\n', doc), 0o600);
+			if (!aw.ok) {
+				audit_append(actor, 'auth_set_readonly', uname, aw.cleanup_failed ? 'cleanup_failed' : 'failed', sprintf('error=%s orig=%s tmp=%s', aw.error || '', aw.orig_error || '', aw.tmp_path || ''));
+				reply_cb({ ok: false, error_code: 'INTERNAL', error: aw.error, orig_error: aw.orig_error || '', cleanup_failed: !!aw.cleanup_failed, tmp_path: aw.cleanup_failed ? (aw.tmp_path || '') : '', message_ar: 'فشل حفظ حساب المراقب' });
+				return;
+			}
 			audit_append(actor, 'auth_set_readonly', uname, 'committed', 'Provisioned readonly operator');
 			reply_cb({ ok: true, username: uname, role: 'readonly', message_ar: 'تم تفعيل حساب المراقب للقراءة فقط بنجاح' });
 		});
@@ -2218,7 +2245,7 @@ function handle_rpc(req, reply_cb) {
 			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'اسم المستخدم وكلمة المرور مطلوبان' });
 			return;
 		}
-		atomic_write(ETC_DIR + '/adguard.json', sprintf('%J\n', { username: u, password: p }), 0o600);
+		if (!atomic_write_or_reply(ETC_DIR + '/adguard.json', sprintf('%J\n', { username: u, password: p }), 0o600, null, null, actor, 'agh_set_creds', reply_cb)) return;
 		let test_res = adguard_http('GET', '/control/status', null);
 		release_lock();
 		if (!test_res.ok) {
@@ -2295,7 +2322,7 @@ function handle_rpc(req, reply_cb) {
 		let r = adguard_http('POST', ep, body);
 		if (flag == 'protection_enabled') {
 			if (r.ok && !enabled && duration_s > 0 && duration_s <= 3600) {
-				atomic_write(ETC_DIR + '/timed_disable.json', sprintf('%J\n', { target_state: true, deadline_epoch: time() + duration_s }), 0o600);
+				if (!atomic_write_or_reply(ETC_DIR + '/timed_disable.json', sprintf('%J\n', { target_state: true, deadline_epoch: time() + duration_s }), 0o600, null, null, actor, 'agh_toggle', reply_cb)) return;
 			} else if (enabled && fs.stat(ETC_DIR + '/timed_disable.json')) {
 				fs.unlink(ETC_DIR + '/timed_disable.json');
 			}
@@ -2467,13 +2494,14 @@ function handle_rpc(req, reply_cb) {
 			delete next_rules.blocked_macs[mac];
 			if (ip != '') delete next_rules.blocked_ips[ip];
 		}
-		atomic_write(rules_path, sprintf('%J\n', next_rules), 0o600);
+		if (!atomic_write_or_reply(rules_path, sprintf('%J\n', next_rules), 0o600, null, null, actor, verb, reply_cb)) return;
 		apply_bridge_block_rules(next_rules, function(apply_res) {
 			if (!apply_res.ok) {
-				atomic_write(rules_path, snap_raw, 0o600);
+				let rb_aw = atomic_write(rules_path, snap_raw, 0o600);
 				apply_bridge_block_rules(prev_rules, function(rb) {
 					if (!rb.ok) {
-						atomic_write(ETC_DIR + '/freeze.json', sprintf('%J\n', { frozen: true, reason: 'client_block rollback failed', ts: now_iso() }), 0o600);
+						let f_aw = atomic_write(ETC_DIR + '/freeze.json', sprintf('%J\n', { frozen: true, reason: 'client_block rollback failed', ts: now_iso() }), 0o600);
+						if (!f_aw.ok) warn('CRITICAL: failed to persist freeze.json\n');
 						audit_append(actor, verb, mac, 'rollback_failed', 'Entered global mutation freeze');
 					} else {
 						audit_append(actor, verb, mac, 'rolled_back', 'Apply failed and rolled back cleanly');
@@ -2486,10 +2514,11 @@ function handle_rpc(req, reply_cb) {
 			// Verify table membership
 			exec_argv_async('/usr/sbin/nft', ['list', 'table', 'bridge', 'noc_block'], 4000, CAP_GENERAL, function(ver) {
 				if (!ver.ok || (verb == 'client_block' && index(ver.output, mac) < 0)) {
-					atomic_write(rules_path, snap_raw, 0o600);
+					let rb_aw = atomic_write(rules_path, snap_raw, 0o600);
 					apply_bridge_block_rules(prev_rules, function(rb) {
 						if (!rb.ok) {
-							atomic_write(ETC_DIR + '/freeze.json', sprintf('%J\n', { frozen: true, reason: 'verify rollback failed', ts: now_iso() }), 0o600);
+							let f_aw = atomic_write(ETC_DIR + '/freeze.json', sprintf('%J\n', { frozen: true, reason: 'verify rollback failed', ts: now_iso() }), 0o600);
+							if (!f_aw.ok) warn('CRITICAL: failed to persist freeze.json\n');
 						}
 						release_lock();
 						reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل التحقق من قاعدة الحظر وتم التراجع' });
@@ -2558,10 +2587,11 @@ function handle_rpc(req, reply_cb) {
 			if (rate_kbps > 0) next_rules.rate_limits[ip] = rate_kbps;
 			else delete next_rules.rate_limits[ip];
 		}
-		atomic_write(rules_path, sprintf('%J\n', next_rules), 0o600);
+		if (!atomic_write_or_reply(rules_path, sprintf('%J\n', next_rules), 0o600, null, null, actor, 'client_set_meta', reply_cb)) return;
 		apply_bridge_block_rules(next_rules, function(ar) {
 			if (!ar.ok) {
-				atomic_write(rules_path, snap_raw, 0o600);
+				let rb_aw = atomic_write(rules_path, snap_raw, 0o600);
+				if (!rb_aw.ok) warn('CRITICAL: client_set_meta rollback write failed\n');
 				apply_bridge_block_rules(prev_rules, function() {
 					release_lock();
 					reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'تعذر تطبيق قاعدة حد السرعة وتم التراجع' });
@@ -2992,7 +3022,7 @@ function handle_rpc(req, reply_cb) {
 			push(out_lines, t);
 		}
 		if (op == 'add' && !found) push(out_lines, entry);
-		atomic_write(fpath, join('\n', out_lines) + (length(out_lines) > 0 ? '\n' : ''), 0o600);
+		if (!atomic_write_or_reply(fpath, join('\n', out_lines) + (length(out_lines) > 0 ? '\n' : ''), 0o600, null, null, actor, 'banip_list_edit', reply_cb)) return;
 		exec_argv_async('/etc/init.d/banip', ['reload'], 10000, CAP_GENERAL, function() {
 			release_lock();
 			audit_append(actor, 'banip_list_edit', ltype + ':' + op + ':' + entry, 'committed', 'Updated list');
@@ -3226,7 +3256,7 @@ function handle_rpc(req, reply_cb) {
 			if (cur_bss && cur_bss.ssid != '') push(list, cur_bss);
 			sort(list, function(a, b) { return b.signal_dbm - a.signal_dbm; });
 			if (length(list) > 25) list = slice(list, 0, 25);
-			atomic_write(RUN_DIR + '/wifi_scan.json', sprintf('%J\n', { ts: time(), results: list }), 0o600);
+			if (!atomic_write_or_reply(RUN_DIR + '/wifi_scan.json', sprintf('%J\n', { ts: time(), results: list }), 0o600, null, null, actor, 'wifi_scan', reply_cb)) return;
 			release_lock();
 			audit_append(actor, 'wifi_scan', 'wlan0', 'ok', 'Scanned ' + length(list) + ' networks');
 			reply_cb({ ok: true, results: list, message_ar: 'تم مسح الشبكات اللاسلكية المجاورة بنجاح' });
@@ -3249,14 +3279,16 @@ function handle_rpc(req, reply_cb) {
 		}
 		let conf_p = '/etc/wpa_supplicant_wwan.conf';
 		let existing = fs.readfile(conf_p) || '';
-		if (existing != '') atomic_write(ETC_DIR + '/wpa_supplicant_wwan.conf.bak', existing, 0o600);
+		if (existing != '') {
+			if (!atomic_write_or_reply(ETC_DIR + '/wpa_supplicant_wwan.conf.bak', existing, 0o600, null, null, actor, 'wifi_save_uplink_bak', reply_cb)) return;
+		}
 		if (psk == '') {
 			let mp = match(existing, /psk="([^"]+)"/);
 			if (!mp) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'كلمة المرور مطلوبة للشبكة الجديدة' }); return; }
 			psk = mp[1];
 		}
 		let next_conf = "ctrl_interface=/var/run/wpa_supplicant\nnetwork={\n    ssid=\"" + ssid + "\"\n    psk=\"" + psk + "\"\n    key_mgmt=WPA-PSK\n}\n";
-		atomic_write(conf_p, next_conf, 0o600);
+		if (!atomic_write_or_reply(conf_p, next_conf, 0o600, null, null, actor, 'wifi_save_uplink', reply_cb)) return;
 		let uplink_init = fs.stat('/etc/init.d/wwan_uplink') ? '/etc/init.d/wwan_uplink' : '/etc/init.d/network';
 		exec_argv_async(uplink_init, ['restart'], 10000, CAP_GENERAL, function() {
 			release_lock();
@@ -3490,7 +3522,7 @@ function handle_rpc(req, reply_cb) {
 				} else push(lines, l);
 			}
 			if (!updated) push(lines, 'net.netfilter.nf_conntrack_max=' + int(ct_max));
-			atomic_write('/etc/sysctl.conf', trim(join('\n', lines)) + '\n', 0o644);
+			if (!atomic_write_or_reply('/etc/sysctl.conf', trim(join('\n', lines)) + '\n', 0o644, null, null, actor, 'sys_save_tuning', reply_cb)) return;
 			release_lock();
 			audit_append(actor, 'sys_save_tuning', 'conntrack_max', r.ok ? 'committed' : 'failed', '' + int(ct_max));
 			reply_cb({ ok: r.ok, message_ar: r.ok ? 'تم تحديث معايير النواة وتوجيه الحزم بنجاح' : 'تعذر ضبط Conntrack عبر sysctl' });
@@ -3723,13 +3755,33 @@ function handle_rpc(req, reply_cb) {
 		}
 		let st_new = fs.lstat(SYSUPGRADE_CONF_PATH);
 		let verify_txt = fs.readfile(SYSUPGRADE_CONF_PATH);
-		release_lock();
 		if (!st_new || st_new.type != 'file' || (st_new.mode & 0o7777) != orig_mode ||
 		    (orig_uid != null && (st_new.uid != orig_uid || st_new.gid != orig_gid)) ||
 		    verify_txt != body_txt) {
-			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل التحقق النهائي من ملف sysupgrade.conf بعد الاستبدال' });
+			let rb_ok = false;
+			if (st_orig) {
+				let rb_aw = atomic_write(SYSUPGRADE_CONF_PATH, existing_raw, orig_mode, orig_uid, orig_gid);
+				let st_rb = fs.lstat(SYSUPGRADE_CONF_PATH);
+				let rb_txt = fs.readfile(SYSUPGRADE_CONF_PATH);
+				rb_ok = rb_aw.ok && st_rb && st_rb.type == 'file' && (st_rb.mode & 0o7777) == orig_mode &&
+					(orig_uid == null || (st_rb.uid == orig_uid && st_rb.gid == orig_gid)) &&
+					rb_txt == existing_raw;
+			} else {
+				if (!fs.stat(SYSUPGRADE_CONF_PATH) || fs.unlink(SYSUPGRADE_CONF_PATH)) {
+					rb_ok = !fs.stat(SYSUPGRADE_CONF_PATH);
+				}
+			}
+			release_lock();
+			if (rb_ok) {
+				audit_append(actor, 'sys_sysupgrade_conf_save', SYSUPGRADE_CONF_PATH, 'rolled_back', 'Post-write verification failed; original restored');
+				reply_cb({ ok: false, error_code: 'INTERNAL', rolled_back: true, message_ar: 'فشل التحقق النهائي من ملف sysupgrade.conf وتمت استعادة النسخة الأصلية بنجاح' });
+			} else {
+				audit_append(actor, 'sys_sysupgrade_conf_save', SYSUPGRADE_CONF_PATH, 'rollback_failed', 'CRITICAL: post-write verification and rollback both failed');
+				reply_cb({ ok: false, error_code: 'INTERNAL', rolled_back: false, rollback_failed: true, message_ar: 'فشل حرج: فشل التحقق النهائي وفشل التراجع عن sysupgrade.conf' });
+			}
 			return;
 		}
+		release_lock();
 		audit_append(actor, 'sys_sysupgrade_conf_save', SYSUPGRADE_CONF_PATH, 'committed', 'entries=' + length(clean_paths));
 		reply_cb({ ok: true, path: SYSUPGRADE_CONF_PATH, entries: clean_paths, count: length(clean_paths), message_ar: 'تم حفظ إعدادات sysupgrade.conf بأمان مع الحفاظ على التعليقات' });
 		return;
@@ -3738,7 +3790,7 @@ function handle_rpc(req, reply_cb) {
 	if (verb == 'sys_reboot_challenge') {
 		let nonce = urandom_hex(16);
 		let exp = time() + 60;
-		atomic_write(RUN_DIR + '/reboot_nonce.json', sprintf('%J\n', { nonce: nonce, actor: actor, exp: exp }), 0o600);
+		if (!atomic_write_or_reply(RUN_DIR + '/reboot_nonce.json', sprintf('%J\n', { nonce: nonce, actor: actor, exp: exp }), 0o600, null, null, actor, 'sys_reboot_challenge', reply_cb)) return;
 		release_lock();
 		reply_cb({ ok: true, nonce: nonce, ttl_s: 60 });
 		return;
@@ -3800,7 +3852,12 @@ function handle_rpc(req, reply_cb) {
 				totp_enabled: !!prev_u.totp_enabled,
 				totp_secret: prev_u.totp_secret || ''
 			};
-			atomic_write(ETC_DIR + '/auth.json', sprintf('%J\n', doc), 0o600);
+			let aw = atomic_write(ETC_DIR + '/auth.json', sprintf('%J\n', doc), 0o600);
+			if (!aw.ok) {
+				audit_append(actor, 'auth_change_password', 'admin', aw.cleanup_failed ? 'cleanup_failed' : 'failed', sprintf('error=%s orig=%s tmp=%s', aw.error || '', aw.orig_error || '', aw.tmp_path || ''));
+				reply_cb({ ok: false, error_code: 'INTERNAL', error: aw.error, orig_error: aw.orig_error || '', cleanup_failed: !!aw.cleanup_failed, tmp_path: aw.cleanup_failed ? (aw.tmp_path || '') : '', message_ar: 'فشل حفظ كلمة المرور الجديدة' });
+				return;
+			}
 			audit_append(actor, 'auth_change_password', 'admin', 'committed', 'Admin password rotated');
 			reply_cb({ ok: true, invalidate_sessions: true, message_ar: 'تم تحديث كلمة مرور المدير بنجاح' });
 		});
@@ -3821,7 +3878,7 @@ function handle_rpc(req, reply_cb) {
 			return;
 		}
 		delete auth_doc.users[uname];
-		atomic_write(ETC_DIR + '/auth.json', sprintf('%J\n', auth_doc), 0o600);
+		if (!atomic_write_or_reply(ETC_DIR + '/auth.json', sprintf('%J\n', auth_doc), 0o600, null, null, actor, 'auth_delete_user', reply_cb)) return;
 		release_lock();
 		audit_append(actor, 'auth_delete_user', uname, 'committed', 'Removed operator user');
 		reply_cb({ ok: true, message_ar: 'تم حذف الحساب بنجاح' });
@@ -3852,7 +3909,7 @@ function handle_rpc(req, reply_cb) {
 		}
 		let bak = fs.readfile(base + '.bak');
 		if (bak != null && meta.cfg_path) {
-			atomic_write(meta.cfg_path, bak, 0o644);
+			if (!atomic_write_or_reply(meta.cfg_path, bak, 0o644, null, null, actor, 'rollback_revert', reply_cb)) return;
 			if (meta.reload_cmd) system(meta.reload_cmd + ' >/dev/null 2>&1');
 		}
 		fs.unlink(base + '.pending');
@@ -3884,7 +3941,7 @@ function handle_rpc(req, reply_cb) {
 			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'رابط ntfy غير صالح' });
 			return;
 		}
-		atomic_write(ETC_DIR + '/alerts.json', sprintf('%J\n', next_cfg), 0o600);
+		if (!atomic_write_or_reply(ETC_DIR + '/alerts.json', sprintf('%J\n', next_cfg), 0o600, null, null, actor, 'alerts_set', reply_cb)) return;
 		release_lock();
 		audit_append(actor, 'alerts_set', 'alerts', 'committed', 'Updated alerting configuration');
 		reply_cb({ ok: true, message_ar: 'تم حفظ إعدادات التنبيهات بنجاح' });
@@ -3898,7 +3955,7 @@ function handle_rpc(req, reply_cb) {
 		let hist = read_json(RUN_DIR + '/alerts_history.json', []);
 		push(hist, { ts: now_iso(), level: trim(params.level || 'info'), title: title, message: msg });
 		if (length(hist) > 50) hist = slice(hist, -50);
-		atomic_write(RUN_DIR + '/alerts_history.json', sprintf('%J\n', hist), 0o600);
+		if (!atomic_write_or_reply(RUN_DIR + '/alerts_history.json', sprintf('%J\n', hist), 0o600, null, null, actor, verb, reply_cb)) return;
 		let sent_channels = [];
 		if (cfg.telegram_enabled && cfg.telegram_bot_token && cfg.telegram_chat_id) {
 			let tg_url = 'https://api.telegram.org/bot' + cfg.telegram_bot_token + '/sendMessage';
@@ -3927,7 +3984,7 @@ function handle_rpc(req, reply_cb) {
 
 	if (verb == 'auth_totp_setup') {
 		let sec = gen_base32_secret();
-		atomic_write(RUN_DIR + '/totp_pending.json', sprintf('%J\n', { secret: sec, ts: time() }), 0o600);
+		if (!atomic_write_or_reply(RUN_DIR + '/totp_pending.json', sprintf('%J\n', { secret: sec, ts: time() }), 0o600, null, null, actor, 'auth_totp_setup', reply_cb)) return;
 		release_lock();
 		reply_cb({
 			ok: true,
@@ -3955,7 +4012,7 @@ function handle_rpc(req, reply_cb) {
 		}
 		auth_doc.users.admin.totp_enabled = true;
 		auth_doc.users.admin.totp_secret = sec;
-		atomic_write(ETC_DIR + '/auth.json', sprintf('%J\n', auth_doc), 0o600);
+		if (!atomic_write_or_reply(ETC_DIR + '/auth.json', sprintf('%J\n', auth_doc), 0o600, null, null, actor, 'auth_totp_enable', reply_cb)) return;
 		fs.unlink(RUN_DIR + '/totp_pending.json');
 		release_lock();
 		audit_append(actor, 'auth_totp_enable', 'admin', 'committed', 'Enabled 2FA TOTP');
@@ -3972,7 +4029,7 @@ function handle_rpc(req, reply_cb) {
 		}
 		auth_doc.users.admin.totp_enabled = false;
 		delete auth_doc.users.admin.totp_secret;
-		atomic_write(ETC_DIR + '/auth.json', sprintf('%J\n', auth_doc), 0o600);
+		if (!atomic_write_or_reply(ETC_DIR + '/auth.json', sprintf('%J\n', auth_doc), 0o600, null, null, actor, 'auth_totp_disable', reply_cb)) return;
 		release_lock();
 		audit_append(actor, 'auth_totp_disable', 'admin', 'committed', 'Disabled 2FA TOTP');
 		reply_cb({ ok: true, message_ar: 'تم تعطيل المصادقة الثنائية لحساب المدير' });
@@ -3991,7 +4048,7 @@ function handle_rpc(req, reply_cb) {
 		let tkbps = +(params.throttle_kbps || 0);
 		if (qmb <= 0 && tkbps <= 0) delete quotas[mac];
 		else quotas[mac] = { quota_mb: qmb, throttle_kbps: tkbps, updated_at: now_iso() };
-		atomic_write(ETC_DIR + '/device_quotas.json', sprintf('%J\n', quotas), 0o600);
+		if (!atomic_write_or_reply(ETC_DIR + '/device_quotas.json', sprintf('%J\n', quotas), 0o600, null, null, actor, 'client_quota_set', reply_cb)) return;
 		release_lock();
 		audit_append(actor, 'client_quota_set', mac, 'committed', sprintf('quota_mb=%d throttle=%d', qmb, tkbps));
 		reply_cb({ ok: true, message_ar: 'تم حفظ الحصة الشهرية للجهاز بنجاح' });
@@ -4011,7 +4068,7 @@ function handle_rpc(req, reply_cb) {
 		let scheds = read_json(ETC_DIR + '/device_schedules.json', []);
 		push(scheds, { id: urandom_hex(4), mac: mac, action_type: action_type, start_time: start_h, end_time: end_h, enabled: true });
 		if (length(scheds) > 40) scheds = slice(scheds, -40);
-		atomic_write(ETC_DIR + '/device_schedules.json', sprintf('%J\n', scheds), 0o600);
+		if (!atomic_write_or_reply(ETC_DIR + '/device_schedules.json', sprintf('%J\n', scheds), 0o600, null, null, actor, 'schedule_action_set', reply_cb)) return;
 		release_lock();
 		audit_append(actor, 'schedule_action_set', mac, 'committed', start_h + '-' + end_h + ' ' + action_type);
 		reply_cb({ ok: true, message_ar: 'تمت إضافة جدولة الإجراء للجهاز بنجاح' });
