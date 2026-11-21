@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-# NMS (Network Management System) - Transactional Installer (Phase 2 Final)
+# NMS (Network Management System) - Transactional Installer (Phase 2 Final Integrity)
 # Usage: ./install.sh [--allow-insecure-lan-http]
 # Supports sandboxed testing via NMS_ROOT_PREFIX=/path/to/sandbox
 # Note: Prerequisite OS package installation (apk/opkg) runs BEFORE the NMS transaction
@@ -17,6 +17,7 @@ done
 ROOT_PREFIX="${NMS_ROOT_PREFIX:-}"
 SKIP_SERVICE_START="${NMS_SKIP_SERVICE_START:-0}"
 FAIL_POINT="${NMS_TEST_FAIL_POINT:-}"
+SERVICE_RUNNER="${NMS_SERVICE_RUNNER:-}"
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
@@ -100,6 +101,32 @@ if [ "$TLS_READY" -ne 1 ] && [ "$ALLOW_INSECURE" -ne 1 ]; then
   exit 1
 fi
 
+validate_tls_set() {
+  _crt="$1"
+  _key="$2"
+  _fp="$3"
+  [ -s "$_crt" ] && [ -s "$_key" ] && [ -s "$_fp" ] || return 1
+  openssl x509 -in "$_crt" -noout -checkend 0 >/dev/null 2>&1 || return 1
+  (openssl pkey -in "$_key" -noout >/dev/null 2>&1 || openssl rsa -in "$_key" -check -noout >/dev/null 2>&1) || return 1
+  _crt_pub="$(openssl x509 -in "$_crt" -pubkey -noout 2>/dev/null || true)"
+  _key_pub="$(openssl pkey -in "$_key" -pubout 2>/dev/null || openssl rsa -in "$_key" -pubout 2>/dev/null || true)"
+  [ -n "$_crt_pub" ] && [ "$_crt_pub" = "$_key_pub" ] || return 1
+  _calc_fp="$(openssl x509 -in "$_crt" -noout -fingerprint -sha256 2>/dev/null || true)"
+  _disk_fp="$(cat "$_fp" 2>/dev/null || true)"
+  [ -n "$_calc_fp" ] && [ "$_calc_fp" = "$_disk_fp" ] || return 1
+  return 0
+}
+
+run_svc() {
+  _svc_path="$1"
+  _svc_act="$2"
+  if [ -n "$SERVICE_RUNNER" ]; then
+    "$SERVICE_RUNNER" "$_svc_path" "$_svc_act"
+  else
+    "$_svc_path" "$_svc_act"
+  fi
+}
+
 # --- Begin NMS Installation Transaction ---
 COMMITTED=0
 TX_TMP_DIR=""
@@ -148,23 +175,25 @@ restore_one_service() {
   _svc="$1"
   _prev_en="$2"
   _prev_run="$3"
-  [ -x "$_svc" ] || return 0
+  if [ ! -e "$_svc" ]; then
+    echo "ROLLBACK ERROR: missing expected service script $_svc" >&2
+    return 1
+  fi
 
   if [ "$_prev_en" -eq 1 ]; then
-    "$_svc" enable || { echo "ROLLBACK ERROR: failed to enable $_svc" >&2; return 1; }
+    run_svc "$_svc" enable || { echo "ROLLBACK ERROR: failed to enable $_svc" >&2; return 1; }
   else
-    "$_svc" disable || { echo "ROLLBACK ERROR: failed to disable $_svc" >&2; return 1; }
+    run_svc "$_svc" disable || { echo "ROLLBACK ERROR: failed to disable $_svc" >&2; return 1; }
   fi
 
   if [ "$_prev_run" -eq 1 ]; then
-    "$_svc" restart || { echo "ROLLBACK ERROR: failed to restart $_svc" >&2; return 1; }
+    run_svc "$_svc" restart || { echo "ROLLBACK ERROR: failed to restart $_svc" >&2; return 1; }
   else
-    "$_svc" stop || { echo "ROLLBACK ERROR: failed to stop $_svc" >&2; return 1; }
+    run_svc "$_svc" stop || { echo "ROLLBACK ERROR: failed to stop $_svc" >&2; return 1; }
   fi
 
-  # Verify resulting service state matches previous state
-  _now_en=0; "$_svc" enabled >/dev/null 2>&1 && _now_en=1 || true
-  _now_run=0; "$_svc" running >/dev/null 2>&1 && _now_run=1 || true
+  _now_en=0; run_svc "$_svc" enabled >/dev/null 2>&1 && _now_en=1 || true
+  _now_run=0; run_svc "$_svc" running >/dev/null 2>&1 && _now_run=1 || true
   if [ "$_now_en" -ne "$_prev_en" ] || [ "$_now_run" -ne "$_prev_run" ]; then
     echo "ROLLBACK ERROR: service state mismatch for $_svc (en=${_now_en}/${_prev_en}, run=${_now_run}/${_prev_run})" >&2
     return 1
@@ -176,45 +205,72 @@ rollback_tx() {
   _rc=$?
   if [ "$COMMITTED" -eq 0 ]; then
     echo "ROLLBACK: Reverting NMS installation transaction..." >&2
+    _rb_err=0
     [ -n "$TMP_MANIFEST" ] && rm -f "$TMP_MANIFEST" 2>/dev/null || true
     [ -n "$TMP_RESTORE" ] && rm -f "$TMP_RESTORE" 2>/dev/null || true
 
     # 1. Stop any newly started services BEFORE restoring files
     if [ "$SVC_TOUCHED" -eq 1 ]; then
-      [ -x "${INIT_DIR}/noc-apid" ] && "${INIT_DIR}/noc-apid" stop >/dev/null 2>&1 || true
-      [ -x "${INIT_DIR}/noc-helperd" ] && "${INIT_DIR}/noc-helperd" stop >/dev/null 2>&1 || true
+      if [ -e "${INIT_DIR}/noc-apid" ]; then
+        run_svc "${INIT_DIR}/noc-apid" stop || { echo "ROLLBACK ERROR: failed to stop noc-apid" >&2; _rb_err=1; }
+      fi
+      if [ -e "${INIT_DIR}/noc-helperd" ]; then
+        run_svc "${INIT_DIR}/noc-helperd" stop || { echo "ROLLBACK ERROR: failed to stop noc-helperd" >&2; _rb_err=1; }
+      fi
     fi
 
     # 2. Restore RUN_DIR ownership if it existed prior to transaction
     if [ "$RUN_DIR_EXISTED" -eq 1 ] && [ -n "$RUN_DIR_ORIG_OWNER" ] && [ -z "$ROOT_PREFIX" ]; then
-      chown -R "$RUN_DIR_ORIG_OWNER" "$RUN_DIR" 2>/dev/null || true
+      chown -R "$RUN_DIR_ORIG_OWNER" "$RUN_DIR" || { echo "ROLLBACK ERROR: chown failed on $RUN_DIR" >&2; _rb_err=1; }
     fi
 
-    # 3. Restore pre-existing files (backend, init.d, frontend, passwd, group, tls, manifests)
+    # 3. Restore pre-existing files & verify exact content + permissions (no silent || true)
     if [ -n "$TX_RESTORE_LIST" ] && [ -f "$TX_RESTORE_LIST" ]; then
       while IFS='|' read -r _dst _mode _bak || [ -n "$_dst" ]; do
         [ -z "$_dst" ] && continue
-        if [ -f "$_bak" ]; then
-          cp -p "$_bak" "$_dst" 2>/dev/null || true
-          chmod "$_mode" "$_dst" 2>/dev/null || true
+        if [ ! -f "$_bak" ]; then
+          echo "ROLLBACK ERROR: missing backup $_bak for $_dst" >&2
+          _rb_err=1
+          continue
+        fi
+        if ! cp -p "$_bak" "$_dst" || ! chmod "$_mode" "$_dst"; then
+          echo "ROLLBACK ERROR: failed to restore $_dst" >&2
+          _rb_err=1
+          continue
+        fi
+        _cur_mode="$(stat -c '%a' "$_dst" 2>/dev/null || echo '')"
+        if ! cmp -s "$_bak" "$_dst" || [ "$_cur_mode" != "$_mode" ]; then
+          echo "ROLLBACK ERROR: verification failed after restoring $_dst (mode=${_cur_mode}/${_mode})" >&2
+          _rb_err=1
         fi
       done < "$TX_RESTORE_LIST"
     fi
 
     # 4. Remove newly created files from this transaction
-    printf '%s\n' "$TX_CREATED_FILES" | while IFS= read -r _f; do
-      [ -n "$_f" ] && rm -f "$_f" 2>/dev/null || true
+    for _f in $TX_CREATED_FILES; do
+      [ -n "$_f" ] || continue
+      if [ -e "$_f" ] || [ -L "$_f" ]; then
+        rm -f "$_f" || { echo "ROLLBACK ERROR: failed to remove $_f" >&2; _rb_err=1; }
+      fi
     done
 
     # 5. Remove newly created directories (deepest first) if empty
-    printf '%s\n' "$TX_CREATED_DIRS" | while IFS= read -r _d; do
-      [ -n "$_d" ] && rmdir "$_d" 2>/dev/null || true
+    for _d in $TX_CREATED_DIRS; do
+      [ -n "$_d" ] || continue
+      if [ -d "$_d" ]; then
+        rmdir "$_d" 2>/dev/null || true
+      fi
     done
 
     # 6. Restore previous enabled/running state using the RESTORED init.d scripts & verify
     if [ "$SVC_TOUCHED" -eq 1 ]; then
-      restore_one_service "${INIT_DIR}/noc-helperd" "$PREV_HELPERD_EN" "$PREV_HELPERD_RUN" || _rc=1
-      restore_one_service "${INIT_DIR}/noc-apid" "$PREV_APID_EN" "$PREV_APID_RUN" || _rc=1
+      restore_one_service "${INIT_DIR}/noc-helperd" "$PREV_HELPERD_EN" "$PREV_HELPERD_RUN" || _rb_err=1
+      restore_one_service "${INIT_DIR}/noc-apid" "$PREV_APID_EN" "$PREV_APID_RUN" || _rb_err=1
+    fi
+
+    if [ "$_rb_err" -ne 0 ]; then
+      echo "ROLLBACK FAILED: One or more restoration steps failed." >&2
+      _rc=1
     fi
   fi
   [ -n "$TX_TMP_DIR" ] && [ -d "$TX_TMP_DIR" ] && rm -rf "$TX_TMP_DIR" 2>/dev/null || true
@@ -248,7 +304,7 @@ chmod 0700 "$TX_TMP_DIR"
 TX_RESTORE_LIST="${TX_TMP_DIR}/tx_restore.list"
 : > "$TX_RESTORE_LIST"
 
-echo "[2/6] Tracking passwd/group and validating TLS artifact set..."
+echo "[2/6] Tracking passwd/group and cryptographically validating TLS set..."
 backup_for_tx "$PASSWD_FILE"
 backup_for_tx "$GROUP_FILE"
 if [ ! -f "$PASSWD_FILE" ]; then : > "$PASSWD_FILE"; chmod 0644 "$PASSWD_FILE"; fi
@@ -271,12 +327,9 @@ if [ -z "$ROOT_PREFIX" ]; then
   chown -R noc-api:noc-api "$RUN_DIR"
 fi
 
-# Validate cert, key, AND fingerprint as one consistent set
 NEED_NEW_TLS=0
 if [ "$TLS_READY" -eq 1 ]; then
-  if [ ! -s "${ETC_DIR}/tls.crt" ] || [ ! -s "${ETC_DIR}/tls.key" ] || [ ! -s "${ETC_DIR}/tls.fingerprint" ]; then
-    NEED_NEW_TLS=1
-  elif ! grep -q "BEGIN CERTIFICATE" "${ETC_DIR}/tls.crt" 2>/dev/null; then
+  if ! validate_tls_set "${ETC_DIR}/tls.crt" "${ETC_DIR}/tls.key" "${ETC_DIR}/tls.fingerprint"; then
     NEED_NEW_TLS=1
   fi
 fi
@@ -293,8 +346,11 @@ if [ "$NEED_NEW_TLS" -eq 1 ]; then
   openssl req -x509 -newkey rsa:2048 -nodes \
     -keyout "${TX_TMP_DIR}/tls.key" -out "${TX_TMP_DIR}/tls.crt" -days 825 \
     -subj "/CN=nms.lan" >/dev/null 2>&1
-  grep -q "BEGIN CERTIFICATE" "${TX_TMP_DIR}/tls.crt"
   openssl x509 -in "${TX_TMP_DIR}/tls.crt" -noout -fingerprint -sha256 > "${TX_TMP_DIR}/tls.fingerprint"
+  validate_tls_set "${TX_TMP_DIR}/tls.crt" "${TX_TMP_DIR}/tls.key" "${TX_TMP_DIR}/tls.fingerprint" || {
+    echo "ERROR: Newly generated TLS set failed cryptographic validation." >&2
+    exit 1
+  }
 fi
 
 TMP_MANIFEST="${MANIFEST_FILE}.tmp.$$"
@@ -334,13 +390,13 @@ install_managed_file() {
   echo "$_dst_rel" >> "$TMP_MANIFEST"
 }
 
-if [ -x "${INIT_DIR}/noc-helperd" ]; then
-  "${INIT_DIR}/noc-helperd" enabled >/dev/null 2>&1 && PREV_HELPERD_EN=1 || true
-  "${INIT_DIR}/noc-helperd" running >/dev/null 2>&1 && PREV_HELPERD_RUN=1 || true
+if [ -e "${INIT_DIR}/noc-helperd" ]; then
+  run_svc "${INIT_DIR}/noc-helperd" enabled >/dev/null 2>&1 && PREV_HELPERD_EN=1 || true
+  run_svc "${INIT_DIR}/noc-helperd" running >/dev/null 2>&1 && PREV_HELPERD_RUN=1 || true
 fi
-if [ -x "${INIT_DIR}/noc-apid" ]; then
-  "${INIT_DIR}/noc-apid" enabled >/dev/null 2>&1 && PREV_APID_EN=1 || true
-  "${INIT_DIR}/noc-apid" running >/dev/null 2>&1 && PREV_APID_RUN=1 || true
+if [ -e "${INIT_DIR}/noc-apid" ]; then
+  run_svc "${INIT_DIR}/noc-apid" enabled >/dev/null 2>&1 && PREV_APID_EN=1 || true
+  run_svc "${INIT_DIR}/noc-apid" running >/dev/null 2>&1 && PREV_APID_RUN=1 || true
 fi
 
 echo "[3/6] Installing backend, init.d, and frontend files (collision-safe)..."
@@ -359,7 +415,6 @@ done
 
 echo "[4/6] Installing TLS artifacts & ownership manifests..."
 if [ "$NEED_NEW_TLS" -eq 1 ] && [ -s "${TX_TMP_DIR}/tls.crt" ]; then
-  # Back up all existing TLS artifacts BEFORE replacing any of them
   backup_for_tx "${ETC_DIR}/tls.key"
   backup_for_tx "${ETC_DIR}/tls.crt"
   backup_for_tx "${ETC_DIR}/tls.fingerprint"
@@ -383,23 +438,25 @@ backup_for_tx "$RESTORE_FILE"
 chmod 0600 "$TMP_MANIFEST" "$TMP_RESTORE"
 mv "$TMP_MANIFEST" "$MANIFEST_FILE"
 mv "$TMP_RESTORE" "$RESTORE_FILE"
+# Optional test hook to corrupt a backup BEFORE failure to verify rollback detects restoration failure
+if [ -n "${NMS_TEST_CORRUPT_BACKUP_MATCH:-}" ] && [ -f "$TX_RESTORE_LIST" ]; then
+  while IFS='|' read -r _dst _mode _bak || [ -n "$_dst" ]; do
+    case "$_dst" in
+      *"$NMS_TEST_CORRUPT_BACKUP_MATCH"*) rm -f "$_bak" ;;
+    esac
+  done < "$TX_RESTORE_LIST"
+fi
 [ "$FAIL_POINT" = "during_manifest" ] && { echo "ERROR: Injected failure during_manifest" >&2; exit 1; }
 
 echo "[5/6] Enabling and starting NMS services..."
-if [ "$SKIP_SERVICE_START" -eq 0 ] && [ -z "$ROOT_PREFIX" ]; then
+if [ "$SKIP_SERVICE_START" -eq 0 ] || [ -n "$SERVICE_RUNNER" ]; then
   SVC_TOUCHED=1
-  /etc/init.d/noc-helperd enable
-  /etc/init.d/noc-apid enable
-  /etc/init.d/noc-helperd restart
-  sleep 1
-  /etc/init.d/noc-apid restart
-  sleep 1
-elif [ "${NMS_TEST_RUN_SANDBOX_SERVICES:-0}" = "1" ]; then
-  SVC_TOUCHED=1
-  "${INIT_DIR}/noc-helperd" enable
-  "${INIT_DIR}/noc-apid" enable
-  "${INIT_DIR}/noc-helperd" restart
-  "${INIT_DIR}/noc-apid" restart
+  run_svc "${INIT_DIR}/noc-helperd" enable
+  run_svc "${INIT_DIR}/noc-apid" enable
+  run_svc "${INIT_DIR}/noc-helperd" restart
+  [ -z "$SERVICE_RUNNER" ] && sleep 1 || true
+  run_svc "${INIT_DIR}/noc-apid" restart
+  [ -z "$SERVICE_RUNNER" ] && sleep 1 || true
 fi
 [ "$FAIL_POINT" = "during_service" ] && { echo "ERROR: Injected failure during_service" >&2; exit 1; }
 
