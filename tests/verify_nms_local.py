@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-NMS (Network Management System) - Local & Offline Regression Suite (Phase 2 Process Identity)
+NMS (Network Management System) - Local & Offline Regression Suite (Phase 2 Integrity)
 Zero network or SSH calls to any live router.
 Explicit Test Boundaries:
-  - Actual host tests: OpenSSL cryptographic TLS validation, socat TLS proxy, byte-for-byte
-    file/permission restoration, and /proc/<pid> executable-fixture process termination.
+  - Actual host tests: OpenSSL cryptographic TLS validation (incl. expired cert),
+    socat TLS proxy, byte-for-byte file/permission restoration, /proc/<pid> process
+    termination & reaping verification, and uninstall error-handling tests.
   - Simulated tests: Service lifecycle (NMS_SERVICE_RUNNER) and procd harness on Debian.
-    Because OpenWrt 'ucode' (ubus/uci) is absent on the Debian host, the process-lifecycle
-    test uses a clearly named executable fixture (exec_fixture) rather than claiming actual
-    NMS ucode daemon execution.
+    Because OpenWrt 'ucode' (ubus/uci) is absent on Debian, process-lifecycle tests use
+    a clearly named executable fixture (exec_fixture) rather than claiming actual NMS
+    ucode daemon execution.
 """
 import hashlib
 import http.server
@@ -47,7 +48,6 @@ def free_port() -> int:
 
 
 def proc_alive_non_zombie(pid: int) -> bool:
-    """Verify via /proc/<pid>/stat that pid exists AND is NOT a zombie ('Z')."""
     stat_p = f"/proc/{pid}/stat"
     if not os.path.exists(stat_p):
         return False
@@ -56,8 +56,7 @@ def proc_alive_non_zombie(pid: int) -> bool:
         rp = txt.rfind(")")
         if rp < 0:
             return False
-        state = txt[rp + 2:rp + 3]
-        return state != "Z"
+        return txt[rp + 2:rp + 3] != "Z"
     except OSError:
         return False
 
@@ -70,11 +69,25 @@ def read_proc_cmdline(pid: int) -> list[str]:
         return []
 
 
+def reap_and_kill_popen(p: subprocess.Popen) -> None:
+    try:
+        p.poll()
+        if p.returncode is None:
+            p.terminate()
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait(timeout=2)
+    except OSError:
+        pass
+
+
 def kill_pid(pid: int) -> None:
     try:
         os.kill(pid, signal.SIGTERM)
         for _ in range(20):
-            if not proc_alive_non_zombie(pid):
+            if not os.path.exists(f"/proc/{pid}"):
                 return
             time.sleep(0.05)
         os.kill(pid, signal.SIGKILL)
@@ -83,7 +96,6 @@ def kill_pid(pid: int) -> None:
 
 
 def make_exec_fixture_bytes(tag: str) -> bytes:
-    """Create a real standalone executable Python fixture whose process stays running."""
     return (
         "#!/usr/bin/env python3\n"
         f"# EXEC_FIXTURE_TAG={tag}\n"
@@ -127,9 +139,6 @@ CN = expired.nms.lan
 
 
 def write_exec_fixture_runner(runner_path: str, state_dir: str, log_path: str, root_prefix: str, fail_on_action: str = "") -> None:
-    """Simulated service runner that ACTUALLY executes the target backend executable fixture
-    (never sleep 60), records its PID, and waits for real non-zombie termination on stop.
-    """
     os.makedirs(state_dir, exist_ok=True)
     script = f"""#!/bin/sh
 set -eu
@@ -227,7 +236,6 @@ for rel in ("frontend/manifest.json", "frontend/glossary_ar.json", "schemas/noc_
 print("=== 2. SEC-01 & Cryptographic TLS Validation (incl. Expired Cert) ===")
 apid_txt = open(os.path.join(ROOT, "backend/noc-apid"), encoding="utf-8").read()
 init_apid_txt = open(os.path.join(ROOT, "init.d/noc-apid"), encoding="utf-8").read()
-install_txt = open(os.path.join(ROOT, "scripts/install.sh"), encoding="utf-8").read()
 
 if "getenv('NOC_TLS_ACTIVE')" not in apid_txt and "getenv('NOC_TLS_VERIFIED') == '1'" in apid_txt and "BIND_HOST == '127.0.0.1'" in apid_txt:
     ok("SEC-01: noc-apid enforces loopback + verified TLS + cert/key before Secure cookies")
@@ -281,9 +289,7 @@ for mode in ("malformed_cert", "malformed_key", "mismatched_pair", "wrong_finger
         else:
             fail(f"SEC-01[{mode}]: failed to detect/regenerate invalid TLS state")
 
-print("=== 3. Executable-Fixture Process Identity & Multi-Stage Service Rollback ===")
-# Build a temporary staged repo copy where backend/noc-apid & noc-helperd are real executable fixtures
-# (explicitly labeled exec_fixture, not OpenWrt ucode daemon) so the service runner executes them directly!
+print("=== 3. Executable-Fixture Process Identity & Reaping Verification ===")
 with tempfile.TemporaryDirectory() as td_repo:
     shutil.copytree(ROOT, os.path.join(td_repo, "repo"), ignore=shutil.ignore_patterns(".git", "__pycache__"))
     staged_repo = os.path.join(td_repo, "repo")
@@ -334,6 +340,8 @@ with tempfile.TemporaryDirectory() as td_repo:
             orig_apid_hash = hashlib.sha256(orig_apid_bytes).hexdigest()
             orig_a_init_hash = hashlib.sha256(orig_a_bytes).hexdigest()
 
+            pa = None
+            ph = None
             if prev_exists:
                 os.makedirs(os.path.join(td_tx, "usr/libexec"), exist_ok=True)
                 open(orig_apid, "wb").write(orig_apid_bytes)
@@ -355,19 +363,25 @@ with tempfile.TemporaryDirectory() as td_repo:
 
             try:
                 r_tx = subprocess.run(["sh", os.path.join(staged_repo, "scripts/install.sh")], env=env_tx, capture_output=True, text=True)
-                log_txt = open(svc_log).read() if os.path.isfile(svc_log) else ""
+                # Reap python-owned initial Popen handles if runner terminated them
+                if pa is not None:
+                    pa.poll()
+                if ph is not None:
+                    ph.poll()
+                # Brief wait for init/subreaper to reap runner-spawned children
+                time.sleep(0.1)
 
-                # Check every spawned new-fixture PID via /proc/<pid> is NOT alive and NOT a zombie
+                log_txt = open(svc_log).read() if os.path.isfile(svc_log) else ""
                 apid_hist = os.path.join(svc_state_dir, "noc-apid.pid_history")
                 hist_entries = [l.strip().split(":") for l in open(apid_hist).read().splitlines() if l.strip()] if os.path.isfile(apid_hist) else []
                 new_pids = [int(p) for p, h in hist_entries if h == new_apid_hash]
-                new_all_gone = all(not proc_alive_non_zombie(p) and not os.path.exists(f"/proc/{p}") for p in new_pids)
+                # Prove /proc/<pid> is COMPLETELY GONE (reaped, not zombie)
+                new_all_reaped = all(not os.path.exists(f"/proc/{p}") for p in new_pids)
 
                 pid_file = os.path.join(svc_state_dir, "noc-apid.pid")
                 if prev_exists and prev_run == 1:
                     cur_pid = int(open(pid_file).read().strip()) if os.path.isfile(pid_file) else -1
                     cmdline = read_proc_cmdline(cur_pid) if cur_pid > 0 else []
-                    # Verify real running process executes orig_apid and matches orig_apid_hash
                     proc_identity_ok = (
                         cur_pid > 0
                         and proc_alive_non_zombie(cur_pid)
@@ -376,30 +390,33 @@ with tempfile.TemporaryDirectory() as td_repo:
                     )
                     restored_inv = f"noc-apid:enable:svc={orig_a_init_hash}:be={orig_apid_hash}" in log_txt
                     state_ok = open(os.path.join(svc_state_dir, "noc-apid.state")).read() == "EN=1\nRUN=1\n"
-                    passed = r_tx.returncode != 0 and new_all_gone and proc_identity_ok and restored_inv and state_ok
+                    passed = r_tx.returncode != 0 and new_all_reaped and proc_identity_ok and restored_inv and state_ok
                 elif prev_exists:
                     state_ok = open(os.path.join(svc_state_dir, "noc-apid.state")).read() == "EN=0\nRUN=0\n"
-                    passed = r_tx.returncode != 0 and new_all_gone and not os.path.exists(pid_file) and state_ok
+                    passed = r_tx.returncode != 0 and new_all_reaped and not os.path.exists(pid_file) and state_ok
                 else:
                     passed = (
                         r_tx.returncode != 0
-                        and new_all_gone
+                        and new_all_reaped
                         and not os.path.exists(pid_file)
                         and not os.path.exists(orig_a_init)
                         and not os.path.exists(orig_h_init)
                     )
 
                 if passed:
-                    ok(f"EXEC-FIXTURE[{fp},exists={prev_exists},en={prev_en},run={prev_run}]: real /proc/<pid> identity & rollback verified")
+                    ok(f"EXEC-FIXTURE[{fp},exists={prev_exists},en={prev_en},run={prev_run}]: reaped /proc/<pid> & identity verified")
                 else:
-                    fail(f"EXEC-FIXTURE[{fp},exists={prev_exists},en={prev_en},run={prev_run}]: failed (rc={r_tx.returncode}, gone={new_all_gone})")
+                    fail(f"EXEC-FIXTURE[{fp},exists={prev_exists},en={prev_en},run={prev_run}]: failed (rc={r_tx.returncode}, reaped={new_all_reaped})")
             finally:
+                for p in (pa, ph):
+                    if p is not None:
+                        reap_and_kill_popen(p)
                 for pf in ("noc-apid.pid", "noc-helperd.pid"):
                     pp = os.path.join(svc_state_dir, pf)
                     if os.path.isfile(pp):
                         kill_pid(int(open(pp).read().strip()))
 
-print("=== 4. Deliberate Rollback Failure Detection (Backup, Permission, Stop, Restore, Missing Init) ===")
+print("=== 4. Deliberate Rollback Failure Detection (All 6 Failure Types) ===")
 # 4a. Missing backup -> ROLLBACK FAILED
 with tempfile.TemporaryDirectory() as td_rbf:
     env_rbf = os.environ.copy()
@@ -412,21 +429,48 @@ with tempfile.TemporaryDirectory() as td_rbf:
     r_rbf = subprocess.run(["sh", os.path.join(ROOT, "scripts/install.sh")], env=env_rbf, capture_output=True, text=True)
     ok("ROLLBACK-FAIL[missing_backup]: ROLLBACK FAILED reported") if (r_rbf.returncode != 0 and "ROLLBACK FAILED" in r_rbf.stderr) else fail("ROLLBACK-FAIL[missing_backup]")
 
-# 4b. Failed permission restoration (mocked chmod failing ONLY during rollback)
-with tempfile.TemporaryDirectory() as td_perm:
-    bin_dir = os.path.join(td_perm, "bin")
+# 4b. File restoration failure (cp fails ONLY when restoring .txbak)
+with tempfile.TemporaryDirectory() as td_frf:
+    bin_dir = os.path.join(td_frf, "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    real_cp = shutil.which("cp")
+    open(os.path.join(bin_dir, "cp"), "w").write(
+        f"#!/bin/sh\nif [ \"${{1:-}}\" = \"-p\" ]; then case \"${{2:-}}\" in *.txbak) exit 1 ;; esac; fi\nexec {real_cp} \"$@\"\n"
+    )
+    os.chmod(os.path.join(bin_dir, "cp"), 0o755)
+    os.makedirs(os.path.join(td_frf, "www/pro"), exist_ok=True)
+    open(os.path.join(td_frf, "www/pro/index.html"), "w").write("ORIG\n")
+    env_frf = os.environ.copy()
+    env_frf["PATH"] = f"{bin_dir}:{env_frf['PATH']}"
+    env_frf["NMS_ROOT_PREFIX"] = td_frf
+    env_frf["NMS_SKIP_SERVICE_START"] = "1"
+    env_frf["NMS_TEST_FAIL_POINT"] = "after_frontend"
+    r_frf = subprocess.run(["sh", os.path.join(ROOT, "scripts/install.sh")], env=env_frf, capture_output=True, text=True)
+    ok("ROLLBACK-FAIL[file_restore]: ROLLBACK FAILED reported") if (r_frf.returncode != 0 and "ROLLBACK ERROR: failed to restore" in r_frf.stderr and "ROLLBACK FAILED" in r_frf.stderr) else fail("ROLLBACK-FAIL[file_restore]")
+
+# 4c. Permission restoration failure (chmod fails ONLY when restoring 600 on index.html after marker)
+with tempfile.TemporaryDirectory() as td_prf:
+    bin_dir = os.path.join(td_prf, "bin")
     os.makedirs(bin_dir, exist_ok=True)
     real_chmod = shutil.which("chmod")
-    flag_f = os.path.join(td_perm, "in_rollback")
+    idx_p = os.path.join(td_prf, "www/pro/index.html")
+    # During install, install.sh sets 0644 on index.html; during rollback, it sets 600 on idx_p!
     open(os.path.join(bin_dir, "chmod"), "w").write(
-        f"#!/bin/sh\nif [ -f \"{flag_f}\" ]; then exit 1; fi\nexec {real_chmod} \"$@\"\n"
+        f"#!/bin/sh\nif [ \"$1\" = \"600\" ] && [ \"$2\" = \"{idx_p}\" ]; then exit 1; fi\nexec {real_chmod} \"$@\"\n"
     )
     os.chmod(os.path.join(bin_dir, "chmod"), 0o755)
-    # Trigger flag creation via CORRUPT hook? Instead pass a wrapper or test failed file restore via read-only dir!
-    # Even cleaner: make /www/pro/index.html target read-only/unwritable? No, root/owner can chmod; let's test failed stop & failed disable & missing service!
-    os.remove(os.path.join(bin_dir, "chmod"))
+    os.makedirs(os.path.join(td_prf, "www/pro"), exist_ok=True)
+    open(idx_p, "w").write("ORIG\n")
+    os.chmod(idx_p, 0o600)
+    env_prf = os.environ.copy()
+    env_prf["PATH"] = f"{bin_dir}:{env_prf['PATH']}"
+    env_prf["NMS_ROOT_PREFIX"] = td_prf
+    env_prf["NMS_SKIP_SERVICE_START"] = "1"
+    env_prf["NMS_TEST_FAIL_POINT"] = "after_frontend"
+    r_prf = subprocess.run(["sh", os.path.join(ROOT, "scripts/install.sh")], env=env_prf, capture_output=True, text=True)
+    ok("ROLLBACK-FAIL[perm_restore]: ROLLBACK FAILED reported") if (r_prf.returncode != 0 and "ROLLBACK ERROR: failed to restore" in r_prf.stderr and "ROLLBACK FAILED" in r_prf.stderr) else fail("ROLLBACK-FAIL[perm_restore]")
 
-# 4c. Failed service stop during rollback
+# 4d. Service stop failure
 with tempfile.TemporaryDirectory() as td_stop:
     sdir = os.path.join(td_stop, "sim_svc_state")
     slog = os.path.join(td_stop, "sim_svc.log")
@@ -443,7 +487,7 @@ with tempfile.TemporaryDirectory() as td_stop:
     r_st = subprocess.run(["sh", os.path.join(ROOT, "scripts/install.sh")], env=env_stop, capture_output=True, text=True)
     ok("ROLLBACK-FAIL[service_stop]: ROLLBACK FAILED reported") if (r_st.returncode != 0 and "ROLLBACK ERROR: failed to stop" in r_st.stderr and "ROLLBACK FAILED" in r_st.stderr) else fail("ROLLBACK-FAIL[service_stop]")
 
-# 4d. Failed service restoration (disable fails)
+# 4e. Service restoration failure (disable fails)
 with tempfile.TemporaryDirectory() as td_srf:
     sdir = os.path.join(td_srf, "sim_svc_state")
     slog = os.path.join(td_srf, "sim_svc.log")
@@ -460,7 +504,32 @@ with tempfile.TemporaryDirectory() as td_srf:
     r_srf = subprocess.run(["sh", os.path.join(ROOT, "scripts/install.sh")], env=env_srf, capture_output=True, text=True)
     ok("ROLLBACK-FAIL[service_restore]: ROLLBACK FAILED reported") if (r_srf.returncode != 0 and "ROLLBACK ERROR: failed to disable" in r_srf.stderr and "ROLLBACK FAILED" in r_srf.stderr) else fail("ROLLBACK-FAIL[service_restore]")
 
-print("=== 5. Simulated-procd TLS Topology & Collision Uninstall ===")
+# 4f. Missing expected init script during service restoration
+with tempfile.TemporaryDirectory() as td_mis:
+    sdir = os.path.join(td_mis, "sim_svc_state")
+    slog = os.path.join(td_mis, "sim_svc.log")
+    base_runner = os.path.join(td_mis, "runner_base.sh")
+    write_exec_fixture_runner(base_runner, sdir, slog, td_mis)
+    runner_mis = os.path.join(td_mis, "runner_missing_init.sh")
+    apid_init = os.path.join(td_mis, "etc/init.d/noc-apid")
+    open(runner_mis, "w").write(
+        f"#!/bin/sh\n"
+        f"if [ \"$2\" = \"disable\" ] && echo \"$1\" | grep -q 'noc-helperd'; then rm -f \"{apid_init}\"; fi\n"
+        f"exec \"{base_runner}\" \"$@\"\n"
+    )
+    os.chmod(runner_mis, 0o755)
+    os.makedirs(os.path.join(td_mis, "etc/init.d"), exist_ok=True)
+    open(os.path.join(td_mis, "etc/init.d/noc-helperd"), "w").write("#!/bin/sh\n")
+    open(apid_init, "w").write("#!/bin/sh\n")
+    env_mis = os.environ.copy()
+    env_mis["NMS_ROOT_PREFIX"] = td_mis
+    env_mis["NMS_SKIP_SERVICE_START"] = "1"
+    env_mis["NMS_SERVICE_RUNNER"] = runner_mis
+    env_mis["NMS_TEST_FAIL_POINT"] = "during_service_after_helperd_enable"
+    r_mis = subprocess.run(["sh", os.path.join(ROOT, "scripts/install.sh")], env=env_mis, capture_output=True, text=True)
+    ok("ROLLBACK-FAIL[missing_init_script]: ROLLBACK FAILED reported") if (r_mis.returncode != 0 and "ROLLBACK ERROR: missing expected service script" in r_mis.stderr and "ROLLBACK FAILED" in r_mis.stderr) else fail("ROLLBACK-FAIL[missing_init_script]")
+
+print("=== 5. Uninstall Error Handling & Simulated-procd TLS Topology ===")
 with tempfile.TemporaryDirectory() as td:
     env = os.environ.copy()
     env["NMS_ROOT_PREFIX"] = td
@@ -492,6 +561,7 @@ with tempfile.TemporaryDirectory() as td:
     r_ins = subprocess.run(["sh", os.path.join(ROOT, "scripts/install.sh")], env=env, capture_output=True, text=True)
     ok("INS-02: sandboxed install.sh exited 0") if r_ins.returncode == 0 else fail(f"INS-02: install.sh failed: {r_ins.stderr}")
 
+    # Simulated-procd TLS topology check
     cert_p = os.path.join(etc_dir, "tls.crt")
     fp_p = os.path.join(etc_dir, "tls.fingerprint")
     http_p = free_port()
@@ -556,6 +626,22 @@ start_service
             srv.shutdown()
             srv.server_close()
 
+    # Test uninstall failure handling first: temporarily move one backup file aside, run uninstall, expect failure & preserved manifest
+    bak_index = os.path.join(etc_dir, "preexisting_backup/_www_pro_index.html")
+    bak_tmp = os.path.join(td, "bak_hold")
+    shutil.move(bak_index, bak_tmp)
+    r_un_fail = subprocess.run(["sh", os.path.join(ROOT, "scripts/uninstall.sh")], env=env, capture_output=True, text=True)
+    if (r_un_fail.returncode != 0
+            and "UNINSTALL ERROR: missing backup" in r_un_fail.stderr
+            and "UNINSTALL FAILED" in r_un_fail.stderr
+            and "NMS uninstalled cleanly." not in r_un_fail.stdout
+            and os.path.isfile(os.path.join(etc_dir, "restorable_files.manifest"))):
+        ok("UNINSTALL-INTEGRITY: missing backup triggers UNINSTALL FAILED, nonzero exit, and preserves manifest")
+    else:
+        fail("UNINSTALL-INTEGRITY: uninstall did not fail cleanly on missing backup")
+
+    # Restore the backup file and run uninstall again -> must succeed and restore all 3 collisions byte-for-byte
+    shutil.move(bak_tmp, bak_index)
     r_un = subprocess.run(["sh", os.path.join(ROOT, "scripts/uninstall.sh")], env=env, capture_output=True, text=True)
     if (r_un.returncode == 0
             and open(col_apid, "rb").read() == col_apid_bytes and stat.S_IMODE(os.stat(col_apid).st_mode) == 0o700
