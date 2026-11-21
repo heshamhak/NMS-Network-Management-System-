@@ -33,24 +33,50 @@ check(!nms_fw_wifi.validate_wifi_iface_cfg({ device: 'radio0', mode: 'ap', netwo
 let uci_dir = vec_dir + '/uci_p3c';
 fs.mkdir(uci_dir);
 let base_fw = "config defaults\n\toption input 'REJECT'\n\toption output 'ACCEPT'\n\toption forward 'REJECT'\n\nconfig zone 'zn_lan'\n\toption name 'lan'\n\toption input 'ACCEPT'\n\toption output 'ACCEPT'\n\toption forward 'ACCEPT'\n\nconfig zone 'zn_wan'\n\toption name 'wan'\n\toption input 'REJECT'\n\toption output 'ACCEPT'\n\toption forward 'REJECT'\n\toption masq '1'\n\nconfig rule 'existing_rule'\n\toption name 'KeepMe'\n\toption src 'wan'\n\toption target 'ACCEPT'\n";
-let base_wifi = "config wifi-device 'radio0'\n\toption type 'mac80211'\n\toption band '2g'\n\toption channel '6'\n\toption htmode 'HT20'\n\toption country 'IQ'\n\nconfig wifi-device 'radio1'\n\toption type 'mac80211'\n\toption band '5g'\n\toption channel '36'\n\toption htmode 'HE80'\n\toption country 'IQ'\n\nconfig wifi-iface 'default_radio0'\n\toption device 'radio0'\n\toption network 'lan'\n\toption mode 'ap'\n\toption ssid 'MainAP'\n\toption encryption 'psk2'\n\toption key 'MainSecret123'\n";
+let base_wifi = "config wifi-device 'radio0'\n\toption type 'mac80211'\n\toption path 'platform/soc/18000000.wmac'\n\toption band '2g'\n\toption channel '6'\n\toption htmode 'HT20'\n\toption country 'DE'\n\nconfig wifi-device 'radio1'\n\toption type 'mac80211'\n\toption path 'pci0000:00/0000:00:00.0/0000:01:00.0'\n\toption band '5g'\n\toption channel '36'\n\toption htmode 'HE80'\n\toption country 'DE'\n\nconfig wifi-iface 'default_radio0'\n\toption device 'radio0'\n\toption network 'lan'\n\toption mode 'ap'\n\toption ssid 'MainAP'\n\toption encryption 'psk2'\n\toption key 'MainSecret123'\n";
 fs.writefile(uci_dir + '/firewall', base_fw);
 fs.chmod(uci_dir + '/firewall', 0o644);
 fs.writefile(uci_dir + '/wireless', base_wifi);
 fs.chmod(uci_dir + '/wireless', 0o644);
 
-let iw_phy_sample = "Wiphy phy1\n\tBand 1:\n\t\tFrequencies:\n\t\t\t* 2437.0 MHz [6] (20.0 dBm)\n\t\t\t* 2462.0 MHz [11] (20.0 dBm)\n\tBand 2:\n\t\tVHT Capabilities (0x338001b2):\n\t\tSupported Channel Width: 160 MHz\n\t\tHE Iftypes: AP\n\t\tFrequencies:\n\t\t\t* 5180.0 MHz [36] (20.0 dBm)\n\t\t\t* 5500.0 MHz [100] (20.0 dBm) (radar detection)\n\t\t\t* 5520.0 MHz [104] (disabled)\n";
-let iw_reg_sample = "global\ncountry DE: DFS-ETSI\n\t(2400 - 2483 @ 40), (N/A, 20), (N/A)\n\t(5150 - 5250 @ 80), (N/A, 20), (N/A)\n\t(5470 - 5725 @ 160), (N/A, 20), (0 ms), DFS\n";
-let parsed_caps = nms_fw_wifi.parse_iw_phy_capabilities(iw_phy_sample, iw_reg_sample);
+let sysfs_sample = [
+	{ phy: 'phy0', device_path: '/sys/devices/platform/soc/18000000.wmac' },
+	{ phy: 'phy2', device_path: '/sys/devices/pci0000:00/0000:00:00.0/0000:01:00.0' }
+];
+let iw_phy0_sample = "Wiphy phy0\n\tBand 1:\n\t\tCapabilities: 0x11ef\n\t\t\tHT20/HT40\n\t\tFrequencies:\n\t\t\t* 2437.0 MHz [6] (20.0 dBm)\n\t\t\t* 2462.0 MHz [11] (20.0 dBm)\n";
+let iw_phy2_sample = "Wiphy phy2\n\tBand 2:\n\t\tVHT Capabilities (0x338001b2):\n\t\tSupported Channel Width: 160 MHz\n\t\tHE Iftypes: AP\n\t\tFrequencies:\n\t\t\t* 5180.0 MHz [36] (20.0 dBm)\n\t\t\t* 5500.0 MHz [100] (20.0 dBm) (radar detection)\n\t\t\t* 5520.0 MHz [104] (disabled)\n";
+let iw_phy2_channels_sample = "Band 2:\n\t* 5180.0 MHz [36] (20.0 dBm)\n\t* 5500.0 MHz [100] (20.0 dBm) (radar detection)\n\t  DFS state: available\n\t  DFS CAC time: 60000 ms\n";
+let iw_reg_sample = "global\ncountry DE: DFS-ETSI\n\t(2400 - 2483.5 @ 40), (N/A, 20), (N/A)\n\t(5150 - 5250 @ 80), (N/A, 20), (N/A)\n\t(5470 - 5725 @ 160), (N/A, 20), (0 ms), DFS\n";
 
 function run_p3c(verb, params, extra_env) {
 	let rep = null;
 	let env = {
 		cfg_dir: uci_dir,
 		uci_dir: uci_dir,
-		discover_wifi_caps: function(r) { return parsed_caps; },
-		read_wifi_runtime: function(r) { return { up: !params.disabled, country: params.country, channel: params.channel, dfs_active: !!params.dfs }; },
-		read_wifi_iface_runtime: function(sid) { return { operational: true, ssid: params.ssid }; },
+		sysfs_ieee80211: sysfs_sample,
+		exec_iw_phy: function(phy) { return phy == 'phy0' ? iw_phy0_sample : (phy == 'phy2' ? iw_phy2_sample : ''); },
+		exec_iw_reg: function() { return iw_reg_sample; },
+		exec_iw_phy_channels: function(phy) { return phy == 'phy2' ? iw_phy2_channels_sample : ''; },
+		exec_iw_dev: function(ifname) {
+			if (ifname == 'phy2-ap0') {
+				let ch = params.channel || '100';
+				let fq = ch == '100' ? '5500' : (ch == '36' ? '5180' : '5500');
+				return sprintf("Interface phy2-ap0\n\twiphy 2\n\ttype AP\n\tssid %s\n\tchannel %s (%s MHz), width: 80 MHz, center1: %s MHz\n", params.ssid || 'Corp5G', ch, fq, fq);
+			}
+			return sprintf("Interface phy0-ap0\n\twiphy 0\n\ttype AP\n\tssid %s\n\tchannel %s (2462 MHz), width: 40 MHz, center1: 2452 MHz\n", params.ssid || 'MainAP', params.channel || '11');
+		},
+		ubus_call: function(obj, method) {
+			if (obj == 'network.wireless' && method == 'status') {
+				return {
+					radio0: { up: !params.disabled, interfaces: [{ section: 'default_radio0', ifname: 'phy0-ap0' }] },
+					radio1: { up: !params.disabled, interfaces: [{ section: params.id || 'guest_5g', ifname: 'phy2-ap0' }] }
+				};
+			}
+			if (index(obj, 'hostapd.') == 0 && method == 'get_status') {
+				return { status: 'ENABLED', freq: 5500, channel: 100, cac_time_seconds: 60, cac_time_left_seconds: 0 };
+			}
+			return null;
+		},
 		validate_fn: function() { return { ok: true }; },
 		reload_fn: function() { return { ok: true }; }
 	};
@@ -123,7 +149,7 @@ check(!r_fw_mis.ok && r_fw_mis.rolled_back === true && r_fw_mis.error == 'verify
 
 let snap_wifi = fs.readfile(uci_dir + '/wireless');
 let rc_wf = 0;
-let r_wf_mis = run_p3c('wifi_radio_save', { radio: 'radio0', band: '2g', channel: '11', htmode: 'HT40', country: 'US', txpower: 18, disabled: false }, {
+let r_wf_mis = run_p3c('wifi_radio_save', { radio: 'radio0', band: '2g', channel: '11', htmode: 'HT40', country: 'DE', txpower: 18, disabled: false }, {
 	reload_fn: function() {
 		rc_wf++;
 		if (rc_wf == 1) {
@@ -136,12 +162,26 @@ let r_wf_mis = run_p3c('wifi_radio_save', { radio: 'radio0', band: '2g', channel
 });
 check(!r_wf_mis.ok && r_wf_mis.rolled_back === true && r_wf_mis.error == 'verify_failed' && fs.readfile(uci_dir + '/wireless') == snap_wifi, 'P3C-PROD[real_wifi_mismatch_triggers_rollback]', sprintf('%J', r_wf_mis));
 
-// 2d. Hardware & regulatory capability rejections + post-reload runtime mismatch + rollback failure freeze
+// 2d. Capability, 6GHz frequency classification, regulatory, PHY mapping, and real runtime evidence tests
+let phy_6g_sample = "Wiphy phy3\n\tBand 3:\n\t\tHE Iftypes: AP\n\t\tEHT Iftypes: AP\n\t\tFrequencies:\n\t\t\t* 5955.0 MHz [1] (23.0 dBm)\n";
+let reg_6g_sample = "country DE: DFS-ETSI\n\t(5945 - 6425 @ 160), (N/A, 23), (N/A)\n";
+let caps_6g = nms_fw_wifi.parse_iw_phy_capabilities(phy_6g_sample, reg_6g_sample);
+check(caps_6g.bands['6g'] != null && caps_6g.bands['6g'].channels['1'].freq == 5955, 'P3C-CAP[6g_classified_by_frequency_regardless_of_band_num]', sprintf('%J', caps_6g));
+
+let caps_malformed = nms_fw_wifi.parse_iw_phy_capabilities("garbage\nBand 1:\n\tFrequencies:\n", "country 00:\n");
+check(!nms_fw_wifi.validate_wifi_radio_against_caps({ radio: 'radio0', band: '2g', channel: '6', htmode: 'HT20', country: 'DE' }, caps_malformed).ok, 'P3C-CAP[reject_malformed_phy_and_country_00]');
+
 let r_bad_band = run_p3c('wifi_radio_save', { radio: 'radio1', band: '6g', channel: '1', htmode: 'HE80', country: 'DE', txpower: 20 });
 check(!r_bad_band.ok && r_bad_band.error_code == 'VALIDATION', 'P3C-CAP[reject_unsupported_band_6g]', sprintf('%J', r_bad_band));
 
 let r_bad_bw = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '36', htmode: 'EHT320', country: 'DE', txpower: 20 });
 check(!r_bad_bw.ok && r_bad_bw.error_code == 'VALIDATION', 'P3C-CAP[reject_unsupported_eht320]', sprintf('%J', r_bad_bw));
+
+let r_reg_bw = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '36', htmode: 'HE160', country: 'DE', txpower: 20 });
+check(!r_reg_bw.ok && r_reg_bw.error_code == 'VALIDATION', 'P3C-CAP[reject_reg_bw_exceeded_he160_on_80_rule]', sprintf('%J', r_reg_bw));
+
+let r_reg_cc = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '36', htmode: 'HE80', country: 'US', txpower: 20 });
+check(!r_reg_cc.ok && r_reg_cc.error_code == 'VALIDATION', 'P3C-CAP[reject_reg_country_mismatch]', sprintf('%J', r_reg_cc));
 
 let r_bad_txp = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 25, dfs: true });
 check(!r_bad_txp.ok && r_bad_txp.error_code == 'VALIDATION', 'P3C-CAP[reject_txpower_exceeds_reg_and_hw]', sprintf('%J', r_bad_txp));
@@ -152,12 +192,65 @@ check(!r_bad_dfs_ch36.ok && r_bad_dfs_ch36.error_code == 'VALIDATION', 'P3C-CAP[
 let r_no_dfs_ch100 = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 20, dfs: false });
 check(!r_no_dfs_ch100.ok && r_no_dfs_ch100.error_code == 'VALIDATION', 'P3C-CAP[reject_missing_dfs_on_radar_ch100]', sprintf('%J', r_no_dfs_ch100));
 
-// Post-reload runtime mismatch (UCI succeeds, reload succeeds, but runtime reports dfs_active=false / wrong channel -> MUST roll back!)
+// PHY mapping tests (radio1 -> phy2 non-matching index, unmapped path rejected, wiphy mismatch rejected)
+let r_unmapped_phy = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 20, dfs: true }, {
+	sysfs_ieee80211: [{ phy: 'phy0', device_path: '/sys/devices/platform/soc/18000000.wmac' }]
+});
+check(!r_unmapped_phy.ok && r_unmapped_phy.error_code == 'VALIDATION', 'P3C-PHY[reject_unmapped_radio1_path]', sprintf('%J', r_unmapped_phy));
+
+let r_wiphy_mis = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 20, dfs: true }, {
+	exec_iw_phy: function(phy) { return iw_phy0_sample; }
+});
+check(!r_wiphy_mis.ok && r_wiphy_mis.error_code == 'VALIDATION', 'P3C-PHY[reject_wiphy_identity_mismatch]', sprintf('%J', r_wiphy_mis));
+
+// Real runtime adapter failure tests (exercising production ubus + iw adapters, NO read_wifi_runtime stub!)
 let snap_wf_rt = fs.readfile(uci_dir + '/wireless');
+
+// Configured DFS in ubus (config.dfs=true) WITHOUT operational hostapd/iw-phy DFS evidence -> MUST roll back!
+let r_dfs_unver = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 20, dfs: true, disabled: false }, {
+	ubus_call: function(obj, method) {
+		if (obj == 'network.wireless' && method == 'status') {
+			return { radio1: { up: true, config: { dfs: true }, interfaces: [{ section: 'guest_5g', ifname: 'phy2-ap0' }] } };
+		}
+		return null; // hostapd get_status missing!
+	},
+	exec_iw_phy_channels: function() { return "Band 2:\n\t* 5500.0 MHz [100] (20.0 dBm) (radar detection)\n\t  DFS state: unavailable\n"; }
+});
+check(!r_dfs_unver.ok && r_dfs_unver.rolled_back === true && fs.readfile(uci_dir + '/wireless') == snap_wf_rt, 'P3C-RT[reject_configured_dfs_without_operational_dfs_evidence]', sprintf('%J', r_dfs_unver));
+
+// Missing runtime channel/country from iw dev / iw reg -> MUST roll back (never silently skipped)!
+let r_rt_missing = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 20, dfs: true, disabled: false }, {
+	exec_iw_dev: function() { return "Interface phy2-ap0\n\twiphy 2\n\ttype AP\n"; }
+});
+check(!r_rt_missing.ok && r_rt_missing.rolled_back === true && fs.readfile(uci_dir + '/wireless') == snap_wf_rt, 'P3C-RT[reject_missing_runtime_channel_triggers_rollback]', sprintf('%J', r_rt_missing));
+
+// Wrong active runtime country / channel -> MUST roll back!
 let r_rt_mis = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '100', htmode: 'HE80', country: 'DE', txpower: 20, dfs: true, disabled: false }, {
-	read_wifi_runtime: function(r) { return { up: true, country: 'DE', channel: '36', dfs_active: false }; }
+	exec_iw_dev: function() { return "Interface phy2-ap0\n\twiphy 2\n\ttype AP\n\tchannel 36 (5180 MHz), width: 80 MHz\n"; }
 });
 check(!r_rt_mis.ok && r_rt_mis.rolled_back === true && r_rt_mis.error == 'verify_failed' && fs.readfile(uci_dir + '/wireless') == snap_wf_rt, 'P3C-PROD[runtime_dfs_channel_mismatch_triggers_rollback]', sprintf('%J', r_rt_mis));
+
+// Disabled radio still reports up=true -> MUST roll back!
+let r_rt_dis = run_p3c('wifi_radio_save', { radio: 'radio1', band: '5g', channel: '36', htmode: 'HE80', country: 'DE', txpower: 20, dfs: false, disabled: true }, {
+	ubus_call: function(obj, method) {
+		if (obj == 'network.wireless' && method == 'status') return { radio1: { up: true, interfaces: [] } };
+		return null;
+	}
+});
+check(!r_rt_dis.ok && r_rt_dis.rolled_back === true && fs.readfile(uci_dir + '/wireless') == snap_wf_rt, 'P3C-RT[reject_disabled_radio_still_up]', sprintf('%J', r_rt_dis));
+
+// Interface inactive / wrong active SSID despite radio_up=true and config.ssid matching -> MUST roll back!
+let r_if_inact = run_p3c('wifi_iface_save', { id: 'guest_5g', device: 'radio1', mode: 'ap', network: 'guest', ssid: 'Guest-5G-WPA3', encryption: 'sae', key: 'GuestPass123!', ieee80211w: '2', disabled: false }, {
+	ubus_call: function(obj, method) {
+		if (obj == 'network.wireless' && method == 'status') {
+			return { radio1: { up: true, interfaces: [{ section: 'guest_5g', ifname: 'phy2-ap0', config: { ssid: 'Guest-5G-WPA3' } }] } };
+		}
+		if (obj == 'hostapd.phy2-ap0' && method == 'get_status') return { status: 'UNINITIALIZED' };
+		return null;
+	},
+	exec_iw_dev: function() { return "Interface phy2-ap0\n\twiphy 2\n\ttype AP\n\tssid WrongOtherSSID\n\tchannel 100 (5500 MHz), width: 80 MHz\n"; }
+});
+check(!r_if_inact.ok && r_if_inact.rolled_back === true && fs.readfile(uci_dir + '/wireless') == snap_wf_rt, 'P3C-RT[reject_inactive_iface_despite_radio_up_and_config_ssid]', sprintf('%J', r_if_inact));
 
 // Wireless reload failure -> MUST roll back wireless UCI config cleanly
 let rc_wf_rel = 0;
