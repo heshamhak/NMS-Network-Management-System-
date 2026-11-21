@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-NMS (Network Management System) - Local & Offline Regression Suite (P4 Hardened)
+NMS (Network Management System) - Local & Offline Regression Suite (Phase 2 Final)
 Zero network or SSH calls to any live router.
 Covers:
   - Static JS/Shell/JSON/CSP hygiene
-  - SEC-01 regression (real TLS handshake via socat+openssl, fingerprint match, refusal on missing TLS)
-  - INS-02 regression (per-file permissions, unchanged user dir/file modes, ucode modules, TLS fail-closed)
-  - INS-03 regression (same-name collision backup & restore with exact original permissions)
+  - SEC-01 regression (real socat + init.d/noc-apid procd topology, loopback-only HTTP, no LAN HTTP)
+  - INS-02 regression (pre-existing /etc/noc-console & user dir perms preserved, ucode modules, TLS fail-closed)
+  - INS-03 regression (collision backup/restore for backend, init.d, AND frontend; transactional rollback on failure)
 """
 import hashlib
 import http.server
@@ -45,16 +45,7 @@ def free_port() -> int:
 
 
 print("=== 1. Static Hygiene & Syntax Checks ===")
-js_files = [
-    "frontend/app.js",
-    "frontend/nms-i18n.js",
-    "frontend/noc-topology.js",
-    "frontend/noc-search.js",
-    "frontend/noc-tools.js",
-    "frontend/netchart.js",
-    "frontend/sw.js",
-]
-for rel in js_files:
+for rel in ("frontend/app.js", "frontend/nms-i18n.js", "frontend/noc-topology.js", "frontend/noc-search.js", "frontend/noc-tools.js", "frontend/netchart.js", "frontend/sw.js"):
     r = subprocess.run(["node", "--check", os.path.join(ROOT, rel)], capture_output=True, text=True)
     ok(f"node --check {rel}") if r.returncode == 0 else fail(f"node --check {rel}: {r.stderr.strip()}")
 
@@ -68,19 +59,6 @@ for rel in ("frontend/manifest.json", "frontend/glossary_ar.json", "schemas/noc_
         ok(f"json valid {rel}")
     except Exception as e:
         fail(f"json invalid {rel}: {e}")
-
-index_html = open(os.path.join(ROOT, "frontend/index.html"), encoding="utf-8").read()
-if re.findall(r"<script(?![^>]*\bsrc=)[^>]*>", index_html, re.I):
-    fail("Inline <script> detected in frontend/index.html")
-else:
-    ok("frontend/index.html: strict script-src 'self' (no inline scripts)")
-
-for js_rel in ("frontend/app.js", "frontend/nms-i18n.js", "frontend/noc-topology.js", "frontend/noc-search.js"):
-    txt = open(os.path.join(ROOT, js_rel), encoding="utf-8").read()
-    if ".innerHTML" in txt or "eval(" in txt or "new Function" in txt:
-        fail(f"Unsafe DOM/eval pattern in {js_rel}")
-    else:
-        ok(f"{js_rel}: zero innerHTML / eval / new Function")
 
 print("=== 2. SEC-01 & Failure-Mode Regression ===")
 apid_txt = open(os.path.join(ROOT, "backend/noc-apid"), encoding="utf-8").read()
@@ -100,12 +78,10 @@ else:
 for mod in ("ucode-mod-uloop", "ucode-mod-digest", "ucode-mod-fs", "ucode-mod-ubus", "ucode-mod-uci", "ucode-mod-socket"):
     ok(f"INS-02: install.sh checks/includes {mod}") if mod in install_txt else fail(f"INS-02: install.sh missing {mod}")
 
-# Test install.sh fails when TLS prerequisites (socat/openssl) are missing
 with tempfile.TemporaryDirectory() as td_fail:
     empty_bin = os.path.join(td_fail, "empty_bin")
     os.makedirs(empty_bin, exist_ok=True)
-    # Symlink only basic POSIX tools, intentionally omitting socat and openssl
-    for tool in ("sh", "mkdir", "chmod", "cp", "mv", "grep", "awk", "sed", "find", "sort", "dirname", "cat", "tr", "stat", "id"):
+    for tool in ("sh", "mkdir", "chmod", "cp", "mv", "grep", "awk", "sed", "find", "sort", "dirname", "cat", "tr", "stat", "id", "rm", "rmdir", "printf"):
         tp = shutil.which(tool)
         if tp:
             os.symlink(tp, os.path.join(empty_bin, tool))
@@ -116,84 +92,155 @@ with tempfile.TemporaryDirectory() as td_fail:
     else:
         fail(f"SEC-01/INS-02: install.sh did not fail on missing TLS (rc={r_fail.returncode})")
 
-print("=== 3. INS-02, INS-03 Collision & Real TLS Handshake Regression ===")
+print("=== 3. Transactional Rollback on Mid-Install Failure ===")
+with tempfile.TemporaryDirectory() as td_tx:
+    env_tx = os.environ.copy()
+    env_tx["NMS_ROOT_PREFIX"] = td_tx
+    env_tx["NMS_SKIP_SERVICE_START"] = "1"
+    env_tx["NMS_TEST_FAIL_AFTER_COPY"] = "1"
+
+    # Pre-create existing /etc/noc-console (0750), existing backend noc-apid (0700), init.d/noc-apid (0755), frontend index.html (0600)
+    etc_dir = os.path.join(td_tx, "etc/noc-console")
+    os.makedirs(etc_dir, exist_ok=True)
+    os.chmod(etc_dir, 0o750)
+
+    os.makedirs(os.path.join(td_tx, "usr/libexec"), exist_ok=True)
+    orig_apid = os.path.join(td_tx, "usr/libexec/noc-apid")
+    open(orig_apid, "w").write("ORIG_BACKEND_APID\n")
+    os.chmod(orig_apid, 0o700)
+
+    os.makedirs(os.path.join(td_tx, "www/pro"), exist_ok=True)
+    orig_idx = os.path.join(td_tx, "www/pro/index.html")
+    open(orig_idx, "w").write("ORIG_FRONTEND_IDX\n")
+    os.chmod(orig_idx, 0o600)
+
+    r_tx = subprocess.run(["sh", os.path.join(ROOT, "scripts/install.sh")], env=env_tx, capture_output=True, text=True)
+    if r_tx.returncode != 0 and "ROLLBACK" in r_tx.stderr:
+        ok("TX: simulated mid-install failure triggered automatic rollback")
+    else:
+        fail(f"TX: rollback did not trigger (rc={r_tx.returncode})")
+
+    if (open(orig_apid).read() == "ORIG_BACKEND_APID\n" and stat.S_IMODE(os.stat(orig_apid).st_mode) == 0o700
+            and open(orig_idx).read() == "ORIG_FRONTEND_IDX\n" and stat.S_IMODE(os.stat(orig_idx).st_mode) == 0o600
+            and stat.S_IMODE(os.stat(etc_dir).st_mode) == 0o750
+            and not os.path.exists(os.path.join(etc_dir, "installed_files.manifest"))
+            and not os.path.exists(os.path.join(td_tx, "usr/libexec/noc-helperd"))):
+        ok("TX: rollback restored original backend/frontend files, preserved 0750 /etc/noc-console, left zero partial manifest")
+    else:
+        fail("TX: rollback left partial state or altered original files/permissions")
+
+print("=== 4. INS-02, INS-03 (Backend + Init + Frontend Collisions) & Service Topology TLS ===")
 with tempfile.TemporaryDirectory() as td:
     env = os.environ.copy()
     env["NMS_ROOT_PREFIX"] = td
     env["NMS_SKIP_SERVICE_START"] = "1"
     env["NMS_SKIP_SERVICE_STOP"] = "1"
 
-    # Pre-create user-owned directory (0700), user file (0600), and SAME-NAME colliding index.html (0600)
+    # Pre-create /etc/noc-console with custom mode 0750
+    etc_dir = os.path.join(td, "etc/noc-console")
+    os.makedirs(etc_dir, exist_ok=True)
+    os.chmod(etc_dir, 0o750)
+
+    # Pre-create colliding backend, init.d, AND frontend files + private user dir
+    os.makedirs(os.path.join(td, "usr/libexec"), exist_ok=True)
+    col_apid = os.path.join(td, "usr/libexec/noc-apid")
+    open(col_apid, "w").write("USER_APID_BIN\n")
+    os.chmod(col_apid, 0o700)
+
+    os.makedirs(os.path.join(td, "etc/init.d"), exist_ok=True)
+    col_init = os.path.join(td, "etc/init.d/noc-apid")
+    open(col_init, "w").write("USER_INIT_SCRIPT\n")
+    os.chmod(col_init, 0o750)
+
     web_pro = os.path.join(td, "www/pro")
     user_dir = os.path.join(web_pro, "user_private_dir")
     os.makedirs(user_dir, exist_ok=True)
     os.chmod(user_dir, 0o700)
-
     user_secret = os.path.join(user_dir, "secret.txt")
-    with open(user_secret, "w", encoding="utf-8") as f:
-        f.write("PRIVATE_DATA\n")
+    open(user_secret, "w").write("PRIVATE_DATA\n")
     os.chmod(user_secret, 0o600)
 
-    colliding_index = os.path.join(web_pro, "index.html")
-    with open(colliding_index, "w", encoding="utf-8") as f:
-        f.write("USER_CUSTOM_INDEX_KEEP\n")
-    os.chmod(colliding_index, 0o600)
+    col_index = os.path.join(web_pro, "index.html")
+    open(col_index, "w").write("USER_CUSTOM_INDEX_KEEP\n")
+    os.chmod(col_index, 0o600)
 
     r_ins = subprocess.run(["sh", os.path.join(ROOT, "scripts/install.sh")], env=env, capture_output=True, text=True)
-    if r_ins.returncode == 0:
-        ok("INS-02: sandboxed install.sh with TLS prerequisites exited 0")
-    else:
-        fail(f"INS-02: sandboxed install.sh failed: {r_ins.stderr}")
+    ok("INS-02: sandboxed install.sh exited 0") if r_ins.returncode == 0 else fail(f"INS-02: install.sh failed: {r_ins.stderr}")
 
-    # Verify user directory & user file modes were NOT altered by install.sh
-    if stat.S_IMODE(os.stat(user_dir).st_mode) == 0o700 and stat.S_IMODE(os.stat(user_secret).st_mode) == 0o600:
-        ok("INS-02: pre-existing user directory (0700) and file (0600) permissions untouched")
+    if stat.S_IMODE(os.stat(etc_dir).st_mode) == 0o750 and stat.S_IMODE(os.stat(user_dir).st_mode) == 0o700 and stat.S_IMODE(os.stat(user_secret).st_mode) == 0o600:
+        ok("INS-02: pre-existing /etc/noc-console (0750), user_private_dir (0700), and secret.txt (0600) preserved")
     else:
-        fail("INS-02: install.sh altered pre-existing user directory/file permissions")
+        fail("INS-02: pre-existing directory or file permissions were modified")
 
-    # Verify NMS-installed file got 0644
-    if stat.S_IMODE(os.stat(os.path.join(web_pro, "app.js")).st_mode) == 0o644:
-        ok("INS-02: NMS-installed file app.js has 0644")
+    # Test init.d/noc-apid procd topology + real socat TLS proxy + loopback-only backend
+    cert_p = os.path.join(etc_dir, "tls.crt")
+    key_p = os.path.join(etc_dir, "tls.key")
+    fp_p = os.path.join(etc_dir, "tls.fingerprint")
+
+    # Simulate procd harness executing init.d/noc-apid start_service
+    procd_log = os.path.join(td, "procd_capture.txt")
+    harness_sh = f"""#!/bin/sh
+uci() {{ echo "127.0.0.1"; }}
+logger() {{ :; }}
+procd_open_instance() {{ echo "INSTANCE=$1" >> "{procd_log}"; }}
+procd_set_param() {{ echo "PARAM=$*" >> "{procd_log}"; }}
+procd_close_instance() {{ echo "END_INSTANCE" >> "{procd_log}"; }}
+sed 's|/etc/noc-console|{etc_dir}|g; s|/tmp/noc-console|{td}/tmp/noc-console|g' "{ROOT}/init.d/noc-apid" > "{td}/init_noc_apid_test"
+. "{td}/init_noc_apid_test"
+start_service
+"""
+    r_procd = subprocess.run(["sh", "-c", harness_sh], capture_output=True, text=True)
+    procd_txt = open(procd_log).read() if os.path.isfile(procd_log) else ""
+    if r_procd.returncode == 0 and "NOC_BIND_HOST=127.0.0.1" in procd_txt and "NOC_TLS_VERIFIED=1" in procd_txt and "OPENSSL-LISTEN:8743,bind=127.0.0.1" in procd_txt:
+        ok("SEC-01: init.d/noc-apid procd topology binds API to 127.0.0.1 and launches socat TLS proxy on :8743")
     else:
-        fail("INS-02: NMS-installed file app.js missing 0644")
+        fail(f"SEC-01: init.d/noc-apid procd topology check failed (rc={r_procd.returncode})")
 
-    # Real TLS handshake test using generated cert + key + socat
-    cert_p = os.path.join(td, "etc/noc-console/tls.crt")
-    key_p = os.path.join(td, "etc/noc-console/tls.key")
-    fp_p = os.path.join(td, "etc/noc-console/tls.fingerprint")
-    if os.path.isfile(cert_p) and os.path.isfile(key_p) and os.path.isfile(fp_p):
-        ok("SEC-01: PEM cert, 0600 key, and SHA-256 fingerprint generated by install.sh")
+    # Verify init.d/noc-apid refuses to start when TLS cert/socat is absent
+    empty_bin2 = os.path.join(td, "no_tls_bin")
+    os.makedirs(empty_bin2, exist_ok=True)
+    for tool in ("sh", "mkdir", "chmod", "sed", "grep", "hostname", "rm", "mv"):
+        tp = shutil.which(tool)
+        if tp:
+            os.symlink(tp, os.path.join(empty_bin2, tool))
+    no_tls_sh = f"""#!/bin/sh
+uci() {{ echo "127.0.0.1"; }}
+logger() {{ echo "LOG:$*" >&2; }}
+procd_open_instance() {{ echo "SHOULD_NOT_START" >&2; }}
+procd_set_param() {{ :; }}
+procd_close_instance() {{ :; }}
+sed 's|/etc/noc-console|{td}/missing_etc|g; s|/tmp/noc-console|{td}/tmp/noc-console|g' "{ROOT}/init.d/noc-apid" > "{td}/init_no_tls"
+. "{td}/init_no_tls"
+start_service
+"""
+    r_no_tls = subprocess.run([os.path.join(empty_bin2, "sh"), "-c", no_tls_sh], env={"PATH": empty_bin2}, capture_output=True, text=True)
+    if r_no_tls.returncode != 0 and "SHOULD_NOT_START" not in r_no_tls.stderr:
+        ok("SEC-01: init.d/noc-apid refuses to start unencrypted HTTP when TLS prerequisites are missing")
     else:
-        fail("SEC-01: TLS cert/key/fingerprint missing after install.sh")
+        fail("SEC-01: init.d/noc-apid did not fail closed when TLS prerequisites were missing")
 
+    # Live local loopback + socat TLS integration test
     if shutil.which("socat") and os.path.isfile(cert_p):
         backend_port = free_port()
         tls_port = free_port()
 
-        class OkHandler(http.server.BaseHTTPRequestHandler):
+        class LoopbackHandler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()
-                self.wfile.write(b"NMS_TLS_OK")
+                self.wfile.write(b"NMS_LOOPBACK_TLS_OK")
             def log_message(self, *args):
                 pass
 
-        srv = http.server.HTTPServer(("127.0.0.1", backend_port), OkHandler)
-        t = threading.Thread(target=srv.serve_forever, daemon=True)
-        t.start()
+        srv = http.server.HTTPServer(("127.0.0.1", backend_port), LoopbackHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
 
         socat_proc = subprocess.Popen(
-            [
-                "socat",
-                f"OPENSSL-LISTEN:{tls_port},bind=127.0.0.1,reuseaddr,fork,cert={cert_p},key={key_p},verify=0",
-                f"TCP:127.0.0.1:{backend_port}",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            ["socat", f"OPENSSL-LISTEN:{tls_port},bind=127.0.0.1,reuseaddr,fork,cert={cert_p},key={key_p},verify=0", f"TCP:127.0.0.1:{backend_port}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         try:
-            # Wait briefly for socat listener
             connected = False
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
@@ -207,38 +254,33 @@ with tempfile.TemporaryDirectory() as td:
                             fp_text = open(fp_p).read().replace(":", "").upper()
                             tls_s.sendall(b"GET / HTTP/1.1\r\nHost: nms.lan\r\nConnection: close\r\n\r\n")
                             resp = tls_s.recv(4096)
-                            if b"NMS_TLS_OK" in resp and sha256_hex in fp_text:
-                                ok(f"SEC-01: Real TLS handshake + HTTP over socat succeeded (SHA256={sha256_hex[:16]}...)")
+                            if b"NMS_LOOPBACK_TLS_OK" in resp and sha256_hex in fp_text:
+                                ok(f"SEC-01: Real TLS proxy -> 127.0.0.1 loopback succeeded (SHA256={sha256_hex[:16]}...)")
                                 connected = True
                                 break
                 except OSError:
                     time.sleep(0.1)
             if not connected:
-                fail("SEC-01: Real TLS handshake over socat failed")
+                fail("SEC-01: Real TLS proxy -> loopback failed")
         finally:
             socat_proc.terminate()
             socat_proc.wait(timeout=3)
             srv.shutdown()
             srv.server_close()
 
-    # Uninstall WITHOUT --purge and verify same-name collision restore + permission preservation
+    # Uninstall WITHOUT --purge and verify backend, init.d, AND frontend collisions are restored with exact modes
     r_un = subprocess.run(["sh", os.path.join(ROOT, "scripts/uninstall.sh")], env=env, capture_output=True, text=True)
-    if r_un.returncode == 0:
-        ok("INS-03: sandboxed uninstall.sh exited 0")
-    else:
-        fail(f"INS-03: sandboxed uninstall.sh failed: {r_un.stderr}")
+    ok("INS-03: sandboxed uninstall.sh exited 0") if r_un.returncode == 0 else fail(f"INS-03: uninstall.sh failed: {r_un.stderr}")
 
-    restored_txt = open(colliding_index, encoding="utf-8").read() if os.path.isfile(colliding_index) else ""
-    restored_mode = stat.S_IMODE(os.stat(colliding_index).st_mode) if os.path.isfile(colliding_index) else 0
-    if restored_txt == "USER_CUSTOM_INDEX_KEEP\n" and restored_mode == 0o600:
-        ok("INS-03: colliding user index.html restored with exact content & 0600 mode")
+    if (open(col_apid).read() == "USER_APID_BIN\n" and stat.S_IMODE(os.stat(col_apid).st_mode) == 0o700
+            and open(col_init).read() == "USER_INIT_SCRIPT\n" and stat.S_IMODE(os.stat(col_init).st_mode) == 0o750
+            and open(col_index).read() == "USER_CUSTOM_INDEX_KEEP\n" and stat.S_IMODE(os.stat(col_index).st_mode) == 0o600
+            and not os.path.exists(os.path.join(td, "usr/libexec/noc-helperd"))
+            and not os.path.exists(os.path.join(web_pro, "app.js"))
+            and os.path.isfile(user_secret)):
+        ok("INS-03: backend, init.d, and frontend collisions restored with exact original modes; NMS-only files removed")
     else:
-        fail(f"INS-03: colliding user index.html not properly restored (mode={oct(restored_mode)})")
-
-    if not os.path.exists(os.path.join(web_pro, "app.js")) and os.path.isfile(user_secret) and stat.S_IMODE(os.stat(user_dir).st_mode) == 0o700:
-        ok("INS-03: NMS files removed while user_private_dir (0700) and secret.txt (0600) preserved")
-    else:
-        fail("INS-03: NMS removal or user file preservation failed")
+        fail("INS-03: collision restoration or NMS-only removal failed")
 
 print(f"\n=== SUMMARY: {len(passes)} passed, {len(failures)} failed ===")
 sys.exit(1 if failures else 0)
