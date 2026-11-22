@@ -34,6 +34,92 @@ export function parse_strict_bool(val, default_val) {
 	return { ok: false };
 };
 
+export function build_sqm_topology(uci_cur, ubus_dump, br_if_entries, iface_exists_fn) {
+	let lan_ifaces = { 'lo': true, 'br-lan': true, 'tailscale0': true, 'docker0': true };
+	let wan_ifaces = {};
+	for (let e in (br_if_entries || [])) {
+		if (e && e != '.' && e != '..') lan_ifaces[e] = true;
+	}
+
+	let uci_ifaces = {};
+	let wan_nets = {};
+	let non_wan_nets = {};
+
+	if (uci_cur) {
+		try {
+			uci_cur.foreach('network', 'device', function(s) {
+				if (s.name == 'br-lan' && type(s.ports) == 'array') {
+					for (let pt in s.ports) if (pt) lan_ifaces[pt] = true;
+				}
+			});
+			uci_cur.foreach('network', 'interface', function(s) {
+				let nm = s['.name'] || '';
+				let dev = s.device || s.ifname || '';
+				let proto = s.proto || '';
+				if (nm != '') uci_ifaces[nm] = { device: dev, proto: proto };
+				if (nm == 'lan' || nm == 'loopback') {
+					if (dev != '') lan_ifaces[dev] = true;
+				}
+			});
+			uci_cur.foreach('firewall', 'zone', function(z) {
+				let zname = lc(trim(z.name || ''));
+				let nets = [];
+				if (type(z.network) == 'array') nets = z.network;
+				else if (type(z.network) == 'string' && trim(z.network) != '') nets = filter(split(trim(z.network), ' '), (x) => x != '');
+				for (let n in nets) {
+					if (zname == 'wan') wan_nets[n] = true;
+					else non_wan_nets[n] = true;
+				}
+			});
+		} catch (e) {}
+	}
+
+	// Mark any device bound to a non-WAN firewall zone (lan, guest, vpn, iot, mgmt) as protected
+	for (let n in keys(non_wan_nets)) {
+		if (uci_ifaces[n] && uci_ifaces[n].device != '') lan_ifaces[uci_ifaces[n].device] = true;
+	}
+
+	// Fail closed if runtime ubus network.interface dump is missing or invalid
+	if (ubus_dump && type(ubus_dump.interface) == 'array') {
+		let rt_by_net = {};
+		for (let itf in ubus_dump.interface) {
+			if (!itf || !itf['interface']) continue;
+			let inm = itf['interface'];
+			rt_by_net[inm] = itf;
+			if (inm == 'lan' || inm == 'loopback' || non_wan_nets[inm]) {
+				if (itf.l3_device) lan_ifaces[itf.l3_device] = true;
+				if (itf.device) lan_ifaces[itf.device] = true;
+			}
+		}
+		for (let wn in keys(wan_nets)) {
+			if (wn == 'lan' || wn == 'loopback' || non_wan_nets[wn]) continue;
+			let rt = rt_by_net[wn];
+			if (!rt || rt.up === false) continue;
+			let rt_l3 = rt.l3_device || '';
+			let rt_l2 = rt.device || '';
+			let rt_dev = rt_l3 != '' ? rt_l3 : rt_l2;
+			if (rt_dev == '') continue;
+			let ui = uci_ifaces[wn];
+			if (ui && ui.device != '') {
+				if (ui.proto == 'pppoe') {
+					if (rt_l2 != '' && rt_l2 != ui.device) continue; // PPPoE L2 mismatch conflict
+				} else {
+					if (rt_dev != ui.device && rt_l2 != ui.device) continue; // UCI vs runtime conflict
+				}
+			}
+			if (!HARD_PROTECTED_IFACES[rt_dev] && !lan_ifaces[rt_dev]) {
+				wan_ifaces[rt_dev] = true;
+			}
+		}
+	}
+
+	return {
+		lan_ifaces: lan_ifaces,
+		wan_ifaces: wan_ifaces,
+		iface_exists: iface_exists_fn
+	};
+};
+
 export function validate_sqm_config(params, topology) {
 	let p = (type(params) == 'object') ? params : {};
 	let topo = (type(topology) == 'object') ? topology : {};
@@ -303,28 +389,55 @@ export function apply_sqm_tx(cfg, deps, cb) {
 				});
 				return;
 			}
-			let check_iface = prev_enabled ? prev_iface : cfg.interface;
-			deps.show_tc(check_iface, function(tc_rb) {
-				let rt_ok = !!(tc_rb && tc_rb.ok);
-				if (rt_ok) {
-					if (prev_enabled) {
-						rt_ok = verify_tc_qdisc_active(tc_rb.output, prev_iface, prev_qdisc);
-					} else if (cfg.enabled == '1' && cfg.qdisc == 'cake') {
-						rt_ok = !verify_tc_qdisc_active(tc_rb.output, cfg.interface, 'cake');
-					}
+			let check_ifaces = [cfg.interface];
+			if (prev_iface != '' && prev_iface != cfg.interface) push(check_ifaces, prev_iface);
+			let check_idx = 0;
+			let verify_next_tc = null;
+			verify_next_tc = function() {
+				if (check_idx >= length(check_ifaces)) {
+					deps.audit_append(deps.actor, 'sqm_update', cfg.interface, 'rolled_back', detail_msg + '; runtime restored');
+					cb({
+						ok: false,
+						error_code: 'DEPENDENCY',
+						rolled_back: true,
+						rollback_failed: false,
+						freeze_persisted: false,
+						freeze_persist_failed: false,
+						message_ar: reason_msg
+					});
+					return;
 				}
-				let fr = !rt_ok ? deps.enter_emergency_freeze('sqm_update runtime rollback verify failed') : null;
-				deps.audit_append(deps.actor, 'sqm_update', cfg.interface, rt_ok ? 'rolled_back' : 'rollback_failed', rt_ok ? (detail_msg + '; runtime restored') : (detail_msg + '; runtime verify failed'));
-				cb({
-					ok: false,
-					error_code: rt_ok ? 'DEPENDENCY' : 'INTERNAL',
-					rolled_back: rt_ok,
-					rollback_failed: !rt_ok,
-					freeze_persisted: fr ? !!fr.freeze_persisted : false,
-					freeze_persist_failed: fr ? !!fr.freeze_persist_failed : false,
-					message_ar: rt_ok ? reason_msg : 'فشل حرج: تعذر التحقق من استعادة حالة SQM التشغيلية — تم تجميد التعديلات'
+				let tif = check_ifaces[check_idx];
+				check_idx++;
+				deps.show_tc(tif, function(tc_rb) {
+					let rt_ok = !!(tc_rb && tc_rb.ok);
+					if (rt_ok) {
+						if (prev_enabled) {
+							if (tif == prev_iface) rt_ok = verify_tc_qdisc_active(tc_rb.output, prev_iface, prev_qdisc);
+							else rt_ok = !verify_tc_qdisc_active(tc_rb.output, tif, 'cake') && !verify_tc_qdisc_active(tc_rb.output, tif, 'fq_codel');
+						} else {
+							rt_ok = !verify_tc_qdisc_active(tc_rb.output, tif, 'cake') && !verify_tc_qdisc_active(tc_rb.output, tif, 'fq_codel');
+						}
+					}
+					if (!rt_ok) {
+						let fr = deps.enter_emergency_freeze('sqm_update runtime rollback verify failed');
+						deps.audit_append(deps.actor, 'sqm_update', cfg.interface, 'rollback_failed', detail_msg + '; runtime verify failed on ' + tif);
+						cb({
+							ok: false,
+							error_code: 'INTERNAL',
+							rolled_back: false,
+							rollback_failed: true,
+							freeze_persisted: !!fr.freeze_persisted,
+							freeze_persist_failed: !!fr.freeze_persist_failed,
+							message_ar: 'فشل حرج: تعذر التحقق من استعادة حالة SQM التشغيلية — تم تجميد التعديلات'
+						});
+						return;
+					}
+					verify_next_tc();
 				});
-			});
+			};
+			if (prev_enabled) check_ifaces = (prev_iface != cfg.interface) ? [prev_iface, cfg.interface] : [prev_iface];
+			verify_next_tc();
 		});
 	};
 

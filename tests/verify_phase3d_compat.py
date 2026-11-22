@@ -260,7 +260,7 @@ EXPECTED_SUITES = {
     "verify_phase4b_ucode.uc": ("UCODE4B_SUMMARY", 14),
     "verify_phase4c_ucode.uc": ("UCODE4C_SUMMARY", 17),
     "verify_phase4d_ucode.uc": ("UCODE4D_SUMMARY", 16),
-    "verify_phase4e_ucode.uc": ("UCODE4E_SUMMARY", 16),
+    "verify_phase4e_ucode.uc": ("UCODE4E_SUMMARY", 22),
 }
 
 

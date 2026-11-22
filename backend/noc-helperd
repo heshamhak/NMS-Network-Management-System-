@@ -3654,54 +3654,21 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 	}
 
 	if (verb == 'sqm_update') {
-		let lan_ifaces = { 'lo': true, 'br-lan': true, 'tailscale0': true, 'docker0': true };
-		let wan_ifaces = {};
 		let br_entries = fs.lsdir('/sys/class/net/br-lan/brif') || [];
-		for (let e in br_entries) {
-			if (e != '.' && e != '..') lan_ifaces[e] = true;
-		}
-		try {
-			let cur0 = uci.cursor();
-			cur0.foreach('network', 'interface', function(s) {
-				let nm = s['.name'] || '';
-				let dev = s.device || s.ifname || '';
-				if (nm == 'lan' || nm == 'loopback') {
-					if (dev != '') lan_ifaces[dev] = true;
-				} else if (nm != '' && dev != '') {
-					wan_ifaces[dev] = true;
-				}
-			});
-			cur0.foreach('network', 'device', function(s) {
-				if (s.name == 'br-lan' && type(s.ports) == 'array') {
-					for (let pt in s.ports) lan_ifaces[pt] = true;
-				}
-			});
-		} catch (e) {}
+		let cur0 = null;
+		try { cur0 = uci.cursor(); } catch (e) {}
+		let dump = null;
 		try {
 			let uctx = ubus.connect();
 			if (uctx) {
-				let dump = uctx.call('network.interface', 'dump', {});
-				if (dump && type(dump.interface) == 'array') {
-					for (let itf in dump.interface) {
-						let inm = itf['interface'] || '';
-						if (inm == 'lan' || inm == 'loopback') {
-							if (itf.l3_device) lan_ifaces[itf.l3_device] = true;
-							if (itf.device) lan_ifaces[itf.device] = true;
-						} else if (inm != '') {
-							if (itf.l3_device) wan_ifaces[itf.l3_device] = true;
-							if (itf.device) wan_ifaces[itf.device] = true;
-						}
-					}
-				}
+				dump = uctx.call('network.interface', 'dump', {});
 				try { uctx.disconnect(); } catch (e) {}
 			}
 		} catch (e) {}
-		for (let li in keys(lan_ifaces)) delete wan_ifaces[li];
-		let v = nms_sqm.validate_sqm_config(params, {
-			lan_ifaces: lan_ifaces,
-			wan_ifaces: wan_ifaces,
-			iface_exists: function(iface) { return !!fs.stat('/sys/class/net/' + iface); }
+		let topo = nms_sqm.build_sqm_topology(cur0, dump, br_entries, function(iface) {
+			return !!fs.stat('/sys/class/net/' + iface);
 		});
+		let v = nms_sqm.validate_sqm_config(params, topo);
 		if (!v.ok) {
 			release_lock();
 			reply_cb({ ok: false, error_code: v.error_code || 'VALIDATION', status: v.status || 400, message_ar: v.message_ar });

@@ -20,6 +20,70 @@ let topo = {
 	iface_exists: function(iface) { return iface == 'pppoe-wan' || iface == 'wlan0' || iface == 'br-lan'; }
 };
 
+// 17. Production build_sqm_topology: accepts verified PPPoE & wireless WAN, rejects guest/vpn/mgmt/LAN/bridge-members
+function make_topo_uci(ifaces, zones, devs) {
+	return {
+		foreach: function(cfg, stype, fn) {
+			if (cfg == 'network' && stype == 'interface') { for (let s in ifaces) fn(s); }
+			else if (cfg == 'firewall' && stype == 'zone') { for (let z in zones) fn(z); }
+			else if (cfg == 'network' && stype == 'device') { for (let d in devs) fn(d); }
+		}
+	};
+}
+let t_uci = make_topo_uci(
+	[
+		{ '.name': 'loopback', device: 'lo', proto: 'none' },
+		{ '.name': 'lan', device: 'br-lan', proto: 'static' },
+		{ '.name': 'wan', device: 'eth0', proto: 'pppoe' },
+		{ '.name': 'wwan', device: 'wlan0', proto: 'dhcp' },
+		{ '.name': 'guest', device: 'eth2', proto: 'static' },
+		{ '.name': 'vpn', device: 'wg0', proto: 'wireguard' },
+		{ '.name': 'mgmt', device: 'eth3', proto: 'static' }
+	],
+	[
+		{ name: 'lan', network: ['lan'] },
+		{ name: 'wan', network: ['wan', 'wwan'] },
+		{ name: 'guest', network: ['guest'] },
+		{ name: 'vpn', network: ['vpn'] },
+		{ name: 'mgmt', network: ['mgmt'] }
+	],
+	[{ name: 'br-lan', ports: ['eth1'] }]
+);
+let t_ubus = {
+	interface: [
+		{ 'interface': 'lan', up: true, l3_device: 'br-lan', device: 'br-lan' },
+		{ 'interface': 'wan', up: true, l3_device: 'pppoe-wan', device: 'eth0' },
+		{ 'interface': 'wwan', up: true, l3_device: 'wlan0', device: 'wlan0' },
+		{ 'interface': 'guest', up: true, l3_device: 'eth2', device: 'eth2' },
+		{ 'interface': 'vpn', up: true, l3_device: 'wg0', device: 'wg0' },
+		{ 'interface': 'mgmt', up: true, l3_device: 'eth3', device: 'eth3' }
+	]
+};
+let real_topo = nms_sqm.build_sqm_topology(t_uci, t_ubus, ['.', '..', 'eth1', 'eth4'], function() { return true; });
+check(
+	nms_sqm.validate_sqm_config({ enabled: true, interface: 'pppoe-wan', download_kbps: 4000, upload_kbps: 2000 }, real_topo).ok === true &&
+	nms_sqm.validate_sqm_config({ enabled: true, interface: 'wlan0', download_kbps: 4000, upload_kbps: 2000 }, real_topo).ok === true &&
+	nms_sqm.validate_sqm_config({ enabled: true, interface: 'eth2', download_kbps: 4000, upload_kbps: 2000 }, real_topo).ok === false &&
+	nms_sqm.validate_sqm_config({ enabled: true, interface: 'wg0', download_kbps: 4000, upload_kbps: 2000 }, real_topo).ok === false &&
+	nms_sqm.validate_sqm_config({ enabled: true, interface: 'eth3', download_kbps: 4000, upload_kbps: 2000 }, real_topo).ok === false &&
+	nms_sqm.validate_sqm_config({ enabled: true, interface: 'br-lan', download_kbps: 4000, upload_kbps: 2000 }, real_topo).ok === false &&
+	nms_sqm.validate_sqm_config({ enabled: true, interface: 'eth1', download_kbps: 4000, upload_kbps: 2000 }, real_topo).ok === false &&
+	nms_sqm.validate_sqm_config({ enabled: true, interface: 'eth4', download_kbps: 4000, upload_kbps: 2000 }, real_topo).ok === false,
+	'P4E-TOPO[real_builder_accepts_wan_rejects_guest_vpn_mgmt_lan]'
+);
+
+// 18. Production build_sqm_topology: missing ubus fails closed & conflicting UCI/runtime rejected
+let topo_noubus = nms_sqm.build_sqm_topology(t_uci, null, ['eth1'], function() { return true; });
+let ubus_conflict = { interface: [{ 'interface': 'wwan', up: true, l3_device: 'eth9', device: 'eth9' }] };
+let topo_conflict = nms_sqm.build_sqm_topology(t_uci, ubus_conflict, ['eth1'], function() { return true; });
+check(
+	!nms_sqm.validate_sqm_config({ enabled: true, interface: 'pppoe-wan', download_kbps: 4000, upload_kbps: 2000 }, topo_noubus).ok &&
+	!nms_sqm.validate_sqm_config({ enabled: true, interface: 'wlan0', download_kbps: 4000, upload_kbps: 2000 }, topo_noubus).ok &&
+	!nms_sqm.validate_sqm_config({ enabled: true, interface: 'eth9', download_kbps: 4000, upload_kbps: 2000 }, topo_conflict).ok &&
+	!nms_sqm.validate_sqm_config({ enabled: true, interface: 'wlan0', download_kbps: 4000, upload_kbps: 2000 }, topo_conflict).ok,
+	'P4E-TOPO[missing_ubus_and_conflict_fail_closed]'
+);
+
 // 1. Strict Boolean validation across all 4 Boolean fields (enabled, debug_logging, squash_dscp, squash_ingress)
 let b_fields = ['enabled', 'debug_logging', 'squash_dscp', 'squash_ingress'];
 let bad_bool_vals = ['false', '0', 'true', '1', 0, 1, [], {}];
@@ -200,14 +264,14 @@ nms_sqm.apply_sqm_tx(v_ok, {
 }, function(r) { res4 = r; });
 check(!res4.ok && res4.rolled_back === true && res4.rollback_failed === false && rc4 == 2 && u4.db.eth1.interface == 'pppoe-wan', 'P4E-RB[prev_enabled_runtime_restored_ok]');
 
-// 11. Previously disabled SQM: reload fail -> UCI restored + reload + tc shows unrelated qdisc (noqueue/fq_codel, no cake) -> rolled_back=true
+// 11. Previously disabled SQM: reload fail -> UCI restored + reload + tc shows unrelated qdisc (pfifo_fast, no cake/fq_codel) -> rolled_back=true
 let u5 = make_mock_sqm(orig_disabled);
 let rc5 = 0;
 let res5 = null;
 nms_sqm.apply_sqm_tx(v_ok, {
 	uci_cursor: u5.cursor,
 	reload_sqm: function(cb) { rc5++; cb({ ok: rc5 > 1 }); },
-	show_tc: function(iface, cb) { cb({ ok: true, output: 'qdisc fq_codel 0: dev wlan0 root refcnt 2\n' }); },
+	show_tc: function(iface, cb) { cb({ ok: true, output: 'qdisc pfifo_fast 0: dev ' + iface + ' root refcnt 2\n' }); },
 	enter_emergency_freeze: function(w) { return { freeze_persisted: true }; },
 	audit_append: function() {},
 	actor: 'admin'
@@ -286,6 +350,67 @@ nms_sqm.apply_sqm_tx(v_ok, {
 	actor: 'admin'
 }, function(r) { res10 = r; });
 check(!res10.ok && res10.rolled_back === false && res10.rollback_failed === true && res10.freeze_persisted === true && length(freezes10) == 1, 'P4E-RB[uci_restore_fail_freezes]');
+
+// 19. Previous disabled + new cake + cake remains after rollback reload -> rollback_failed=true + freeze
+let u11 = make_mock_sqm(orig_disabled);
+let rc11 = 0;
+let fr11 = [];
+let res11 = null;
+nms_sqm.apply_sqm_tx(v_ok, {
+	uci_cursor: u11.cursor,
+	reload_sqm: function(cb) { rc11++; cb({ ok: rc11 > 1 }); },
+	show_tc: function(iface, cb) { cb({ ok: true, output: 'qdisc cake 8001: dev ' + iface + ' root refcnt 2\n' }); },
+	enter_emergency_freeze: function(w) { push(fr11, w); return { freeze_persisted: true, freeze_persist_failed: false }; },
+	audit_append: function() {},
+	actor: 'admin'
+}, function(r) { res11 = r; });
+check(!res11.ok && res11.rolled_back === false && res11.rollback_failed === true && length(fr11) == 1, 'P4E-RB[prev_disabled_cake_remains_freezes]');
+
+// 20. Previous disabled + new fq_codel + fq_codel remains after rollback reload -> rollback_failed=true + freeze
+let v_fq = nms_sqm.validate_sqm_config({ enabled: true, interface: 'wlan0', download_kbps: 4000, upload_kbps: 2000, qdisc: 'fq_codel', script: 'simple.qos' }, topo);
+let u12 = make_mock_sqm(orig_disabled);
+let rc12 = 0;
+let fr12 = [];
+let res12 = null;
+nms_sqm.apply_sqm_tx(v_fq, {
+	uci_cursor: u12.cursor,
+	reload_sqm: function(cb) { rc12++; cb({ ok: rc12 > 1 }); },
+	show_tc: function(iface, cb) { cb({ ok: true, output: 'qdisc fq_codel 0: dev ' + iface + ' root refcnt 2\n' }); },
+	enter_emergency_freeze: function(w) { push(fr12, w); return { freeze_persisted: true, freeze_persist_failed: false }; },
+	audit_append: function() {},
+	actor: 'admin'
+}, function(r) { res12 = r; });
+check(!res12.ok && res12.rolled_back === false && res12.rollback_failed === true && length(fr12) == 1, 'P4E-RB[prev_disabled_fq_codel_remains_freezes]');
+
+// 21. Previous disabled (pppoe-wan) + interface changed (wlan0) + unrelated noqueue on both -> rolled_back=true
+let u13 = make_mock_sqm(orig_disabled);
+let rc13 = 0;
+let checked_ifs13 = [];
+let res13 = null;
+nms_sqm.apply_sqm_tx(v_ok, {
+	uci_cursor: u13.cursor,
+	reload_sqm: function(cb) { rc13++; cb({ ok: rc13 > 1 }); },
+	show_tc: function(iface, cb) { push(checked_ifs13, iface); cb({ ok: true, output: 'qdisc noqueue 0: dev ' + iface + ' root refcnt 2\n' }); },
+	enter_emergency_freeze: function(w) { return { freeze_persisted: true }; },
+	audit_append: function() {},
+	actor: 'admin'
+}, function(r) { res13 = r; });
+check(!res13.ok && res13.rolled_back === true && res13.rollback_failed === false && length(checked_ifs13) == 2, 'P4E-RB[prev_disabled_iface_changed_noqueue_ok]');
+
+// 22. Previous disabled + runtime query failure on interface -> rollback_failed=true + freeze
+let u14 = make_mock_sqm(orig_disabled);
+let rc14 = 0;
+let fr14 = [];
+let res14 = null;
+nms_sqm.apply_sqm_tx(v_ok, {
+	uci_cursor: u14.cursor,
+	reload_sqm: function(cb) { rc14++; cb({ ok: rc14 > 1 }); },
+	show_tc: function(iface, cb) { cb({ ok: false, output: '' }); },
+	enter_emergency_freeze: function(w) { push(fr14, w); return { freeze_persisted: true, freeze_persist_failed: false }; },
+	audit_append: function() {},
+	actor: 'admin'
+}, function(r) { res14 = r; });
+check(!res14.ok && res14.rolled_back === false && res14.rollback_failed === true && length(fr14) == 1, 'P4E-RB[prev_disabled_tc_query_fail_freezes]');
 
 printf('UCODE4E_SUMMARY: %d passed, %d failed\n', passed, failed);
 exit(failed == 0 ? 0 : 1);
