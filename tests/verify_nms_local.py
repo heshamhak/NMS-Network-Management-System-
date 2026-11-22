@@ -2253,6 +2253,69 @@ if os.path.isdir(rfs_auth):
 else:
     fail(f"LIVE-PROC-VALIDATION: required OpenWrt rootfs missing at {rfs_auth}")
 
+# 8d. Hostname Lifecycle: re-running enable-root-redirect.sh updates data-nms-sys-hostname and preserves LuCI backups
+print("\n=== 8d. Hostname Lifecycle ===")
+if os.path.isdir(rfs_auth):
+    with tempfile.TemporaryDirectory(prefix="nms_hn_bak_") as td_bak:
+        sys_cfg_p = os.path.join(rfs_auth, "etc", "config", "system")
+        had_sys = os.path.exists(sys_cfg_p)
+        if had_sys:
+            shutil.copy2(sys_cfg_p, os.path.join(td_bak, "system"))
+        www_p = os.path.join(rfs_auth, "www")
+        had_www = os.path.isdir(www_p)
+        if had_www:
+            shutil.copytree(www_p, os.path.join(td_bak, "www"), symlinks=True)
+        noc_cfg_p = os.path.join(rfs_auth, "etc", "noc-console")
+        had_noc_cfg = os.path.isdir(noc_cfg_p)
+        if had_noc_cfg:
+            shutil.copytree(noc_cfg_p, os.path.join(td_bak, "noc-console"), symlinks=True)
+            shutil.rmtree(noc_cfg_p, ignore_errors=True)
+        hn_src_dir = os.path.join(rfs_auth, "tmp", "nms_hn_src")
+        os.makedirs(os.path.join(hn_src_dir, "scripts"), exist_ok=True)
+        shutil.copytree(os.path.join(ROOT, "frontend"), os.path.join(hn_src_dir, "frontend"), dirs_exist_ok=True)
+        en_dst_p = os.path.join(hn_src_dir, "scripts", "enable-root-redirect.sh")
+        shutil.copy2(os.path.join(ROOT, "scripts", "enable-root-redirect.sh"), en_dst_p)
+        shutil.copy2(os.path.join(ROOT, "scripts", "luci_redirect_cgi.uc"), os.path.join(hn_src_dir, "scripts", "luci_redirect_cgi.uc"))
+        try:
+            os.makedirs(os.path.join(www_p, "cgi-bin"), exist_ok=True)
+            os.makedirs(os.path.join(www_p, "pro"), exist_ok=True)
+            os.makedirs(os.path.join(rfs_auth, "etc", "noc-console"), exist_ok=True)
+            orig_luci = open(os.path.join(www_p, "cgi-bin", "luci"), "rb").read()
+            orig_idx = open(os.path.join(www_p, "index.html"), "rb").read()
+            open(sys_cfg_p, "w").write("config system\n\toption hostname 'alpha-gw'\n")
+            cmd_hn = ["sudo", "-n", "chroot", rfs_auth, "/bin/sh", "-c", "NOC_SKIP_SERVICE_RESTART=1 sh /tmp/nms_hn_src/scripts/enable-root-redirect.sh"]
+            r1 = subprocess.run(cmd_hn, capture_output=True, text=True, timeout=15)
+            idx1 = open(os.path.join(www_p, "index.html"), "r", encoding="utf-8").read()
+            open(sys_cfg_p, "w").write("config system\n\toption hostname 'beta-gw'\n")
+            r2 = subprocess.run(cmd_hn, capture_output=True, text=True, timeout=15)
+            r3 = subprocess.run(cmd_hn, capture_output=True, text=True, timeout=15)
+            idx3 = open(os.path.join(www_p, "index.html"), "r", encoding="utf-8").read()
+            bak_luci = open(os.path.join(www_p, "cgi-bin", "luci.orig.bak"), "rb").read() if os.path.exists(os.path.join(www_p, "cgi-bin", "luci.orig.bak")) else b""
+            bak_idx = open(os.path.join(www_p, "index.luci.bak.html"), "rb").read() if os.path.exists(os.path.join(www_p, "index.luci.bak.html")) else b""
+            if (
+                r1.returncode == 0 and r2.returncode == 0 and r3.returncode == 0
+                and 'data-nms-sys-hostname="alpha-gw"' in idx1
+                and 'data-nms-sys-hostname="beta-gw"' in idx3
+                and bak_luci == orig_luci and bak_idx == orig_idx
+            ):
+                ok("HOSTNAME-LIFECYCLE: enable-root-redirect.sh updates data-nms-sys-hostname idempotently and preserves original LuCI backups")
+            else:
+                fail(f"HOSTNAME-LIFECYCLE: r1={r1.returncode} r2={r2.returncode} r3={r3.returncode} bak_ok={bak_luci == orig_luci and bak_idx == orig_idx} err={r1.stderr.strip()}")
+        finally:
+            shutil.rmtree(hn_src_dir, ignore_errors=True)
+            subprocess.run(["sudo", "-n", "rm", "-rf", www_p], capture_output=True)
+            if had_www:
+                shutil.copytree(os.path.join(td_bak, "www"), www_p, symlinks=True)
+            subprocess.run(["sudo", "-n", "rm", "-rf", noc_cfg_p], capture_output=True)
+            if had_noc_cfg:
+                shutil.copytree(os.path.join(td_bak, "noc-console"), noc_cfg_p, symlinks=True)
+            if had_sys:
+                shutil.copy2(os.path.join(td_bak, "system"), sys_cfg_p)
+            elif os.path.exists(sys_cfg_p):
+                os.unlink(sys_cfg_p)
+else:
+    fail(f"HOSTNAME-LIFECYCLE: required OpenWrt rootfs missing at {rfs_auth}")
+
 # 9. Option A Root-Interface (/) Redirect & Atomic LuCI Restore Verification (Sections A, B, C, D)
 print("\n=== 8. Root-Interface (/) Redirect & Atomic LuCI Restore (Option A) ===")
 launcher_html_p = os.path.join(ROOT, "frontend", "launcher_index.html")
