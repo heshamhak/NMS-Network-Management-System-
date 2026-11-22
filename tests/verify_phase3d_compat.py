@@ -521,6 +521,61 @@ def test_in_chroot_lifecycle(rootfs_dir, ver_label):
         verify_sysupgrade_preservation(sb, sysupgrade_orig, su_orig_st.st_uid, su_orig_st.st_gid, f"P3D-CHROOT-SYSUPGRADE[{ver_label},preserved_after_uninstall]")
 
 
+def test_apk_provenance_verification():
+    import hashlib
+    key_path = os.path.join(ROOTFS_2512, "etc", "apk", "keys", "openwrt-25.12.pem")
+    check(os.path.isfile(key_path), "P3D-PROVENANCE[openwrt_25_12_signing_key_present]")
+    cache_dir = "/tmp/openwrt-pkg-cache/25.12.6"
+    expected_hashes = {
+        "packages.adb": "c13c23b1e8d8a602a090de3f05b7c539f3755bf4fde6ccdd75a26e47a729285e",
+        "ucode-mod-digest-2026.07.09~b885dd0f-r3.apk": "82ef7e42c7981316f5b4194d1aa5cf7aeb1f5b36898f048b26d7d1a4537f0750",
+        "ucode-mod-socket-2026.07.09~b885dd0f-r3.apk": "f34de956b2af4320ae1a6152c968a1d9dc25409976f8b1cc0e33506b8d2ee81a",
+        "ucode-mod-struct-2026.07.09~b885dd0f-r3.apk": "d0dbcdfec18899b77f3920fdd1bad2101d395dd2deed0400bae8331193afaf59",
+    }
+    if not all(os.path.isfile(os.path.join(cache_dir, fn)) for fn in expected_hashes):
+        check(False, "P3D-PROVENANCE[official_apk_cache_present]", f"missing files in {cache_dir}")
+        return
+    for fn, exp_sha in expected_hashes.items():
+        got_sha = hashlib.sha256(open(os.path.join(cache_dir, fn), "rb").read()).hexdigest()
+        check(got_sha == exp_sha, f"P3D-PROVENANCE[sha256,{fn}]", f"got={got_sha}")
+
+    with tempfile.TemporaryDirectory(prefix="nms_p3d_prov_") as tmp:
+        sb = os.path.join(tmp, "rootfs")
+        shutil.copytree(ROOTFS_2512, sb, symlinks=True)
+        repo_in = os.path.join(sb, "tmp", "apk_repo")
+        os.makedirs(repo_in, exist_ok=True)
+        for fn in expected_hashes:
+            shutil.copy2(os.path.join(cache_dir, fn), os.path.join(repo_in, fn))
+        r_ver = subprocess.run(
+            ["unshare", "-r", "/usr/sbin/chroot", sb, "/usr/bin/apk", "verify", "/tmp/apk_repo/packages.adb"],
+            capture_output=True, text=True, timeout=15
+        )
+        check(r_ver.returncode == 0 and "packages.adb: OK" in r_ver.stdout, "P3D-PROVENANCE[apk_verify_signed_packages_adb]", (r_ver.stderr or r_ver.stdout)[-200:])
+
+        # Negative test: tampered packages.adb MUST fail apk verify
+        adb_p = os.path.join(repo_in, "packages.adb")
+        adb_raw = bytearray(open(adb_p, "rb").read())
+        adb_raw[-10] ^= 0xFF
+        open(adb_p, "wb").write(adb_raw)
+        r_tamper = subprocess.run(
+            ["unshare", "-r", "/usr/sbin/chroot", sb, "/usr/bin/apk", "verify", "/tmp/apk_repo/packages.adb"],
+            capture_output=True, text=True, timeout=15
+        )
+        check(r_tamper.returncode != 0, "P3D-PROVENANCE[tampered_packages_adb_rejected]")
+
+    r_inst_list = subprocess.run(
+        ["unshare", "-r", "/usr/sbin/chroot", ROOTFS_2512, "/bin/sh", "-c", "/usr/bin/apk list --installed ucode*"],
+        capture_output=True, text=True, timeout=15
+    )
+    inst_ok = (
+        r_inst_list.returncode == 0
+        and "ucode-mod-digest-2026.07.09~b885dd0f-r3 x86_64" in r_inst_list.stdout
+        and "ucode-mod-socket-2026.07.09~b885dd0f-r3 x86_64" in r_inst_list.stdout
+        and "ucode-mod-struct-2026.07.09~b885dd0f-r3 x86_64" in r_inst_list.stdout
+    )
+    check(inst_ok, "P3D-PROVENANCE[installed_apk_versions_and_arch_verified]")
+
+
 def test_architecture_portability():
     elf_hits = []
     for sub in ("backend", "frontend", "init.d", "scripts", "schemas"):
@@ -745,6 +800,7 @@ def main():
 
     test_sandboxed_lifecycle_with_rollback()
     test_harness_integrity(prod_slice)
+    test_apk_provenance_verification()
     test_architecture_portability()
     print(f"\n=== PHASE 3D SUMMARY: {passed} passed, {failed} failed, {skipped} skipped ===")
     sys.exit(0 if failed == 0 else 1)
