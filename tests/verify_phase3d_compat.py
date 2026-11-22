@@ -270,9 +270,36 @@ def evaluate_ucode_suite_output(script_name, returncode, stdout):
     return True, f"{got_passed} passed, {got_failed} failed (expected {exp_passed})"
 
 
-def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_src):
+def restore_preexisting_entry(dst_lib, entry_info, chown_fn=os.chown, lchown_fn=os.lchown):
+    kind, data, mode, uid, gid = entry_info
+    if os.path.lexists(dst_lib):
+        os.unlink(dst_lib)
+    if kind == "symlink":
+        os.symlink(data, dst_lib)
+        cur_st = os.lstat(dst_lib)
+        if cur_st.st_uid != uid or cur_st.st_gid != gid:
+            lchown_fn(dst_lib, uid, gid)
+        ver_st = os.lstat(dst_lib)
+        if not stat.S_ISLNK(ver_st.st_mode) or os.readlink(dst_lib) != data or ver_st.st_uid != uid or ver_st.st_gid != gid:
+            raise RuntimeError(f"Failed to verify restored symlink {dst_lib}")
+    elif kind == "reg":
+        with open(dst_lib, "wb") as bf:
+            bf.write(data)
+        os.chmod(dst_lib, mode)
+        cur_st = os.lstat(dst_lib)
+        if cur_st.st_uid != uid or cur_st.st_gid != gid:
+            chown_fn(dst_lib, uid, gid)
+        ver_st = os.lstat(dst_lib)
+        if (not stat.S_ISREG(ver_st.st_mode) or (ver_st.st_mode & 0o777) != mode
+                or ver_st.st_uid != uid or ver_st.st_gid != gid or open(dst_lib, "rb").read() != data):
+            raise RuntimeError(f"Failed to verify restored regular file {dst_lib}")
+    else:
+        raise RuntimeError(f"Unsupported entry kind {kind}")
+
+
+def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_src, run_fn=subprocess.run, chown_fn=os.chown, lchown_fn=os.lchown, raise_on_restore_err=False):
     if not os.path.isdir(rootfs_dir) or not os.path.isfile(os.path.join(rootfs_dir, "usr/bin/ucode")):
-        skip(f"P3D-CHROOT[{ver_label},{script_name}]", f"rootfs missing at {rootfs_dir}")
+        check(False, f"P3D-CHROOT[{ver_label},{script_name}]", f"required OpenWrt rootfs or ucode missing at {rootfs_dir}")
         return
     p3a_dir = os.path.join(rootfs_dir, "tmp", "p3a_test")
     if os.path.exists(p3a_dir):
@@ -289,7 +316,14 @@ def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_s
             dst_lib = os.path.join(libexec_dir, mod)
             if os.path.lexists(dst_lib):
                 st = os.lstat(dst_lib)
-                preexisting_backups.append((dst_lib, open(dst_lib, "rb").read(), st.st_mode & 0o777, st.st_uid, st.st_gid))
+                if stat.S_ISLNK(st.st_mode):
+                    preexisting_backups.append((dst_lib, ("symlink", os.readlink(dst_lib), None, st.st_uid, st.st_gid)))
+                    # Unlink symlink BEFORE copying so we NEVER overwrite the symlink target
+                    os.unlink(dst_lib)
+                elif stat.S_ISREG(st.st_mode):
+                    preexisting_backups.append((dst_lib, ("reg", open(dst_lib, "rb").read(), st.st_mode & 0o777, st.st_uid, st.st_gid)))
+                else:
+                    raise RuntimeError(f"Unsupported pre-existing entry type at {dst_lib}: mode={oct(st.st_mode)}")
             else:
                 created_libexec.append(dst_lib)
             shutil.copy2(src_mod, dst_lib)
@@ -306,7 +340,7 @@ def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_s
         else:
             args = ["/tmp/p3a_test/vec"]
 
-        res = subprocess.run(
+        res = run_fn(
             ["unshare", "-r", "/usr/sbin/chroot", rootfs_dir, "/usr/bin/ucode", f"/tmp/p3a_test/{script_name}"] + args,
             capture_output=True, text=True, timeout=30
         )
@@ -317,14 +351,13 @@ def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_s
         for p in created_libexec:
             if os.path.lexists(p):
                 os.unlink(p)
-        for dst_lib, raw_bytes, mode, uid, gid in preexisting_backups:
-            with open(dst_lib, "wb") as bf:
-                bf.write(raw_bytes)
-            os.chmod(dst_lib, mode)
+        for dst_lib, entry_info in preexisting_backups:
             try:
-                os.chown(dst_lib, uid, gid)
-            except PermissionError:
-                pass
+                restore_preexisting_entry(dst_lib, entry_info, chown_fn=chown_fn, lchown_fn=lchown_fn)
+            except Exception as exc:
+                if raise_on_restore_err:
+                    raise
+                check(False, f"P3D-RESTORE[{ver_label},{os.path.basename(dst_lib)}]", str(exc))
 
 
 def verify_sysupgrade_preservation(sb, expected_bytes, orig_uid, orig_gid, label):
@@ -345,8 +378,8 @@ def verify_sysupgrade_preservation(sb, expected_bytes, orig_uid, orig_gid, label
 
 
 def test_in_chroot_lifecycle(rootfs_dir, ver_label):
-    if not os.path.isdir(rootfs_dir) or not os.path.isfile(os.path.join(rootfs_dir, "bin/sh")):
-        skip(f"P3D-LIFECYCLE[{ver_label}]", f"rootfs missing at {rootfs_dir}")
+    if not os.path.isdir(rootfs_dir) or not os.path.isfile(os.path.join(rootfs_dir, "bin/sh")) or not os.path.isfile(os.path.join(rootfs_dir, "usr/bin/ucode")):
+        check(False, f"P3D-LIFECYCLE[{ver_label}]", f"required OpenWrt rootfs, /bin/sh, or /usr/bin/ucode missing at {rootfs_dir}")
         return
     with tempfile.TemporaryDirectory(prefix=f"nms_p3d_chroot_{ver_label}_") as tmp:
         sb = os.path.join(tmp, "rootfs")
@@ -400,6 +433,10 @@ def test_in_chroot_lifecycle(rootfs_dir, ver_label):
             capture_output=True, text=True, timeout=10
         )
         if probe.returncode != 0:
+            probe_err = (probe.stderr or "") + (probe.stdout or "")
+            if "Unable to resolve path for module" not in probe_err and "Unable to load module" not in probe_err:
+                check(False, f"P3D-CHROOT-PREREQ[{ver_label},ucode_probe_failed]", probe_err[:200])
+                return
             # Verify install.sh fails closed without attempting package install, and preserves LuCI + /etc/sysupgrade.conf
             r_fail_pre = run_in_openwrt(["/tmp/nms_repo/scripts/install.sh", "--allow-insecure-lan-http"])
             pre_fail_ok = (
@@ -584,30 +621,76 @@ def test_harness_integrity(prod_slice):
         ok, _ = evaluate_ucode_suite_output("verify_phase3a_ucode.uc", rc, out)
         check(not ok, f"P3D-HARNESS-NEG[{lbl}_rejected]")
 
-    # 2. Pre-existing staged /usr/libexec file preservation & restoration
-    if os.path.isdir(ROOTFS_2512):
+    # 2. Adversarial staging preservation & cleanup checks (regular file, symlink->target, broken symlink, chown failure, timeout cleanup)
+    if not os.path.isdir(ROOTFS_2512):
+        check(False, "P3D-HARNESS[rootfs_2512_required_for_staging_tests]")
+    else:
         with tempfile.TemporaryDirectory(prefix="nms_p3d_preexist_") as tmp:
             sb = os.path.join(tmp, "rootfs")
             shutil.copytree(ROOTFS_2512, sb, symlinks=True)
-            os.makedirs(os.path.join(sb, "usr", "libexec"), exist_ok=True)
-            for fn in ("nms_network.uc", "nms_fw_wifi.uc"):
-                lp = os.path.join(sb, "usr", "libexec", fn)
+            libexec = os.path.join(sb, "usr", "libexec")
+            os.makedirs(libexec, exist_ok=True)
+            for fn in ("nms_archive.uc", "nms_network.uc", "nms_fw_wifi.uc"):
+                lp = os.path.join(libexec, fn)
                 if os.path.lexists(lp):
                     os.unlink(lp)
-            sentinel_path = os.path.join(sb, "usr", "libexec", "nms_archive.uc")
-            sentinel_bytes = b"// PRE-EXISTING CUSTOM MODULE\n"
-            with open(sentinel_path, "wb") as f:
+            sentinel_reg = os.path.join(libexec, "nms_archive.uc")
+            sentinel_bytes = b"// PRE-EXISTING REGULAR MODULE\n"
+            with open(sentinel_reg, "wb") as f:
                 f.write(sentinel_bytes)
-            os.chmod(sentinel_path, 0o640)
-            run_ucode_suite_in_chroot(sb, "preexist-check", "verify_phase3b_ucode.uc", prod_slice)
-            restored_ok = (
-                os.path.isfile(sentinel_path)
-                and open(sentinel_path, "rb").read() == sentinel_bytes
-                and (os.lstat(sentinel_path).st_mode & 0o777) == 0o640
-                and not os.path.lexists(os.path.join(sb, "usr", "libexec", "nms_network.uc"))
-                and not os.path.lexists(os.path.join(sb, "usr", "libexec", "nms_fw_wifi.uc"))
+            os.chmod(sentinel_reg, 0o640)
+
+            sym_target = os.path.join(tmp, "precious_target.uc")
+            sym_target_bytes = b"// DO NOT OVERWRITE SYMLINK TARGET\n"
+            with open(sym_target, "wb") as f:
+                f.write(sym_target_bytes)
+            sym_link = os.path.join(libexec, "nms_network.uc")
+            os.symlink(sym_target, sym_link)
+
+            broken_link = os.path.join(libexec, "nms_fw_wifi.uc")
+            os.symlink("/nonexistent/dangling/module.uc", broken_link)
+
+            run_ucode_suite_in_chroot(sb, "preexist-adv", "verify_phase3b_ucode.uc", prod_slice)
+            adv_ok = (
+                stat.S_ISREG(os.lstat(sentinel_reg).st_mode)
+                and open(sentinel_reg, "rb").read() == sentinel_bytes
+                and (os.lstat(sentinel_reg).st_mode & 0o777) == 0o640
+                and stat.S_ISLNK(os.lstat(sym_link).st_mode)
+                and os.readlink(sym_link) == sym_target
+                and open(sym_target, "rb").read() == sym_target_bytes
+                and stat.S_ISLNK(os.lstat(broken_link).st_mode)
+                and os.readlink(broken_link) == "/nonexistent/dangling/module.uc"
             )
-            check(restored_ok, "P3D-HARNESS[preserves_and_restores_preexisting_libexec_file]")
+            check(adv_ok, "P3D-HARNESS[preserves_reg_symlink_target_and_broken_symlink]")
+
+            # Timeout cleanup check
+            def timeout_runner(*a, **kw):
+                raise subprocess.TimeoutExpired(cmd="ucode", timeout=30)
+            timed_out = False
+            try:
+                run_ucode_suite_in_chroot(sb, "timeout-chk", "verify_phase3b_ucode.uc", prod_slice, run_fn=timeout_runner)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            check(
+                timed_out
+                and not os.path.exists(os.path.join(sb, "tmp", "p3a_test"))
+                and open(sym_target, "rb").read() == sym_target_bytes
+                and stat.S_ISLNK(os.lstat(broken_link).st_mode),
+                "P3D-HARNESS[cleanup_and_restore_after_subprocess_timeout]"
+            )
+
+            # Ownership restoration failure check (must NOT silently ignore PermissionError)
+            st_reg = os.lstat(sentinel_reg)
+            chown_failed = False
+            try:
+                restore_preexisting_entry(
+                    sentinel_reg,
+                    ("reg", sentinel_bytes, 0o640, st_reg.st_uid + 1, st_reg.st_gid),
+                    chown_fn=lambda p, u, g: (_ for _ in ()).throw(PermissionError("EPERM simulated"))
+                )
+            except PermissionError:
+                chown_failed = True
+            check(chown_failed, "P3D-HARNESS[ownership_restore_failure_is_not_ignored]")
 
         # 3. Missing ucode module MUST fail cleanly when NMS_SKIP_PKG_INSTALL=1 (no apk/opkg attempted)
         with tempfile.TemporaryDirectory(prefix="nms_p3d_prereq_") as tmp:
