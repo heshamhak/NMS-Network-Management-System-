@@ -642,16 +642,18 @@ def test_apk_provenance_verification():
     key_path = os.path.join(ROOTFS_2512, "etc", "apk", "keys", "openwrt-25.12.pem")
     check(os.path.isfile(key_path), "P3D-PROVENANCE[openwrt_25_12_signing_key_present]")
     cache_dir = "/tmp/openwrt-pkg-cache/25.12.6"
-    expected_hashes = {
-        "packages.adb": "c13c23b1e8d8a602a090de3f05b7c539f3755bf4fde6ccdd75a26e47a729285e",
+    expected_pkg_hashes = {
         "ucode-mod-digest-2026.07.09~b885dd0f-r3.apk": "82ef7e42c7981316f5b4194d1aa5cf7aeb1f5b36898f048b26d7d1a4537f0750",
         "ucode-mod-socket-2026.07.09~b885dd0f-r3.apk": "f34de956b2af4320ae1a6152c968a1d9dc25409976f8b1cc0e33506b8d2ee81a",
         "ucode-mod-struct-2026.07.09~b885dd0f-r3.apk": "d0dbcdfec18899b77f3920fdd1bad2101d395dd2deed0400bae8331193afaf59",
     }
-    if not all(os.path.isfile(os.path.join(cache_dir, fn)) for fn in expected_hashes):
+    required_files = ["packages.adb"] + list(expected_pkg_hashes.keys())
+    if not all(os.path.isfile(os.path.join(cache_dir, fn)) for fn in required_files):
         check(False, "P3D-PROVENANCE[official_apk_cache_present]", f"missing files in {cache_dir}")
         return
-    for fn, exp_sha in expected_hashes.items():
+    adb_size = os.path.getsize(os.path.join(cache_dir, "packages.adb"))
+    check(adb_size > 0, "P3D-PROVENANCE[packages_adb_present_for_sig_verify]", f"size={adb_size}")
+    for fn, exp_sha in expected_pkg_hashes.items():
         got_sha = hashlib.sha256(open(os.path.join(cache_dir, fn), "rb").read()).hexdigest()
         check(got_sha == exp_sha, f"P3D-PROVENANCE[sha256,{fn}]", f"got={got_sha}")
 
@@ -661,7 +663,7 @@ def test_apk_provenance_verification():
         repo_in = os.path.join(sb, "tmp", "apk_repo")
         repo_arch = os.path.join(repo_in, "x86_64")
         os.makedirs(repo_arch, exist_ok=True)
-        for fn in expected_hashes:
+        for fn in required_files:
             shutil.copy2(os.path.join(cache_dir, fn), os.path.join(repo_in, fn))
             shutil.copy2(os.path.join(cache_dir, fn), os.path.join(repo_arch, fn))
         r_ver = subprocess.run(
