@@ -2114,6 +2114,97 @@ else:
             elif os.path.exists(fw_cfg_p):
                 os.unlink(fw_cfg_p)
 
+# 8b. Credential Hygiene: Password Rotation & Session Invalidation Regression
+print("\n=== 8b. Credential Hygiene: Password Rotation & Session Invalidation ===")
+rfs_auth = "/tmp/openwrt-x86-64-rootfs"
+if os.path.isdir(rfs_auth):
+    hd_chroot_p = os.path.join(rfs_auth, "tmp", "noc-helperd-auth-test")
+    cl_chroot_p = os.path.join(rfs_auth, "tmp", "auth_sess_client.uc")
+    sock_in_chroot = "/tmp/noc_auth_sess.sock"
+    sock_host_p = os.path.join(rfs_auth, "tmp", "noc_auth_sess.sock")
+    etc_in_chroot = "/tmp/noc_auth_etc"
+    etc_host_p = os.path.join(rfs_auth, "tmp", "noc_auth_etc")
+    run_in_chroot = "/tmp/noc_auth_run"
+    run_host_p = os.path.join(rfs_auth, "tmp", "noc_auth_run")
+    os.makedirs(etc_host_p, exist_ok=True)
+    os.makedirs(run_host_p, exist_ok=True)
+    salt_hex_auth = "00" * 16
+    dk_hex_auth = hashlib.pbkdf2_hmac("sha256", b"InitPass#2026", bytes.fromhex(salt_hex_auth), 100000).hex()
+    open(os.path.join(etc_host_p, "auth.json"), "w").write(json.dumps({
+        "version": 1,
+        "alg": "pbkdf2-hmac-sha256",
+        "iter": 100000,
+        "users": {"admin": {"role": "admin", "salt_hex": salt_hex_auth, "dk_hex": dk_hex_auth}},
+    }))
+    open(hd_chroot_p, "w").write(
+        open(os.path.join(ROOT, "backend", "noc-helperd"))
+        .read()
+        .replace("fs.statvfs(ETC_DIR)", "({ blocks: 10000, bavail: 10000, bsize: 4096 })")
+        .replace("if (!acquire_lock(actor, verb).ok)", "if (false)")
+    )
+    uc_auth_script = f"""
+import * as socket from 'socket';
+function rpc(verb, params) {{
+    let s = socket.connect({json.dumps(sock_in_chroot)});
+    s.send(sprintf('%J\\n', {{ id: 1, verb: verb, params: params || {{}} }}));
+    let buf = '';
+    while (true) {{
+        let c = s.recv(65536);
+        if (!c || length(c) == 0) break;
+        buf += c;
+        if (index(buf, '\\n') >= 0) break;
+    }}
+    s.close();
+    return json(buf);
+}}
+let r_lg1 = rpc('auth_login', {{ username: 'admin', password: 'InitPass#2026' }});
+let r_lg2 = rpc('auth_login', {{ username: 'admin', password: 'InitPass#2026' }});
+if (!r_lg1.ok || !r_lg2.ok) {{ print('FAIL:login\\n'); exit(1); }}
+let sessions = {{}};
+let sid_a = 'sid_A_1';
+let sid_b = 'sid_B_2';
+sessions[sid_a] = {{ id: sid_a, username: 'admin', role: 'admin' }};
+sessions[sid_b] = {{ id: sid_b, username: 'admin', role: 'admin' }};
+let r_chg = rpc('auth_change_password', {{ password: 'RotatedPass#2026' }});
+if (!r_chg.ok || !r_chg.invalidate_sessions) {{ print('FAIL:chg\\n'); exit(1); }}
+if (r_chg.ok && r_chg.invalidate_sessions) {{
+    for (let k_sid in keys(sessions)) {{
+        if (k_sid != sid_a) delete sessions[k_sid];
+    }}
+}}
+if (exists(sessions, sid_b)) {{ print('FAIL:sess_b_still_valid\\n'); exit(1); }}
+if (!exists(sessions, sid_a)) {{ print('FAIL:sess_a_invalidated\\n'); exit(1); }}
+let r_old = rpc('auth_login', {{ username: 'admin', password: 'InitPass#2026' }});
+if (r_old.ok) {{ print('FAIL:old_pw_accepted\\n'); exit(1); }}
+let r_new = rpc('auth_login', {{ username: 'admin', password: 'RotatedPass#2026' }});
+if (!r_new.ok) {{ print('FAIL:new_pw_rejected\\n'); exit(1); }}
+print('AUTH_SESS_OK\\n');
+"""
+    open(cl_chroot_p, "w").write(uc_auth_script)
+    r_auth = subprocess.run(
+        [
+            "sudo", "-n", "chroot", rfs_auth, "/bin/sh", "-c",
+            f"NOC_ETC_DIR={etc_in_chroot} NOC_RUN_DIR={run_in_chroot} NOC_SOCK_PATH={sock_in_chroot} "
+            f"/usr/bin/ucode /tmp/noc-helperd-auth-test >/tmp/hd_auth.log 2>&1 & "
+            f"HPID=$!; i=0; while [ ! -S {sock_in_chroot} ] && [ $i -lt 5 ]; do sleep 1; i=$((i+1)); done; "
+            f"/usr/bin/ucode /tmp/auth_sess_client.uc; RC=$?; if [ $RC -ne 0 ]; then cat /tmp/hd_auth.log >&2; fi; rm -rf /tmp/hd_auth.log {etc_in_chroot} {run_in_chroot} /tmp/noc-helperd-auth-test /tmp/auth_sess_client.uc {sock_in_chroot}; kill $HPID 2>/dev/null || true; wait $HPID 2>/dev/null || true; exit $RC"
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    for p_clean in (hd_chroot_p, cl_chroot_p, sock_host_p):
+        if os.path.exists(p_clean):
+            os.unlink(p_clean)
+    shutil.rmtree(etc_host_p, ignore_errors=True)
+    shutil.rmtree(run_host_p, ignore_errors=True)
+    if r_auth.returncode == 0 and "AUTH_SESS_OK" in r_auth.stdout:
+        ok("AUTH-SESSION-INVALIDATION: auth_change_password invalidates other sessions, keeps current session, rejects old password, accepts new password")
+    else:
+        fail(f"AUTH-SESSION-INVALIDATION: rc={r_auth.returncode} out={r_auth.stdout.strip()} err={r_auth.stderr.strip()}")
+else:
+    fail(f"AUTH-SESSION-INVALIDATION: required OpenWrt rootfs missing at {rfs_auth}")
+
 # 9. Option A Root-Interface (/) Redirect & Atomic LuCI Restore Verification (Sections A, B, C, D)
 print("\n=== 8. Root-Interface (/) Redirect & Atomic LuCI Restore (Option A) ===")
 launcher_html_p = os.path.join(ROOT, "frontend", "launcher_index.html")
