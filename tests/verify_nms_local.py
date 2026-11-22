@@ -2074,6 +2074,9 @@ else:
             client_uc_p = os.path.join(rfs, "tmp", "test_fw_rpc_client.uc")
             open(client_uc_p, "w", encoding="utf-8").write(rpc_client_uc)
             try:
+                os.makedirs(os.path.join(rfs, "dev"), exist_ok=True)
+                if not os.path.exists(os.path.join(rfs, "dev", "null")):
+                    open(os.path.join(rfs, "dev", "null"), "w").close()
                 open(os.path.join(rfs, "tmp", "hd_in"), "w").close()
                 single_ns_cmd = (
                     "/usr/bin/ucode /tmp/test_noc_helperd </tmp/hd_in >/tmp/hd.log 2>&1 &\n"
