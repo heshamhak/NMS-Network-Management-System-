@@ -55,8 +55,10 @@ def _http_request(
         return 0, "", str(exc)
 
 
-def _validate_action_payload(action: str, data: dict) -> tuple[bool, str]:
-    if not isinstance(data, dict) or not data.get("ok"):
+def _validate_action_payload(action: str, data: object) -> tuple[bool, str]:
+    if not isinstance(data, dict):
+        return False, f"expected JSON object, got {type(data).__name__}"
+    if not data.get("ok"):
         return False, f"ok is not true: {data.get('error_code', data.get('error', 'unknown'))}"
     if action == "firewall":
         if "zones" not in data or "forwardings" not in data:

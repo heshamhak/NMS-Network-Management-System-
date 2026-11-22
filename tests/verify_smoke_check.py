@@ -21,6 +21,7 @@ class _MockState:
         self.requests: list[tuple[str, str]] = []
         self.fail_action: str | None = None
         self.hang_action: str | None = None
+        self.list_action: str | None = None
 
 
 def _make_handler(state: _MockState):
@@ -60,6 +61,15 @@ def _make_handler(state: _MockState):
 
             if state.fail_action == action:
                 self._send_json(503, {"ok": False, "error_code": "UNAVAILABLE"})
+                return
+
+            if state.list_action == action:
+                raw = b"[]"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
                 return
 
             if action == "firewall":
@@ -128,6 +138,12 @@ def main() -> int:
         rep_to = smoke_check.run_smoke_check(base_url, token="test-token-123", timeout=0.25)
         check("detects_timeout", (not rep_to["ok"]) and rep_to["failed"] >= 1, str(rep_to))
         state.hang_action = None
+
+        # 3b. Non-object JSON (e.g. []) handled cleanly without AttributeError
+        state.list_action = "services"
+        rep_list = smoke_check.run_smoke_check(base_url, token="test-token-123", timeout=2.0)
+        check("detects_non_object_json", (not rep_list["ok"]) and rep_list["failed"] == 1, str(rep_list))
+        state.list_action = None
 
         # 4. Recovery after failure
         rep_rec = smoke_check.run_smoke_check(base_url, token="test-token-123", timeout=2.0)
