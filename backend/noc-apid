@@ -210,66 +210,21 @@ function call_helper(verb, params, actor, client_ip, cb) {
 }
 
 // --- Direct In-Process /proc & /sys Collectors (ZERO subshell forks per P18) ---
-let last_cpu_pct = {};
-let last_steal_pct = 0;
-let boot_cpu_cores = null;
+let cpu_collector_state = { prev_cpu: prev_cpu, last_cpu_pct: {}, last_steal_pct: 0, boot_cpu_cores: null };
 let prev_client_rates = {};
 
 function collect_cpu() {
 	let mono = now_mono_ms();
 	let raw = fs.readfile('/proc/stat') || '';
-	let cores = [];
-	let total_pct = null;
-	let total_status = 'unknown';
-	let steal_pct = last_steal_pct;
-
-	for (let line in split(raw, '\n')) {
-		let p = split(trim(line), /\s+/);
-		if (length(p) < 8 || !match(p[0], /^cpu[0-9]*$/)) continue;
-		let name = p[0];
-		let user = +p[1], nice = +p[2], sys = +p[3], idle = +p[4], iowait = +p[5], irq = +p[6], softirq = +p[7], steal = length(p) > 8 ? +p[8] : 0;
-		let total = user + nice + sys + idle + iowait + irq + softirq + steal;
-		let busy = total - idle - iowait - steal;
-
-		let pct = last_cpu_pct[name] != null ? last_cpu_pct[name] : null;
-		let st = pct != null ? 'ok' : 'unknown';
-		if (!prev_cpu[name]) {
-			prev_cpu[name] = { total: total, busy: busy, steal: steal, mono: mono };
-		} else {
-			let dt = total - prev_cpu[name].total;
-			let db = busy - prev_cpu[name].busy;
-			let ds = steal - prev_cpu[name].steal;
-			let elapsed_sample = mono - prev_cpu[name].mono;
-			if (dt > 0 && elapsed_sample >= 800) {
-				pct = int((db * 1000) / dt) / 10.0;
-				if (pct < 0) pct = 0;
-				if (pct > 100) pct = 100;
-				st = 'ok';
-				last_cpu_pct[name] = pct;
-				if (name == 'cpu') {
-					steal_pct = int((ds * 1000) / dt) / 10.0;
-					last_steal_pct = steal_pct;
-				}
-				prev_cpu[name] = { total: total, busy: busy, steal: steal, mono: mono };
-			}
-		}
-		if (name == 'cpu') {
-			total_pct = pct;
-			total_status = st;
-		} else {
-			push(cores, { name: name, pct: pct, status: st });
-		}
-	}
-	if (boot_cpu_cores == null && length(cores) > 0) boot_cpu_cores = length(cores);
-	let exp_cores = boot_cpu_cores != null ? boot_cpu_cores : length(cores);
+	let res = nms_discovery.collect_cpu_from_proc(raw, mono, cpu_collector_state);
 	return {
-		metric: make_metric(total_pct, 'percent', 'procfs', total_status, null, mono),
-		total_pct: total_pct != null ? total_pct : 0,
-		steal_pct: steal_pct,
-		detected_cores: length(cores),
-		expected_cores: exp_cores,
-		core_drift: length(cores) != exp_cores,
-		cores: cores
+		metric: make_metric(res.raw_total_pct, 'percent', 'procfs', res.total_status, null, mono),
+		total_pct: res.total_pct,
+		steal_pct: res.steal_pct,
+		detected_cores: res.detected_cores,
+		expected_cores: res.expected_cores,
+		core_drift: res.core_drift,
+		cores: res.cores
 	};
 }
 

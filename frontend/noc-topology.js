@@ -583,9 +583,17 @@
       var nid = 'topo-dev-' + idx;
       var stCls = c.blocked ? 'broken' : (devUp ? 'active' : 'disabled');
       var badge = c.blocked ? 'محجوب' : (devUp ? 'متصل' : 'غير متصل');
-      var dKey = c.mac || c.ip || nid;
       var backendBps = (c.rate_supported && c.rx_bps != null && c.tx_bps != null) ? (Number(c.rx_bps) + Number(c.tx_bps)) : null;
-      var instBps = devUp ? (isLive ? (backendBps != null ? backendBps : (deviceInstantBps[dKey] || 0)) : (simSpeeds[c.ip] || 0)) : 0;
+      var instBps = devUp ? (isLive ? backendBps : (simSpeeds[c.ip] || 0)) : 0;
+      var rateText = devUp
+        ? (isLive
+            ? (instBps != null
+                ? fmtBps(instBps)
+                : (c.rate_supported === false
+                    ? 'غير مدعوم'
+                    : (c.rate_reason === 'counter_reset' ? 'إعادة ضبط العداد' : 'قيد القياس')))
+            : fmtBps(instBps))
+        : badge;
       if (devUp && !isLive) simTotalBps += instBps;
 
       colDevices.appendChild(makeNode({
@@ -593,19 +601,19 @@
         type: 'device',
         deviceIp: c.ip || '',
         title: c.display_name || c.ip || 'جهاز',
-        badge: devUp ? fmtBps(instBps) : badge,
+        badge: rateText,
         stateClass: stCls,
         lines: [
           { text: (c.ip || '--') + ' | ' + (c.mac || '--'), mono: true },
           { text: fmtBytes(c.total_rx_bytes || 0) + ' / ' + fmtBytes(c.total_tx_bytes || 0), mono: true }
         ],
         footLabel: c.rate_limit_kbps > 0 ? ('محدود ' + c.rate_limit_kbps + ' Kbps') : 'السرعة اللحظية',
-        footVal: devUp ? fmtBps(instBps) : badge,
+        footVal: rateText,
         details: [
           ['الاسم', c.display_name || '--'],
           ['IP', c.ip || '--'],
           ['MAC', c.mac || '--'],
-          ['السرعة اللحظية', fmtBps(instBps)],
+          ['السرعة اللحظية', rateText],
           ['التنزيل الكلي', fmtBytes(c.total_rx_bytes || 0)],
           ['الرفع الكلي', fmtBytes(c.total_tx_bytes || 0)],
           ['الحد', c.rate_limit_kbps > 0 ? (c.rate_limit_kbps + ' Kbps') : 'غير مقيد']

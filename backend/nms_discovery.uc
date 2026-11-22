@@ -336,14 +336,14 @@ export function compute_client_rates(clients, prev_map, now_ms, flow_offloading,
 			c.rate_reason = 'pending_baseline';
 		} else {
 			let dt = now_ms - prev.ts_ms;
-			if (dt < 500) {
-				c.rx_bps = prev.last_rx_bps != null ? prev.last_rx_bps : null;
-				c.tx_bps = prev.last_tx_bps != null ? prev.last_tx_bps : null;
-				c.rate_reason = c.rx_bps != null ? 'ok' : 'pending_baseline';
-			} else if (rx < prev.rx || tx < prev.tx) {
+			if (rx < prev.rx || tx < prev.tx) {
 				c.rx_bps = null;
 				c.tx_bps = null;
 				c.rate_reason = 'counter_reset';
+			} else if (dt < 500) {
+				c.rx_bps = prev.last_rx_bps != null ? prev.last_rx_bps : null;
+				c.tx_bps = prev.last_tx_bps != null ? prev.last_tx_bps : null;
+				c.rate_reason = c.rx_bps != null ? 'ok' : 'pending_baseline';
 			} else {
 				c.rx_bps = int(((rx - prev.rx) * 8 * 1000) / dt);
 				c.tx_bps = int(((tx - prev.tx) * 8 * 1000) / dt);
@@ -351,11 +351,76 @@ export function compute_client_rates(clients, prev_map, now_ms, flow_offloading,
 			}
 		}
 		if (key != '' && (pmap[key] || length(keys(pmap)) < MAX_RATE_CACHE)) {
-			let should_update = !prev || ((now_ms - prev.ts_ms) >= 500) || (rx < prev.rx || tx < prev.tx);
-			if (should_update) {
+			let is_reset = prev && (rx < prev.rx || tx < prev.tx);
+			if (is_reset) {
+				pmap[key] = { rx: rx, tx: tx, ts_ms: now_ms, last_rx_bps: null, last_tx_bps: null };
+			} else if (!prev || (now_ms - prev.ts_ms) >= 500) {
 				pmap[key] = { rx: rx, tx: tx, ts_ms: now_ms, last_rx_bps: c.rx_bps, last_tx_bps: c.tx_bps };
 			}
 		}
 	}
 	return clients;
+};
+
+export function collect_cpu_from_proc(raw, mono, state) {
+	if (type(state) != 'object') state = {};
+	if (type(state.prev_cpu) != 'object') state.prev_cpu = {};
+	if (type(state.last_cpu_pct) != 'object') state.last_cpu_pct = {};
+	if (state.last_steal_pct == null) state.last_steal_pct = 0;
+
+	let cores = [];
+	let total_pct = null;
+	let total_status = 'unknown';
+	let steal_pct = state.last_steal_pct;
+
+	for (let line in split(raw || '', '\n')) {
+		let p = split(trim(line), /\s+/);
+		if (length(p) < 8 || !match(p[0], /^cpu[0-9]*$/)) continue;
+		let name = p[0];
+		let user = +p[1], nice = +p[2], sys = +p[3], idle = +p[4], iowait = +p[5], irq = +p[6], softirq = +p[7], steal = length(p) > 8 ? +p[8] : 0;
+		let total = user + nice + sys + idle + iowait + irq + softirq + steal;
+		let busy = total - idle - iowait - steal;
+
+		let pct = state.last_cpu_pct[name] != null ? state.last_cpu_pct[name] : null;
+		let st = pct != null ? 'ok' : 'unknown';
+		if (!state.prev_cpu[name]) {
+			state.prev_cpu[name] = { total: total, busy: busy, steal: steal, mono: mono };
+		} else {
+			let dt = total - state.prev_cpu[name].total;
+			let db = busy - state.prev_cpu[name].busy;
+			let ds = steal - state.prev_cpu[name].steal;
+			let elapsed_sample = mono - state.prev_cpu[name].mono;
+			if (dt > 0 && elapsed_sample >= 800) {
+				pct = int((db * 1000) / dt) / 10.0;
+				if (pct < 0) pct = 0;
+				if (pct > 100) pct = 100;
+				st = 'ok';
+				state.last_cpu_pct[name] = pct;
+				if (name == 'cpu') {
+					steal_pct = int((ds * 1000) / dt) / 10.0;
+					if (steal_pct < 0) steal_pct = 0;
+					state.last_steal_pct = steal_pct;
+				}
+				state.prev_cpu[name] = { total: total, busy: busy, steal: steal, mono: mono };
+			}
+		}
+		if (name == 'cpu') {
+			total_pct = pct;
+			total_status = st;
+		} else {
+			push(cores, { name: name, pct: pct, status: st });
+		}
+	}
+	if (state.boot_cpu_cores == null && length(cores) > 0) state.boot_cpu_cores = length(cores);
+	let exp_cores = state.boot_cpu_cores != null ? state.boot_cpu_cores : length(cores);
+	return {
+		raw_total_pct: total_pct,
+		total_status: total_status,
+		total_pct: total_pct != null ? total_pct : 0,
+		steal_pct: steal_pct,
+		detected_cores: length(cores),
+		expected_cores: exp_cores,
+		core_drift: length(cores) != exp_cores,
+		cores: cores
+	};
 };
