@@ -1388,5 +1388,97 @@ else:
             finally:
                 shutil.rmtree(stage_4f, ignore_errors=True)
 
+# 8. SEC-01-STUNNEL: OpenWrt 25.12.6 #undef WITH_OPENSSL socat rejection + isolated procd stunnel TLS lifecycle
+with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
+    bin_nossl = os.path.join(st_td, "bin_nossl")
+    bin_stunnel = os.path.join(st_td, "bin_stunnel")
+    os.makedirs(bin_nossl)
+    os.makedirs(bin_stunnel)
+    # Create a fake socat reporting OpenWrt 25.12.6's `#undef WITH_OPENSSL`
+    for bdir in (bin_nossl, bin_stunnel):
+        sc_p = os.path.join(bdir, "socat")
+        open(sc_p, "w").write("#!/bin/sh\necho 'socat version 1.8.1.3'\necho '  #undef WITH_OPENSSL'\n")
+        os.chmod(sc_p, 0o755)
+    # Add fake stunnel binary only in bin_stunnel
+    st_bin = os.path.join(bin_stunnel, "stunnel")
+    open(st_bin, "w").write("#!/bin/sh\nexit 0\n")
+    os.chmod(st_bin, 0o755)
+
+    # Generate valid temp cert/key
+    crt_p = os.path.join(st_td, "tls.crt")
+    key_p = os.path.join(st_td, "tls.key")
+    fp_p = os.path.join(st_td, "tls.fingerprint")
+    st_conf = os.path.join(st_td, "stunnel.conf")
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key_p, "-out", crt_p, "-days", "1", "-subj", "/CN=test.lan"],
+        check=True, capture_output=True,
+    )
+    fp_out = subprocess.run(["openssl", "x509", "-in", crt_p, "-noout", "-fingerprint", "-sha256"], check=True, capture_output=True, text=True).stdout
+    open(fp_p, "w").write(fp_out)
+
+    init_body = open(os.path.join(ROOT, "init.d", "noc-apid"), "r", encoding="utf-8").read()
+    init_body = init_body.replace("#!/bin/sh /etc/rc.common", "#!/bin/sh")
+    init_body = init_body.replace("TLS_CERT=/etc/noc-console/tls.crt", f"TLS_CERT={crt_p}")
+    init_body = init_body.replace("TLS_KEY=/etc/noc-console/tls.key", f"TLS_KEY={key_p}")
+    init_body = init_body.replace("TLS_FP=/etc/noc-console/tls.fingerprint", f"TLS_FP={fp_p}")
+    init_body = init_body.replace("STUNNEL_CONF=/tmp/noc-console/stunnel.conf", f"STUNNEL_CONF={st_conf}")
+    init_shim = os.path.join(st_td, "noc_apid_shim.sh")
+    open(init_shim, "w", encoding="utf-8").write(init_body)
+
+    procd_harness = (
+        "procd_open_instance() { echo \"INST:$1\"; }\n"
+        "procd_set_param() { echo \"PARAM:$*\"; }\n"
+        "procd_close_instance() { echo \"CLOSE\"; }\n"
+        "logger() { echo \"LOG:$*\"; }\n"
+        "uci() { echo '192.168.1.1'; }\n"
+        f". {init_shim}\n"
+    )
+    # 8a. #undef WITH_OPENSSL socat + no stunnel MUST fail closed (rc != 0, no noc_apid started)
+    r_fail = subprocess.run(
+        ["sh", "-c", procd_harness + "start_service"],
+        env={"PATH": f"{bin_nossl}:/usr/bin:/bin"}, capture_output=True, text=True,
+    )
+    if r_fail.returncode != 0 and "INST:noc_apid" not in r_fail.stdout:
+        ok("SEC-01-STUNNEL[undef_with_openssl_socat_fails_closed]")
+    else:
+        fail(f"SEC-01-STUNNEL[undef_with_openssl_socat_fails_closed]: rc={r_fail.returncode} out={r_fail.stdout}")
+
+    # 8b. stunnel present alongside #undef WITH_OPENSSL socat -> selects stunnel, writes isolated 0600 conf, binds 127.0.0.1:8780 + 192.168.1.1:8743, cleans up on stop_service
+    r_st = subprocess.run(
+        ["sh", "-c", procd_harness + "start_service"],
+        env={"PATH": f"{bin_stunnel}:/usr/bin:/bin"}, capture_output=True, text=True,
+    )
+    conf_txt = open(st_conf).read() if os.path.isfile(st_conf) else ""
+    conf_mode = (os.stat(st_conf).st_mode & 0o777) if os.path.isfile(st_conf) else 0
+    r_stop = subprocess.run(
+        ["sh", "-c", procd_harness + "stop_service"],
+        env={"PATH": f"{bin_stunnel}:/usr/bin:/bin"}, capture_output=True, text=True,
+    )
+    if (
+        r_st.returncode == 0
+        and "NOC_BIND_HOST=127.0.0.1" in r_st.stdout
+        and "INST:noc_tls_proxy" in r_st.stdout
+        and f"{st_bin} {st_conf}" in r_st.stdout
+        and "foreground = yes" in conf_txt
+        and "accept = 192.168.1.1:8743" in conf_txt
+        and "connect = 127.0.0.1:8780" in conf_txt
+        and conf_mode == 0o600
+        and not os.path.exists(st_conf)
+    ):
+        ok("SEC-01-STUNNEL[isolated_stunnel_conf_procd_loopback_and_stop_cleanup]")
+    else:
+        fail(f"SEC-01-STUNNEL[isolated_stunnel_conf_procd_loopback_and_stop_cleanup]: rc={r_st.returncode} mode={oct(conf_mode)} exists_after_stop={os.path.exists(st_conf)} out={r_st.stdout}")
+
+    # 8c. Corrupted TLS cert MUST fail closed even when stunnel is present
+    open(crt_p, "w").write("INVALID_PEM\n")
+    r_badc = subprocess.run(
+        ["sh", "-c", procd_harness + "start_service"],
+        env={"PATH": f"{bin_stunnel}:/usr/bin:/bin"}, capture_output=True, text=True,
+    )
+    if r_badc.returncode != 0 and "INST:noc_apid" not in r_badc.stdout:
+        ok("SEC-01-STUNNEL[invalid_cert_fails_closed_even_with_stunnel]")
+    else:
+        fail(f"SEC-01-STUNNEL[invalid_cert_fails_closed_even_with_stunnel]: rc={r_badc.returncode} out={r_badc.stdout}")
+
 print(f"\n=== SUMMARY: {len(passes)} passed, {len(failures)} failed ===")
 sys.exit(1 if failures else 0)

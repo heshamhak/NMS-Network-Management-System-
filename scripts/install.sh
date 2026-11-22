@@ -42,7 +42,7 @@ RESTORE_FILE="${ETC_DIR}/restorable_files.manifest"
 
 REQUIRED_UCODE_MODS="fs ubus uci socket math struct uloop digest"
 REQUIRED_PKGS="ucode ucode-mod-fs ucode-mod-ubus ucode-mod-uci ucode-mod-socket ucode-mod-math ucode-mod-struct ucode-mod-uloop ucode-mod-digest"
-TLS_PKGS="socat openssl-util"
+TLS_PKGS="stunnel openssl-util"
 
 # --- Stage 0: Irreversible System Prerequisite Installation (Pre-Transaction) ---
 echo "[0/6] Checking system prerequisites (non-transactional OS packages)..."
@@ -89,8 +89,18 @@ if [ -z "$ROOT_PREFIX" ]; then
   fi
 fi
 
+has_tls_proxy() {
+  if command -v stunnel >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v socat >/dev/null 2>&1 && socat -V 2>&1 | grep -Eq '#define[[:space:]]+WITH_OPENSSL([[:space:]]|$)'; then
+    return 0
+  fi
+  return 1
+}
+
 TLS_READY=0
-if command -v socat >/dev/null 2>&1 && socat -V 2>&1 | grep -qi openssl && command -v openssl >/dev/null 2>&1; then
+if has_tls_proxy && command -v openssl >/dev/null 2>&1; then
   TLS_READY=1
 elif [ -z "$ROOT_PREFIX" ] && [ "$SKIP_PKG_INSTALL" -ne 1 ]; then
   if command -v apk >/dev/null 2>&1; then
@@ -98,13 +108,13 @@ elif [ -z "$ROOT_PREFIX" ] && [ "$SKIP_PKG_INSTALL" -ne 1 ]; then
   elif command -v opkg >/dev/null 2>&1; then
     opkg install $TLS_PKGS >/dev/null 2>&1 || true
   fi
-  if command -v socat >/dev/null 2>&1 && socat -V 2>&1 | grep -qi openssl && command -v openssl >/dev/null 2>&1; then
+  if has_tls_proxy && command -v openssl >/dev/null 2>&1; then
     TLS_READY=1
   fi
 fi
 
 if [ "$TLS_READY" -ne 1 ] && [ "$ALLOW_INSECURE" -ne 1 ]; then
-  echo "ERROR: Mandatory TLS prerequisites (socat with OpenSSL + openssl) are unavailable." >&2
+  echo "ERROR: Mandatory TLS prerequisites (stunnel or OpenSSL-enabled socat + openssl) are unavailable." >&2
   echo "Refusing to expose unencrypted HTTP admin UI." >&2
   exit 1
 fi
