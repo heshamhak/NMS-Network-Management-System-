@@ -1529,7 +1529,7 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
         "procd_set_param() { echo \"PARAM:$*\"; }\n"
         "procd_close_instance() { echo \"CLOSE\"; }\n"
         "logger() { echo \"LOG:$*\"; }\n"
-        "uci() { echo '192.168.1.1/24 10.0.0.1/24'; }\n"
+        "uci() { case \"$*\" in *network.lan.ipaddr*) echo '192.168.1.1/24 10.0.0.1/24' ;; *) echo 'nms-router' ;; esac; }\n"
         f". {init_shim}\n"
         f"TLS_CERT={cidr_crt}; TLS_KEY={cidr_key}; TLS_FP={cidr_fp}; STUNNEL_CONF={cidr_conf}; start_service\n"
     )
