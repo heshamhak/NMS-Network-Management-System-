@@ -2181,20 +2181,72 @@ for ver_label, rfs in (("24.10.0-opkg", "/tmp/openwrt-24.10-x86-64-rootfs"), ("2
                 if rc.returncode != 0 or "Status: 302 Found\nLocation: https://192.168.1.1:8743/\n" not in rc.stdout:
                     cgi_ok = False
                     break
-            # Verify dynamic system hostname parity in CGI (NMS_SYS_HOSTNAME / UCI / /proc/sys/kernel/hostname)
-            for sys_h, exp_loc in [
-                ("edge-gw-01", "https://edge-gw-01:8743/"),
-                ("edge-gw-01.lan:80", "https://edge-gw-01.lan:8743/"),
-                ("edge-gw-01.local", "https://edge-gw-01.local:8743/"),
-                ("edge-gw-01.home.arpa:443", "https://edge-gw-01.home.arpa:8743/"),
-            ]:
-                rc_sys = subprocess.run(
-                    ["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/env", "NMS_SYS_HOSTNAME=edge-gw-01", f"HTTP_HOST={sys_h}", "/usr/bin/ucode", "/tmp/test_luci_redirect.uc"],
+            # Verify dynamic system hostname parity in CGI via real OpenWrt /etc/config/system (UCI) AND /proc/sys/kernel/hostname WITHOUT any env override
+            sys_cfg_p = os.path.join(rfs, "etc", "config", "system")
+            proc_hn_p = os.path.join(rfs, "proc", "sys", "kernel", "hostname")
+            had_sys_cfg = os.path.isfile(sys_cfg_p)
+            orig_sys_cfg = open(sys_cfg_p, "rb").read() if had_sys_cfg else None
+            had_proc_hn = os.path.isfile(proc_hn_p)
+            orig_proc_hn = open(proc_hn_p, "rb").read() if had_proc_hn else None
+            try:
+                # 1. Real UCI /etc/config/system path (hostname 'edge-gw-01') with NO environment override
+                os.makedirs(os.path.dirname(sys_cfg_p), exist_ok=True)
+                open(sys_cfg_p, "w", encoding="utf-8").write("config system\n\toption hostname 'edge-gw-01'\n")
+                for sys_h, exp_loc in [
+                    ("edge-gw-01", "https://edge-gw-01:8743/"),
+                    ("edge-gw-01.lan:80", "https://edge-gw-01.lan:8743/"),
+                    ("edge-gw-01.local", "https://edge-gw-01.local:8743/"),
+                    ("edge-gw-01.home.arpa:443", "https://edge-gw-01.home.arpa:8743/"),
+                ]:
+                    rc_uci = subprocess.run(
+                        ["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/env", f"HTTP_HOST={sys_h}", "/usr/bin/ucode", "/tmp/test_luci_redirect.uc"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if rc_uci.returncode != 0 or f"Status: 302 Found\nLocation: {exp_loc}\n" not in rc_uci.stdout:
+                        cgi_ok = False
+                        break
+                # Verify unapproved hostname is still rejected while UCI hostname is edge-gw-01
+                rc_uci_bad = subprocess.run(
+                    ["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/env", "HTTP_HOST=other-gw.lan", "/usr/bin/ucode", "/tmp/test_luci_redirect.uc"],
                     capture_output=True, text=True, timeout=10,
                 )
-                if rc_sys.returncode != 0 or f"Status: 302 Found\nLocation: {exp_loc}\n" not in rc_sys.stdout:
+                if rc_uci_bad.returncode != 0 or "Status: 302 Found\nLocation: https://192.168.1.1:8743/\n" not in rc_uci_bad.stdout:
                     cgi_ok = False
-                    break
+
+                # 2. Fallback /proc/sys/kernel/hostname path when UCI /etc/config/system is absent
+                if os.path.exists(sys_cfg_p):
+                    os.unlink(sys_cfg_p)
+                os.makedirs(os.path.dirname(proc_hn_p), exist_ok=True)
+                open(proc_hn_p, "w", encoding="utf-8").write("proc-gw-02\n")
+                for proc_h, exp_loc in [
+                    ("proc-gw-02", "https://proc-gw-02:8743/"),
+                    ("proc-gw-02.lan:80", "https://proc-gw-02.lan:8743/"),
+                    ("proc-gw-02.local", "https://proc-gw-02.local:8743/"),
+                    ("proc-gw-02.home.arpa:443", "https://proc-gw-02.home.arpa:8743/"),
+                ]:
+                    rc_proc = subprocess.run(
+                        ["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/env", f"HTTP_HOST={proc_h}", "/usr/bin/ucode", "/tmp/test_luci_redirect.uc"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if rc_proc.returncode != 0 or f"Status: 302 Found\nLocation: {exp_loc}\n" not in rc_proc.stdout:
+                        cgi_ok = False
+                        break
+                # Verify previous UCI hostname edge-gw-01 is now rejected when only /proc/sys/kernel/hostname=proc-gw-02 exists
+                rc_proc_bad = subprocess.run(
+                    ["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/env", "HTTP_HOST=edge-gw-01.lan", "/usr/bin/ucode", "/tmp/test_luci_redirect.uc"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if rc_proc_bad.returncode != 0 or "Status: 302 Found\nLocation: https://192.168.1.1:8743/\n" not in rc_proc_bad.stdout:
+                    cgi_ok = False
+            finally:
+                if had_sys_cfg and orig_sys_cfg is not None:
+                    open(sys_cfg_p, "wb").write(orig_sys_cfg)
+                elif os.path.exists(sys_cfg_p):
+                    os.unlink(sys_cfg_p)
+                if had_proc_hn and orig_proc_hn is not None:
+                    open(proc_hn_p, "wb").write(orig_proc_hn)
+                elif os.path.exists(proc_hn_p):
+                    os.unlink(proc_hn_p)
             if cgi_ok:
                 ok(f"ROOT-REDIRECT-A/C/D[luci_cgi_302_trusted_host_policy_and_external_domain_rejected_{ver_label}]")
             else:

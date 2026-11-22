@@ -60,8 +60,6 @@ function is_local_ipv6(h) {
 }
 
 function get_system_hostname() {
-	let env_hn = getenv('NMS_SYS_HOSTNAME');
-	if (type(env_hn) == 'string' && env_hn != '') return lc(trim(env_hn));
 	try {
 		let cur = uci.cursor();
 		let hn = cur.get_first('system', 'system', 'hostname');
