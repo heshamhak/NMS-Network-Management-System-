@@ -15,7 +15,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python & Node.js
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -33,54 +33,13 @@ jobs:
       - name: Provision OpenWrt 25.12.6 host apk-tools (mkpkg/mkndx)
         run: |
           mkdir -p /tmp/openwrt-sdk
-          curl -sL https://downloads.openwrt.org/releases/25.12.6/targets/x86/64/openwrt-sdk-25.12.6-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst \
+          curl -fsSL https://downloads.openwrt.org/releases/25.12.6/targets/x86/64/openwrt-sdk-25.12.6-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst \
             | tar --zstd -xf - --strip-components=1 -C /tmp/openwrt-sdk --wildcards '*/staging_dir/host/bin/apk' '*/staging_dir/host/bin/.apk.bin' '*/staging_dir/host/lib/*'
           echo "APK_BIN=/tmp/openwrt-sdk/staging_dir/host/bin/apk" >> "$GITHUB_ENV"
           /tmp/openwrt-sdk/staging_dir/host/bin/apk --version
 
       - name: Provision isolated OpenWrt 24.10.0 & 25.12.6 chroots
-        run: |
-          mkdir -p /tmp/openwrt-24.10-x86-64-rootfs /tmp/openwrt-x86-64-rootfs /tmp/openwrt-pkg-cache/25.12.6
-          curl -sL https://downloads.openwrt.org/releases/24.10.0/targets/x86/64/openwrt-24.10.0-x86-64-rootfs.tar.gz | tar -xz -C /tmp/openwrt-24.10-x86-64-rootfs
-          curl -sL https://downloads.openwrt.org/releases/25.12.6/targets/x86/64/openwrt-25.12.6-x86-64-rootfs.tar.gz | tar -xz -C /tmp/openwrt-x86-64-rootfs
-          python3 -c '
-          import os, subprocess, urllib.request, tarfile, io
-          cache_25 = "/tmp/openwrt-pkg-cache/25.12.6"
-          base_25 = "https://downloads.openwrt.org/releases/25.12.6/packages/x86_64/base"
-          files_25 = [
-              "packages.adb",
-              "ucode-mod-digest-2026.07.09~b885dd0f-r3.apk",
-              "ucode-mod-socket-2026.07.09~b885dd0f-r3.apk",
-              "ucode-mod-struct-2026.07.09~b885dd0f-r3.apk",
-          ]
-          for fn in files_25:
-              urllib.request.urlretrieve(f"{base_25}/{fn}", os.path.join(cache_25, fn))
-          rfs25 = "/tmp/openwrt-x86-64-rootfs"
-          repo25 = os.path.join(rfs25, "tmp/apk_init")
-          os.makedirs(os.path.join(repo25, "x86_64"), exist_ok=True)
-          for fn in files_25:
-              raw = open(os.path.join(cache_25, fn), "rb").read()
-              open(os.path.join(repo25, fn), "wb").write(raw)
-              if fn.endswith(".apk"):
-                  open(os.path.join(repo25, "x86_64", fn), "wb").write(raw)
-          open(os.path.join(rfs25, "tmp/apk_repos.list"), "w").write("/tmp/apk_init/packages.adb\n")
-          subprocess.run(["unshare", "-r", "/usr/sbin/chroot", rfs25, "/usr/bin/apk", "add", "--no-network", "--repositories-file", "/tmp/apk_repos.list", "ucode-mod-digest", "ucode-mod-socket", "ucode-mod-struct"], check=True)
-          base_24 = "https://downloads.openwrt.org/releases/24.10.0/packages/x86_64/base"
-          pkgs_txt = urllib.request.urlopen(f"{base_24}/Packages").read().decode("utf-8")
-          rfs24 = "/tmp/openwrt-24.10-x86-64-rootfs"
-          wanted = {"ucode", "libucode20230711", "ucode-mod-digest", "ucode-mod-socket", "ucode-mod-struct", "ucode-mod-uloop"}
-          cur = None
-          for line in pkgs_txt.splitlines():
-              if line.startswith("Package: "): cur = line.split(": ", 1)[1].strip()
-              elif line.startswith("Filename: ") and cur in wanted:
-                  raw = urllib.request.urlopen(f"{base_24}/{line.split(\": \", 1)[1].strip()}").read()
-                  with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as outer:
-                      dm = outer.extractfile("./data.tar.gz") or outer.extractfile("data.tar.gz")
-                      with tarfile.open(fileobj=io.BytesIO(dm.read()), mode="r:gz") as dtf:
-                          dtf.extractall(rfs24)
-                  wanted.discard(cur)
-          assert not wanted, f"missing 24.10 packages: {wanted}"
-          '
+        run: sh scripts/provision_ci_chroots.sh
 
       - name: Run full NMS CI verification (fails on any failure or skipped test)
         run: sh scripts/run_ci_local.sh
