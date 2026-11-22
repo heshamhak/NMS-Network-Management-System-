@@ -1456,6 +1456,7 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 					ip_route_raw: tres ? tres.ip_route_raw : null,
 					bridge_vlan_raw: tres ? tres.bridge_vlan_raw : null,
 					fdb_raw: tres ? tres.fdb_raw : '',
+					carrier_map: tres ? tres.carrier_map : null,
 					bridges: tres ? tres.bridges : [],
 					uci_wireless: tres ? tres.uci_wireless : [],
 					runtime_ap_ifs: tres ? tres.runtime_ap_ifs : {},

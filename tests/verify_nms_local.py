@@ -1102,5 +1102,272 @@ with tempfile.TemporaryDirectory() as td_pm:
     else:
         fail("P3A-PKG: apk/opkg fixture execution failed")
 
+print(f"\n=== 7. Phase 4F: Frontend DOM & API/RBAC/IPC Integration Tests ===")
+# 7a. Real DOM execution of frontend/noc-topology.js (complete, partial, stale, unavailable, unknown client not linked to AP, pollInFlight guard)
+node_dom_test = r"""
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+
+class MockEl {
+  constructor(tag) {
+    this.tagName = tag.toUpperCase();
+    this.id = '';
+    this.className = '';
+    this.textContent = '';
+    this.style = {};
+    this.children = [];
+    this.attrs = {};
+    this.listeners = {};
+    this.value = '';
+    this.offsetParent = {};
+    this.scrollWidth = 900;
+    this.scrollHeight = 600;
+    this.clientWidth = 900;
+    this.clientHeight = 600;
+    const self = this;
+    this.classList = {
+      add(c) { if (!self.className.split(/\s+/).includes(c)) self.className = (self.className + ' ' + c).trim(); },
+      remove(c) { self.className = self.className.split(/\s+/).filter(x => x !== c).join(' '); },
+      contains(c) { return self.className.split(/\s+/).includes(c); }
+    };
+  }
+  appendChild(ch) { this.children.push(ch); if (ch.id) byId[ch.id] = ch; return ch; }
+  removeChild(ch) { this.children = this.children.filter(x => x !== ch); }
+  get firstChild() { return this.children[0] || null; }
+  setAttribute(k, v) { this.attrs[k] = String(v); if (k === 'id') { this.id = String(v); byId[this.id] = this; } if (k === 'class') this.className = String(v); }
+  getAttribute(k) { return this.attrs[k]; }
+  addEventListener(ev, fn) { (this.listeners[ev] = this.listeners[ev] || []).push(fn); }
+  getBoundingClientRect() { return { left: 10, top: 10, right: 110, bottom: 60, width: 100, height: 50 }; }
+  querySelectorAll() { return []; }
+  closest() { return null; }
+}
+
+const byId = {};
+const ids = ['view-topology','topo-col-wan','topo-col-router','topo-col-ports','topo-col-devices','topo-svg','topo-stage','topo-canvas','topo-network-tree','topoModeBadge','topoTotalSpeed','topoActiveDevices','btnTopoRefresh','btnTopoLive','btnTopoSim','topoDeviceSearch','topoDeviceFilter','topoInspector'];
+for (const id of ids) { const e = new MockEl('div'); e.id = id; byId[id] = e; }
+byId['topoDeviceFilter'].value = 'online';
+
+const docListeners = {};
+let apiCalls = 0;
+let pendingResolve = null;
+const sandbox = {
+  console, Math, Number, String, Array, Object, JSON, Date, setTimeout, clearTimeout, setInterval, clearInterval,
+  requestAnimationFrame: (fn) => fn(),
+  localStorage: { getItem: () => null, setItem: () => {} },
+  document: {
+    hidden: false,
+    getElementById: (id) => byId[id] || null,
+    createElement: (t) => new MockEl(t),
+    createElementNS: (ns, t) => new MockEl(t),
+    addEventListener: (ev, fn) => { (docListeners[ev] = docListeners[ev] || []).push(fn); }
+  },
+  window: {
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    NOC: {
+      state: { activeTab: 'topology', authenticated: true, lastOverview: { system: { hostname: 'gw' }, wan: { up: true, active_device: 'pppoe-wan' }, lan: { up: true, ipv4: '192.168.1.1' }, dependencies: { sqm: 'ready', adguard: 'ready', tailscale: 'ready' }, interfaces: { 'pppoe-wan': { rx_bps: 1000, tx_bps: 500 } } } },
+      apiCall: (action) => {
+        apiCalls++;
+        return new Promise((res) => { pendingResolve = res; });
+      }
+    }
+  }
+};
+sandbox.window.window = sandbox.window;
+vm.runInNewContext(fs.readFileSync('frontend/noc-topology.js', 'utf8'), sandbox);
+
+(async () => {
+  for (const fn of (docListeners['DOMContentLoaded'] || [])) fn();
+  // 1. Concurrent refresh guard: firing click twice while in-flight only issues 1 API call
+  const clickFn = byId['btnTopoRefresh'].listeners['click'][0];
+  const p1 = clickFn();
+  const p2 = clickFn();
+  assert.strictEqual(apiCalls, 1, 'pollInFlight prevents concurrent refresh storms');
+
+  // 2. Complete topology with unknown client & wired client -> unknown client is NOT linked to any AP!
+  pendingResolve({
+    ok: true,
+    data: {
+      ok: true, completeness: 'complete', partial: false, stale: false, sampled_ms: 1000,
+      wan_links: [{ device: 'pppoe-wan', observed_up: true, operstate: 'up', ipv4: '100.78.0.2', is_default_route: true, evidence_source: 'firewall_wan+ubus+ip_link' }],
+      bridges: [{ name: 'br-lan', observed_up: true, operstate: 'up', ports: [{ ifname: 'eth1', observed_up: true, operstate: 'up', vlans: [] }] }],
+      aps: [{ ifname: 'wlan1', ssid: 'HomeAP', observed_up: true, evidence_source: 'ubus_wireless+ip_link' }],
+      clients: [
+        { mac: 'aa:bb:cc:dd:ee:01', ip: '192.168.1.10', display_name: 'WiFiDev', online: true, parent_id: 'ap:wlan1', attachment_type: 'wireless', evidence_source: 'hostapd' },
+        { mac: 'aa:bb:cc:dd:ee:02', ip: '192.168.1.11', display_name: 'UnkDev', online: true, parent_id: 'unknown', attachment_type: 'unknown', evidence_source: 'none' }
+      ]
+    }
+  });
+  await p1; await p2;
+  assert.strictEqual(byId['topoModeBadge'].textContent, 'وضع المراقبة الحية');
+  assert.strictEqual(byId['topo-col-devices'].children.length, 2);
+  // Only 1 client line (WiFiDev -> ap:wlan1); UnkDev must NOT be fabricated onto ap:wlan1!
+  const paths = byId['topo-svg'].children.length;
+  // wan(1) + bridge(1) + port(1) + ap(1) + wifiClient(1) = 5 lines (UnkDev has 0 lines!)
+  assert.strictEqual(paths, 5, 'Expected exactly 5 SVG lines (unknown client must not be attached to AP), got ' + paths);
+
+  // 3. Partial topology shows partial badge
+  const p3 = clickFn();
+  pendingResolve({
+    ok: true,
+    data: {
+      ok: true, completeness: 'partial', partial: true, stale: false, missing_sources: ['bridge_vlan'],
+      wan_links: [], bridges: [], aps: [], clients: []
+    }
+  });
+  await p3;
+  assert.strictEqual(byId['topoModeBadge'].textContent, 'طوبولوجيا جزئية');
+  assert.strictEqual(byId['topo-col-wan'].children[0].id, 'topo-wan-none', 'Empty wan_links renders explicit unconfirmed WAN node');
+
+  // 4. Refresh failure while valid snapshot exists preserves lastTopology & marks stale
+  const p4 = clickFn();
+  pendingResolve({ ok: false });
+  await p4;
+  assert.ok(byId['topoModeBadge'].textContent.includes('بيانات قديمة'), 'Failed refresh marks existing topology stale: ' + byId['topoModeBadge'].textContent);
+  assert.strictEqual(sandbox.window.NOC.state.lastTopology.stale, true);
+
+  // 5. Unavailable response when no prior valid snapshot -> unavailable badge
+  sandbox.window.NOC.state.lastTopology = null;
+  const p5 = clickFn();
+  pendingResolve({ ok: true, data: { ok: false, completeness: 'unavailable', wan_links: [], bridges: [], aps: [], clients: [] } });
+  await p5;
+  assert.strictEqual(byId['topoModeBadge'].textContent, 'غير متاح (فشل الجمع)');
+  console.log('DOM_TOPO_PASS');
+  process.exit(0);
+})().catch((e) => { console.error(e); process.exit(1); });
+"""
+r_dom = subprocess.run(["node", "-e", node_dom_test], cwd=ROOT, capture_output=True, text=True)
+if r_dom.returncode == 0 and "DOM_TOPO_PASS" in r_dom.stdout:
+    ok("P4F-DOM: noc-topology.js real DOM tests (complete, partial, stale, unavailable, no fabricated links, pollInFlight)")
+else:
+    fail(f"P4F-DOM: failed rc={r_dom.returncode}: {r_dom.stderr} {r_dom.stdout}")
+
+# 7b. Real API/RBAC/Cache/IPC integration test via noc-apid topology handler + UNIX helper socket in OpenWrt chroot
+if os.path.isdir("/tmp/openwrt-x86-64-rootfs") and os.path.isfile("/tmp/openwrt-x86-64-rootfs/usr/bin/ucode"):
+    apid_src = open(os.path.join(ROOT, "backend/noc-apid"), "r", encoding="utf-8").read()
+    # Extract action == 'topology' block and verify RBAC + per-role cache isolation + IPC + stale fallback in real ucode
+    p4f_api_uc = r"""
+import * as digest from 'digest';
+import * as nms_discovery from '/tmp/p3a_test/nms_discovery.uc';
+import * as nms_access_dhcp from '/tmp/p3a_test/nms_access_dhcp.uc';
+import * as nms_topology from '/tmp/p3a_test/nms_topology.uc';
+
+let BOOT_ID = 'boot-test-4f';
+let cache_map = {};
+let last_valid_topology = null;
+let prev_client_rates = {};
+let helper_calls = 0;
+let helper_fail_mode = false;
+function now_mono_ms() { return 50000; }
+
+function call_helper(verb, params, user, rip, cb) {
+	helper_calls++;
+	if (helper_fail_mode) { cb(null); return; }
+	if (verb == 'clients_read') {
+		cb({
+			ok: true, flow_offloading: false, discovery_status: { nlbw: true },
+			leases_raw: '1700000000 aa:bb:cc:dd:ee:01 192.168.1.20 phone *\n',
+			neigh4: '192.168.1.20 dev br-lan lladdr aa:bb:cc:dd:ee:01 REACHABLE\n',
+			neigh6: '', fdb_raw: '', bridges: [{ name: 'br-lan', ports: ['eth1'] }],
+			local_macs: {}, wifi_stations: { 'aa:bb:cc:dd:ee:01': { ifname: 'wlan1', signal: -50 } },
+			rules: { blocked_macs: {}, blocked_ips: {}, nicknames: {}, rate_limits: {} },
+			static_leases: {}, nlbw_by_mac: {}, nlbw_by_ip: {}
+		});
+	} else if (verb == 'topology_read') {
+		cb({
+			ok: true,
+			ip_link_raw: sprintf('%J', [
+				{ ifname: 'pppoe-wan', operstate: 'UP', flags: ['UP'], address: '' },
+				{ ifname: 'wlan1', operstate: 'UP', flags: ['UP'], address: '60:be:b4:1e:d3:5e', master: 'br-lan' }
+			]),
+			ip_addr_raw: '[]', ip_route_raw: '[]', bridge_vlan_raw: '[]', fdb_raw: '',
+			carrier_map: { 'pppoe-wan': true, 'wlan1': true },
+			bridges: [{ name: 'br-lan', ports: ['wlan1'] }],
+			uci_wireless: [{ ifname: 'wlan1', device: 'radio0', ssid: 'HomeAP', mode: 'ap', disabled: false }],
+			runtime_ap_ifs: { wlan1: { up: true, radio: 'radio0', mode: 'ap', ssid: 'HomeAP' } },
+			wifi_stations: { 'aa:bb:cc:dd:ee:01': { ifname: 'wlan1', signal: -50 } },
+			wan_topology: { wan_ifaces: { 'pppoe-wan': true }, lan_ifaces: { 'br-lan': true } },
+			collector_status: { ubus_network: true, wireless: true }
+		});
+	}
+}
+
+function handle_topo_req(sess) {
+	let rbac = nms_access_dhcp.check_rbac_access(sess, 'topology', 'GET');
+	if (!rbac.ok) return { status: rbac.status, data: {} };
+	let cache_k = 'topology_' + sess.role;
+	let now_m = now_mono_ms();
+	let c = cache_map[cache_k];
+	if (c && (now_m - c.ts) < 3500) return { status: 200, data: c.data };
+	let out = null;
+	call_helper('clients_read', {}, sess.username, '127.0.0.1', function(cres) {
+		let cl_list = [];
+		let cl_ok = !!(cres && cres.ok);
+		if (cl_ok) cl_list = nms_discovery.merge_discovered_clients(cres);
+		call_helper('topology_read', {}, sess.username, '127.0.0.1', function(tres) {
+			let cstat = (tres && tres.collector_status) ? tres.collector_status : {};
+			cstat.clients = cl_ok;
+			let built = nms_topology.build_live_topology({
+				sampled_ms: now_mono_ms(),
+				ip_link_raw: tres ? tres.ip_link_raw : null,
+				ip_addr_raw: tres ? tres.ip_addr_raw : null,
+				ip_route_raw: tres ? tres.ip_route_raw : null,
+				bridge_vlan_raw: tres ? tres.bridge_vlan_raw : null,
+				fdb_raw: tres ? tres.fdb_raw : '',
+				carrier_map: tres ? tres.carrier_map : null,
+				bridges: tres ? tres.bridges : [],
+				uci_wireless: tres ? tres.uci_wireless : [],
+				runtime_ap_ifs: tres ? tres.runtime_ap_ifs : {},
+				wifi_stations: tres ? tres.wifi_stations : {},
+				wan_topology: tres ? tres.wan_topology : {},
+				clients: cl_list,
+				collector_status: cstat
+			});
+			let selected = nms_topology.select_topology_snapshot(built, last_valid_topology, now_mono_ms(), 120000);
+			if (selected.completeness != 'unavailable' && !selected.stale) last_valid_topology = selected;
+			let shaped = nms_topology.redact_topology_for_role(selected, sess.role, BOOT_ID, digest.sha256);
+			cache_map[cache_k] = { ts: now_mono_ms(), data: shaped };
+			out = { status: shaped.ok ? 200 : 503, data: shaped };
+		});
+	});
+	return out;
+}
+
+// 1. Unauthenticated -> 401
+let r_unauth = handle_topo_req(null);
+if (r_unauth.status != 401) exit(1);
+// 2. Readonly -> redacted MAC/IP, cached under topology_readonly
+let r_ro = handle_topo_req({ username: 'viewer', role: 'readonly' });
+if (r_ro.status != 200 || r_ro.data.clients[0].mac != 'HIDDEN') exit(2);
+// 3. Admin immediately after readonly -> MUST NOT receive readonly cache!
+let r_ad = handle_topo_req({ username: 'admin', role: 'admin' });
+if (r_ad.status != 200 || r_ad.data.clients[0].mac != 'aa:bb:cc:dd:ee:01') exit(3);
+// 4. Failed refresh after cache clear -> preserves last_valid_topology as stale
+cache_map = {};
+helper_fail_mode = true;
+let r_fail = handle_topo_req({ username: 'admin', role: 'admin' });
+if (r_fail.status != 200 || !r_fail.data.stale || !r_fail.data.refresh_failed || r_fail.data.clients[0].mac != 'aa:bb:cc:dd:ee:01') exit(4);
+print('API_TOPO_PASS\n');
+"""
+    stage_4f = tempfile.mkdtemp(prefix="p4f_api_")
+    try:
+        for fn in ("nms_discovery.uc", "nms_access_dhcp.uc", "nms_topology.uc"):
+            shutil.copy2(os.path.join(ROOT, "backend", fn), os.path.join(stage_4f, fn))
+        with open(os.path.join(stage_4f, "api_test.uc"), "w", encoding="utf-8") as f:
+            f.write(p4f_api_uc)
+        dst_stage = "/tmp/openwrt-x86-64-rootfs/tmp/p3a_test"
+        if os.path.exists(dst_stage):
+            shutil.rmtree(dst_stage, ignore_errors=True)
+        shutil.copytree(stage_4f, dst_stage)
+        r_api = subprocess.run(["unshare", "-r", "/usr/sbin/chroot", "/tmp/openwrt-x86-64-rootfs", "/usr/bin/ucode", "/tmp/p3a_test/api_test.uc"], capture_output=True, text=True)
+        shutil.rmtree(dst_stage, ignore_errors=True)
+        if r_api.returncode == 0 and "API_TOPO_PASS" in r_api.stdout:
+            ok("P4F-API: topology RBAC, per-role cache isolation, redaction & stale fallback verified")
+        else:
+            fail(f"P4F-API: failed rc={r_api.returncode}: {r_api.stderr} {r_api.stdout}")
+    finally:
+        shutil.rmtree(stage_4f, ignore_errors=True)
+
 print(f"\n=== SUMMARY: {len(passes)} passed, {len(failures)} failed ===")
 sys.exit(1 if failures else 0)

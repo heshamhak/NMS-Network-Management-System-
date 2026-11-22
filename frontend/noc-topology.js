@@ -428,9 +428,9 @@
     var eth3Speed = ifaces.eth3 ? ((Number(ifaces.eth3.rx_bps) || 0) + (Number(ifaces.eth3.tx_bps) || 0)) : 0;
 
     if (isLive && topo) {
-      var isStale = !!(topo.stale || topologyRefreshFailed);
-      var isPartial = !!topo.partial;
-      var isUnavail = (topo.completeness === 'unavailable' && !isStale);
+      var isUnavail = (topo.completeness === 'unavailable' && !topo.stale);
+      var isStale = !isUnavail && !!(topo.stale || topologyRefreshFailed);
+      var isPartial = !isUnavail && !!topo.partial;
       if (qs('topoModeBadge')) {
         if (isUnavail) {
           qs('topoModeBadge').textContent = 'غير متاح (فشل الجمع)';

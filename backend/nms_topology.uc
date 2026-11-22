@@ -1,6 +1,8 @@
 // Phase 4F: Evidence-Driven Live Topology Builder, Stale/Conflict Handler & Role Redaction
 // Zero external dependencies; executed in-process by noc-apid and OpenWrt chroot suites.
 
+const VALID_WIFI_MODES = { 'ap': true, 'sta': true, 'mesh': true, 'monitor': true, 'adhoc': true, 'wds': true };
+
 function safe_json_array(raw) {
 	if (!raw || trim(raw) == '') return { ok: false, data: [], error: 'empty' };
 	try {
@@ -12,18 +14,37 @@ function safe_json_array(raw) {
 	}
 }
 
-export function parse_ip_links(raw) {
+export function parse_ip_links(raw, carrier_map) {
 	let r = safe_json_array(raw);
 	if (!r.ok) return { ok: false, links: {}, error: r.error };
+	let cmap = (type(carrier_map) == 'object') ? carrier_map : {};
 	let links = {};
 	for (let it in r.data) {
 		if (!it || type(it) != 'object' || !it.ifname) continue;
 		let kind = (it.linkinfo && it.linkinfo.info_kind) ? it.linkinfo.info_kind : '';
 		let slave_kind = (it.linkinfo && it.linkinfo.info_slave_kind) ? it.linkinfo.info_slave_kind : '';
+		let admin_up = (index(it.flags || [], 'UP') >= 0);
+		let operstate = (it.operstate != null && trim('' + it.operstate) != '') ? lc(trim('' + it.operstate)) : 'unknown';
+		let carrier = null;
+		if (cmap[it.ifname] != null) carrier = !!cmap[it.ifname];
+		else if (it.carrier != null) carrier = (it.carrier == 1 || it.carrier === true);
+
+		let operational_up = admin_up && (operstate == 'up') && (carrier !== false);
+		let conn_state = 'unknown';
+		if (!admin_up) conn_state = 'admin_down';
+		else if (carrier === false) conn_state = 'no_carrier';
+		else if (operstate == 'down' || operstate == 'lowerlayerdown') conn_state = operstate;
+		else if (operstate == 'unknown') conn_state = 'unknown';
+		else if (operational_up) conn_state = 'up';
+		else conn_state = operstate;
+
 		links[it.ifname] = {
 			ifname: it.ifname,
-			operstate: lc(it.operstate || 'unknown'),
-			up: (index(it.flags || [], 'UP') >= 0),
+			admin_up: admin_up,
+			operstate: operstate,
+			carrier: carrier,
+			operational_up: operational_up,
+			connectivity_state: conn_state,
 			mac: lc(it.address || ''),
 			master: it.master || '',
 			kind: kind,
@@ -128,7 +149,7 @@ export function build_live_topology(sources) {
 	let sampled_ms = src.sampled_ms || 0;
 	let cstat = (type(src.collector_status) == 'object') ? src.collector_status : {};
 
-	let p_links = src.ip_link_raw != null ? parse_ip_links(src.ip_link_raw) : { ok: false, links: {}, error: 'missing' };
+	let p_links = src.ip_link_raw != null ? parse_ip_links(src.ip_link_raw, src.carrier_map) : { ok: false, links: {}, error: 'missing' };
 	let p_addrs = src.ip_addr_raw != null ? parse_ip_addrs(src.ip_addr_raw) : { ok: false, addrs: {}, error: 'missing' };
 	let p_routes = src.ip_route_raw != null ? parse_ip_routes(src.ip_route_raw) : { ok: false, defaults: [], error: 'missing' };
 	let p_vlans = src.bridge_vlan_raw != null ? parse_bridge_vlans(src.bridge_vlan_raw) : { ok: false, vlans_by_dev: {}, error: 'missing' };
@@ -160,7 +181,7 @@ export function build_live_topology(sources) {
 	let wan_ifaces = (type(wan_topo.wan_ifaces) == 'object') ? wan_topo.wan_ifaces : {};
 	let lan_ifaces = (type(wan_topo.lan_ifaces) == 'object') ? wan_topo.lan_ifaces : {};
 
-	// 1. WAN links from explicit verified wan_ifaces + runtime link/addr/route evidence
+	// 1. WAN links: separate admin_up from operational_up / operstate / carrier
 	let default_route_devs = {};
 	for (let rt in p_routes.defaults) default_route_devs[rt.dev] = rt;
 
@@ -170,7 +191,7 @@ export function build_live_topology(sources) {
 		let lnk = links[wdev];
 		let adr = addrs[wdev];
 		let dr = default_route_devs[wdev];
-		let observed_up = !!(lnk && lnk.up);
+		let observed_up = !!(lnk && lnk.operational_up);
 		if (p_links.ok && !lnk) {
 			push(conflicts, { type: 'disappeared_wan_interface', dev: wdev, detail: 'WAN interface absent from ip link' });
 		}
@@ -178,7 +199,10 @@ export function build_live_topology(sources) {
 			id: 'wan:' + wdev,
 			device: wdev,
 			observed_up: observed_up,
+			admin_up: lnk ? lnk.admin_up : false,
 			operstate: lnk ? lnk.operstate : 'unknown',
+			carrier: lnk ? lnk.carrier : null,
+			connectivity_state: lnk ? lnk.connectivity_state : 'unknown',
 			ipv4: (adr && length(adr.ipv4) > 0) ? adr.ipv4[0] : '',
 			is_default_route: !!dr,
 			gateway: dr ? dr.gateway : '',
@@ -206,8 +230,11 @@ export function build_live_topology(sources) {
 				id: 'port:' + pt,
 				ifname: pt,
 				bridge: br.name,
-				observed_up: !!(plnk && plnk.up),
+				observed_up: !!(plnk && plnk.operational_up),
+				admin_up: plnk ? plnk.admin_up : false,
 				operstate: plnk ? plnk.operstate : 'unknown',
+				carrier: plnk ? plnk.carrier : null,
+				connectivity_state: plnk ? plnk.connectivity_state : 'unknown',
 				vlans: p_vlans_list,
 				evidence_source: plnk ? 'sysfs+ip_link' : 'sysfs_only'
 			};
@@ -217,8 +244,11 @@ export function build_live_topology(sources) {
 		push(bridge_nodes, {
 			id: 'bridge:' + br.name,
 			name: br.name,
-			observed_up: !!(br_lnk && br_lnk.up),
+			observed_up: !!(br_lnk && br_lnk.operational_up),
+			admin_up: br_lnk ? br_lnk.admin_up : false,
 			operstate: br_lnk ? br_lnk.operstate : 'unknown',
+			carrier: br_lnk ? br_lnk.carrier : null,
+			connectivity_state: br_lnk ? br_lnk.connectivity_state : 'unknown',
 			vlans: p_vlans.vlans_by_dev[br.name] || [],
 			ports: br_ports,
 			evidence_source: br_lnk ? 'sysfs+ip_link' : 'sysfs_only'
@@ -233,51 +263,93 @@ export function build_live_topology(sources) {
 				ifname: ifn,
 				parent_if: lk.link,
 				vlan_id: lk.vlan_id,
-				observed_up: lk.up,
+				observed_up: lk.operational_up,
+				admin_up: lk.admin_up,
+				operstate: lk.operstate,
+				carrier: lk.carrier,
+				connectivity_state: lk.connectivity_state,
 				evidence_source: 'ip_link'
 			});
 		}
 	}
 
-	// 3. Wireless Radios & AP SSIDs (configured vs observed runtime)
+	// 3. Wireless Interfaces & AP Classification (strict mode check: AP vs STA/mesh/monitor/unknown)
+	let wireless_ifaces = [];
 	let ap_nodes = {};
 	let uci_wifi = (type(src.uci_wireless) == 'array') ? src.uci_wireless : [];
 	let wifi_stations = (type(src.wifi_stations) == 'object') ? src.wifi_stations : {};
 	let runtime_ap_ifs = (type(src.runtime_ap_ifs) == 'object') ? src.runtime_ap_ifs : {};
+	let seen_wifi_ifs = {};
 
 	for (let wcfg in uci_wifi) {
 		if (!wcfg || !wcfg.ifname) continue;
-		let rt_ap = runtime_ap_ifs[wcfg.ifname];
-		let lnk = links[wcfg.ifname];
-		let obs_up = !!(rt_ap && rt_ap.up && (!p_links.ok || (lnk && lnk.up)));
-		ap_nodes[wcfg.ifname] = {
-			id: 'ap:' + wcfg.ifname,
-			ifname: wcfg.ifname,
-			radio: wcfg.device || '',
-			ssid: wcfg.ssid || '',
+		let ifname = wcfg.ifname;
+		seen_wifi_ifs[ifname] = true;
+		let cfg_mode = lc(trim(wcfg.mode || ''));
+		if (!VALID_WIFI_MODES[cfg_mode]) cfg_mode = 'unknown';
+
+		let rt_ap = runtime_ap_ifs[ifname];
+		let rt_mode = (rt_ap && rt_ap.mode) ? lc(trim(rt_ap.mode)) : '';
+		if (rt_mode != '' && !VALID_WIFI_MODES[rt_mode]) rt_mode = 'unknown';
+
+		let mode_conflict = (cfg_mode != 'unknown' && rt_mode != '' && cfg_mode != rt_mode);
+		if (mode_conflict) {
+			push(conflicts, { type: 'wireless_mode_mismatch', ifname: ifname, detail: 'UCI mode ' + cfg_mode + ' != runtime mode ' + rt_mode });
+		}
+
+		let effective_mode = (rt_mode != '') ? rt_mode : cfg_mode;
+		let lnk = links[ifname];
+		let obs_up = !!(rt_ap && rt_ap.up && !mode_conflict && (!p_links.ok || (lnk && lnk.operational_up)));
+		let ev_src = (rt_ap && rt_ap.up) ? (p_links.ok ? 'ubus_wireless+ip_link' : 'ubus_wireless') : 'uci_only';
+
+		let w_entry = {
+			id: (effective_mode == 'ap' ? 'ap:' : 'wifi:') + ifname,
+			ifname: ifname,
+			radio: wcfg.device || (rt_ap ? (rt_ap.radio || '') : ''),
+			ssid: wcfg.ssid || (rt_ap ? (rt_ap.ssid || '') : ''),
+			mode: effective_mode,
+			configured_mode: cfg_mode,
+			runtime_mode: rt_mode != '' ? rt_mode : 'unknown',
 			configured_disabled: !!wcfg.disabled,
 			observed_up: obs_up,
-			evidence_source: obs_up ? 'ubus_wireless+ip_link' : 'uci_only'
+			connectivity_state: lnk ? lnk.connectivity_state : 'unknown',
+			conflict: mode_conflict,
+			evidence_source: ev_src
 		};
-	}
-	for (let rt_if in sort(keys(runtime_ap_ifs))) {
-		if (!ap_nodes[rt_if]) {
-			let rt_ap = runtime_ap_ifs[rt_if];
-			let lnk = links[rt_if];
-			let obs_up = !!(rt_ap && rt_ap.up && (!p_links.ok || (lnk && lnk.up)));
-			ap_nodes[rt_if] = {
-				id: 'ap:' + rt_if,
-				ifname: rt_if,
-				radio: rt_ap.radio || '',
-				ssid: rt_ap.ssid || '',
-				configured_disabled: false,
-				observed_up: obs_up,
-				evidence_source: 'ubus_wireless'
-			};
+		push(wireless_ifaces, w_entry);
+		if (effective_mode == 'ap' && !mode_conflict) {
+			ap_nodes[ifname] = w_entry;
 		}
 	}
 
-	// 4. Client-to-AP / Port / Bridge relationships (evidence-only, never blindly attached to AP)
+	for (let rt_if in sort(keys(runtime_ap_ifs))) {
+		if (seen_wifi_ifs[rt_if]) continue;
+		let rt_ap = runtime_ap_ifs[rt_if];
+		let rt_mode = (rt_ap && rt_ap.mode) ? lc(trim(rt_ap.mode)) : 'unknown';
+		if (!VALID_WIFI_MODES[rt_mode]) rt_mode = 'unknown';
+		let lnk = links[rt_if];
+		let obs_up = !!(rt_ap && rt_ap.up && (!p_links.ok || (lnk && lnk.operational_up)));
+		let w_entry = {
+			id: (rt_mode == 'ap' ? 'ap:' : 'wifi:') + rt_if,
+			ifname: rt_if,
+			radio: rt_ap.radio || '',
+			ssid: rt_ap.ssid || '',
+			mode: rt_mode,
+			configured_mode: 'unknown',
+			runtime_mode: rt_mode,
+			configured_disabled: false,
+			observed_up: obs_up,
+			connectivity_state: lnk ? lnk.connectivity_state : 'unknown',
+			conflict: false,
+			evidence_source: 'ubus_wireless'
+		};
+		push(wireless_ifaces, w_entry);
+		if (rt_mode == 'ap') {
+			ap_nodes[rt_if] = w_entry;
+		}
+	}
+
+	// 4. Client-to-AP / Port / Bridge relationships (evidence-only, only verified APs accept station links)
 	let raw_clients = (type(src.clients) == 'array') ? src.clients : [];
 	let seen_macs = {};
 	let client_links = [];
@@ -361,6 +433,7 @@ export function build_live_topology(sources) {
 		bridges: bridge_nodes,
 		vlans: vlan_nodes,
 		aps: ap_list,
+		wireless_ifaces: wireless_ifaces,
 		clients: client_links
 	};
 };
@@ -397,6 +470,7 @@ export function select_topology_snapshot(new_snap, last_valid_snap, now_ms, max_
 		bridges: [],
 		vlans: [],
 		aps: [],
+		wireless_ifaces: [],
 		clients: []
 	};
 };

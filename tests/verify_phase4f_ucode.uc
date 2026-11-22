@@ -1,5 +1,8 @@
-// Executed directly by OpenWrt 24.10.0 & 25.12.6 ucode runtime against production backend/nms_topology.uc
+// Executed directly by OpenWrt 24.10.0 & 25.12.6 ucode runtime against production backend/nms_topology.uc & noc-helperd exec_argv_async
+import * as fs from 'fs';
+import * as uloop from 'uloop';
 import * as nms_topo from '/tmp/p3a_test/nms_topology.uc';
+import * as h_exec from '/tmp/p3a_test/helperd_exec_prod.uc';
 
 let passed = 0;
 let failed = 0;
@@ -44,10 +47,10 @@ let base_sources = {
 	fdb_raw: fdb_ok,
 	bridges: [{ name: 'br-lan', ports: ['eth1', 'wlan1'] }],
 	uci_wireless: [
-		{ ifname: 'wlan1', device: 'radio0', ssid: 'HomeAP', disabled: false },
-		{ ifname: 'wlan2', device: 'radio1', ssid: 'DisabledAP', disabled: true }
+		{ ifname: 'wlan1', device: 'radio0', ssid: 'HomeAP', mode: 'ap', disabled: false },
+		{ ifname: 'wlan2', device: 'radio1', ssid: 'DisabledAP', mode: 'ap', disabled: true }
 	],
-	runtime_ap_ifs: { wlan1: { up: true, radio: 'radio0', ssid: 'HomeAP' } },
+	runtime_ap_ifs: { wlan1: { up: true, radio: 'radio0', mode: 'ap', ssid: 'HomeAP' } },
 	wifi_stations: { 'aa:bb:cc:dd:ee:01': { ifname: 'wlan1', signal: -52 } },
 	wan_topology: { wan_ifaces: { 'pppoe-wan': true }, lan_ifaces: { 'br-lan': true, 'eth1': true, 'lo': true } },
 	clients: [
@@ -133,6 +136,84 @@ let fake_sha = function(s) { return 'abcdef0123456789'; };
 let red_ro = nms_topo.redact_topology_for_role(t_dup, 'readonly', 'boot1', fake_sha);
 let red_ad = nms_topo.redact_topology_for_role(t_dup, 'admin', 'boot1', fake_sha);
 check(red_ro.clients[0].mac == 'HIDDEN' && substr(red_ro.clients[0].ip, 0, 7) == 'PSEUDO-' && length(red_ro.conflicts) == 0 && red_ad.clients[0].mac == 'aa:bb:cc:dd:ee:01' && length(red_ad.conflicts) > 0, 'P4F-RBAC[readonly_redacted_admin_full]');
+
+// 16. P1-1: Wireless interface classification distinguishes AP vs STA, mesh, monitor, unknown, and mode mismatch
+let s_wmodes = {}; for (let k in keys(base_sources)) s_wmodes[k] = base_sources[k];
+s_wmodes.uci_wireless = [
+	{ ifname: 'wlan1', device: 'radio0', ssid: 'HomeAP', mode: 'ap', disabled: false },
+	{ ifname: 'wlan_sta', device: 'radio1', ssid: 'Uplink', mode: 'sta', disabled: false },
+	{ ifname: 'wlan_mesh', device: 'radio1', ssid: 'MeshNet', mode: 'mesh', disabled: false },
+	{ ifname: 'wlan_mon', device: 'radio1', ssid: '', mode: 'monitor', disabled: false },
+	{ ifname: 'wlan_unk', device: 'radio1', ssid: 'Mystery', mode: '', disabled: false },
+	{ ifname: 'wlan_mis', device: 'radio1', ssid: 'Mismatch', mode: 'ap', disabled: false }
+];
+s_wmodes.runtime_ap_ifs = {
+	wlan1: { up: true, radio: 'radio0', mode: 'ap', ssid: 'HomeAP' },
+	wlan_sta: { up: true, radio: 'radio1', mode: 'sta', ssid: 'Uplink' },
+	wlan_mesh: { up: true, radio: 'radio1', mode: 'mesh', ssid: 'MeshNet' },
+	wlan_mon: { up: true, radio: 'radio1', mode: 'monitor', ssid: '' },
+	wlan_mis: { up: true, radio: 'radio1', mode: 'sta', ssid: 'Mismatch' }
+};
+s_wmodes.wifi_stations = {
+	'aa:bb:cc:dd:ee:01': { ifname: 'wlan1', signal: -50 },
+	'aa:bb:cc:dd:ee:03': { ifname: 'wlan_sta', signal: -60 } // station on STA iface must NOT link as AP client
+};
+let t_wm = nms_topo.build_live_topology(s_wmodes);
+let ap_names = map(t_wm.aps, (a) => a.ifname);
+let has_mis_conflict = length(filter(t_wm.conflicts, (cf) => cf.type == 'wireless_mode_mismatch')) == 1;
+check(
+	length(t_wm.aps) == 1 && ap_names[0] == 'wlan1' && length(t_wm.wireless_ifaces) == 6 &&
+	has_mis_conflict && t_wm.clients[0].parent_id == 'ap:wlan1' && t_wm.clients[2].parent_id != 'ap:wlan_sta',
+	'P4F-WIFI[ap_vs_sta_mesh_monitor_unknown_and_mismatch]'
+);
+
+// 17. P1-2: Separate administrative UP from operational connectivity (operstate & carrier)
+let link_cases = sprintf('%J', [
+	{ ifname: 'if_op_down', operstate: 'DOWN', flags: ['UP'], address: '02:00:00:00:00:01' },
+	{ ifname: 'if_lldown', operstate: 'LOWERLAYERDOWN', flags: ['UP'], address: '02:00:00:00:00:02' },
+	{ ifname: 'if_miss_op', flags: ['UP'], address: '02:00:00:00:00:03' },
+	{ ifname: 'if_nocarrier', operstate: 'UP', flags: ['UP'], address: '02:00:00:00:00:04' },
+	{ ifname: 'if_adm_down', operstate: 'DOWN', flags: [], address: '02:00:00:00:00:05' },
+	{ ifname: 'if_true_up', operstate: 'UP', flags: ['UP', 'LOWER_UP'], address: '02:00:00:00:00:06' }
+]);
+let pl = nms_topo.parse_ip_links(link_cases, { if_nocarrier: false, if_true_up: true });
+check(
+	pl.ok &&
+	pl.links.if_op_down.admin_up === true && pl.links.if_op_down.operational_up === false && pl.links.if_op_down.connectivity_state == 'down' &&
+	pl.links.if_lldown.admin_up === true && pl.links.if_lldown.operational_up === false && pl.links.if_lldown.connectivity_state == 'lowerlayerdown' &&
+	pl.links.if_miss_op.admin_up === true && pl.links.if_miss_op.operational_up === false && pl.links.if_miss_op.connectivity_state == 'unknown' &&
+	pl.links.if_nocarrier.admin_up === true && pl.links.if_nocarrier.operational_up === false && pl.links.if_nocarrier.connectivity_state == 'no_carrier' &&
+	pl.links.if_adm_down.admin_up === false && pl.links.if_adm_down.operational_up === false && pl.links.if_adm_down.connectivity_state == 'admin_down' &&
+	pl.links.if_true_up.admin_up === true && pl.links.if_true_up.operational_up === true && pl.links.if_true_up.connectivity_state == 'up',
+	'P4F-LINK[admin_up_vs_operational_connectivity_all_6_cases]'
+);
+
+// 18. P1-2 applied to WAN: WAN with UP flag but operstate=DOWN must have observed_up=false
+let s_wandown = {}; for (let k in keys(base_sources)) s_wandown[k] = base_sources[k];
+s_wandown.ip_link_raw = sprintf('%J', [{ ifname: 'pppoe-wan', operstate: 'DOWN', flags: ['UP'], address: '' }]);
+let t_wd = nms_topo.build_live_topology(s_wandown);
+check(t_wd.wan_links[0].admin_up === true && t_wd.wan_links[0].observed_up === false && t_wd.wan_links[0].connectivity_state == 'down', 'P4F-WAN[admin_up_operstate_down_not_connected]');
+
+// 19. P1-3: exec_argv_async terminates timed-out child process, executes callback once, leaves no background process
+uloop.init();
+let exec_cb_count = 0;
+let exec_res = null;
+h_exec.exec_argv_async('/bin/sleep', ['5'], 150, 65536, function(r) {
+	exec_cb_count++;
+	exec_res = r;
+	uloop.end();
+});
+uloop.run();
+let all_pids_dead = true;
+for (let kp in (exec_res && exec_res.killed_pids ? exec_res.killed_pids : [])) {
+	if (fs.stat('/proc/' + kp)) all_pids_dead = false;
+}
+check(
+	exec_cb_count == 1 && exec_res && exec_res.ok === false && exec_res.error_code == 'TIMEOUT' &&
+	exec_res.killed === true && length(exec_res.killed_pids || []) >= 1 && all_pids_dead,
+	'P4F-EXEC[timeout_kills_process_tree_and_single_callback]',
+	sprintf('%J', exec_res)
+);
 
 printf('UCODE4F_SUMMARY: %d passed, %d failed\n', passed, failed);
 exit(failed == 0 ? 0 : 1);

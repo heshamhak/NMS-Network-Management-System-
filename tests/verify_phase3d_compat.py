@@ -261,7 +261,7 @@ EXPECTED_SUITES = {
     "verify_phase4c_ucode.uc": ("UCODE4C_SUMMARY", 17),
     "verify_phase4d_ucode.uc": ("UCODE4D_SUMMARY", 16),
     "verify_phase4e_ucode.uc": ("UCODE4E_SUMMARY", 23),
-    "verify_phase4f_ucode.uc": ("UCODE4F_SUMMARY", 15),
+    "verify_phase4f_ucode.uc": ("UCODE4F_SUMMARY", 19),
 }
 
 
@@ -335,6 +335,12 @@ def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_s
             shutil.copy2(src_mod, dst_lib)
         with open(os.path.join(p3a_dir, "helperd_aw_prod.uc"), "w", encoding="utf-8") as f:
             f.write(helperd_prod_src)
+        h_raw = open(os.path.join(REPO_ROOT, "backend", "noc-helperd"), "r", encoding="utf-8").read()
+        m_exec = re.search(r"(function kill_pid_tree\(.*?\n\}\n\nfunction exec_argv_async\(.*?\n\})", h_raw, re.S)
+        if not m_exec:
+            raise RuntimeError("Failed to extract kill_pid_tree/exec_argv_async from backend/noc-helperd")
+        with open(os.path.join(p3a_dir, "helperd_exec_prod.uc"), "w", encoding="utf-8") as f:
+            f.write("import * as fs from 'fs';\nimport * as uloop from 'uloop';\nconst CAP_GENERAL = 65536;\n" + m_exec.group(1) + "\nexport { exec_argv_async };\n")
         shutil.copy2(os.path.join(REPO_ROOT, "tests", script_name), os.path.join(p3a_dir, script_name))
 
         vec_dir = os.path.join(p3a_dir, "vec")
@@ -346,8 +352,12 @@ def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_s
         else:
             args = ["/tmp/p3a_test/vec"]
 
+        os.makedirs(os.path.join(rootfs_dir, "proc"), exist_ok=True)
+        unshare_cmd = ["unshare", "-r"]
+        if script_name == "verify_phase4f_ucode.uc":
+            unshare_cmd = ["unshare", "-rpf", f"--mount-proc={os.path.join(rootfs_dir, 'proc')}"]
         res = run_fn(
-            ["unshare", "-r", "/usr/sbin/chroot", rootfs_dir, "/usr/bin/ucode", f"/tmp/p3a_test/{script_name}"] + args,
+            unshare_cmd + ["/usr/sbin/chroot", rootfs_dir, "/usr/bin/ucode", f"/tmp/p3a_test/{script_name}"] + args,
             capture_output=True, text=True, timeout=30
         )
         ok, detail = evaluate_ucode_suite_output(script_name, res.returncode, res.stdout)

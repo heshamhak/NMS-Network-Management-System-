@@ -548,27 +548,58 @@ function release_lock() {
 	if (fs.stat(lp)) fs.unlink(lp);
 }
 
-// --- Non-shell async command capture with byte cap & timeout ---
+// --- Non-shell async command capture with byte cap, timeout & process-tree termination ---
+function kill_pid_tree(tpid) {
+	if (!tpid || tpid <= 0) return [];
+	let killed = [];
+	let ch_raw = fs.readfile('/proc/' + tpid + '/task/' + tpid + '/children');
+	if (ch_raw) {
+		for (let p in filter(split(trim(ch_raw), ' '), (x) => match(x, /^[0-9]+$/))) {
+			push(killed, +p);
+			system(['/bin/kill', '-TERM', p]);
+			system(['/bin/kill', '-9', p]);
+		}
+	}
+	push(killed, tpid);
+	system(['/bin/kill', '-TERM', '' + tpid]);
+	system(['/bin/kill', '-9', '' + tpid]);
+	return killed;
+}
+
 function exec_argv_async(abs_exe, argv, timeout_ms, max_bytes, cb) {
 	if (!fs.stat(abs_exe)) {
-		cb({ ok: false, exit_code: -1, output: '', error_code: 'UNSUPPORTED', overflow: false });
+		cb({ ok: false, exit_code: -1, output: '', error_code: 'UNSUPPORTED', killed: false, overflow: false });
 		return;
 	}
 	let pp = fs.pipe();
 	if (!pp) {
-		cb({ ok: false, exit_code: -1, output: '', error_code: 'INTERNAL', overflow: false });
+		cb({ ok: false, exit_code: -1, output: '', error_code: 'INTERNAL', killed: false, overflow: false });
 		return;
 	}
 	let done = false;
+	let task = null;
+	let pid_pp = fs.pipe();
 	let timer = uloop.timer(timeout_ms || 8000, function() {
 		if (done) return;
 		done = true;
+		let tpid = (task && task.pid) ? task.pid() : null;
+		if (!tpid && pid_pp) {
+			let rpid = trim(pid_pp[0].read(32) || '');
+			if (match(rpid, /^[0-9]+$/)) tpid = +rpid;
+		}
+		if (pid_pp) try { pid_pp[0].close(); } catch (e) {}
+		let k_pids = kill_pid_tree(tpid);
 		try { pp[0].close(); } catch (e) {}
-		cb({ ok: false, exit_code: -1, output: '', error_code: 'TIMEOUT', overflow: false });
+		cb({ ok: false, exit_code: -1, output: '', error_code: 'TIMEOUT', killed: length(k_pids) > 0, killed_pids: k_pids, overflow: false });
 	});
 
-	let task = null;
 	task = uloop.task(function() {
+		if (pid_pp) {
+			pid_pp[0].close();
+			let sp = fs.readlink('/proc/self') || '';
+			if (sp != '') pid_pp[1].write(sp + '\n');
+			pid_pp[1].close();
+		}
 		pp[0].close();
 		let wfd = pp[1].fileno();
 		if (wfd != 1) fs.dup2(wfd, 1);
@@ -579,6 +610,7 @@ function exec_argv_async(abs_exe, argv, timeout_ms, max_bytes, cb) {
 		return system(full_argv);
 	}, function(rc) {
 		task = null;
+		if (pid_pp) try { pid_pp[0].close(); } catch (e) {}
 		if (done) return;
 		done = true;
 		timer.cancel();
@@ -604,6 +636,7 @@ function exec_argv_async(abs_exe, argv, timeout_ms, max_bytes, cb) {
 		}
 	});
 	pp[1].close();
+	if (pid_pp) pid_pp[1].close();
 	if (!task) {
 		done = true;
 		timer.cancel();
@@ -2091,9 +2124,32 @@ function handle_rpc(req, reply_cb) {
 		return;
 	}
 
+let topology_inflight_cbs = null;
+
 	if (verb == 'topology_read') {
+		if (topology_inflight_cbs != null) {
+			push(topology_inflight_cbs, reply_cb);
+			return;
+		}
+		topology_inflight_cbs = [reply_cb];
+		let finish_all_topo = function(payload) {
+			let cbs = topology_inflight_cbs || [];
+			topology_inflight_cbs = null;
+			for (let fcb in cbs) fcb(payload);
+		};
 		let br_entries = fs.lsdir('/sys/class/net/br-lan/brif') || [];
 		let bridges = nms_discovery.discover_bridges_from_sysfs('/sys/class/net');
+		let carrier_map = {};
+		let net_devs = fs.lsdir('/sys/class/net') || [];
+		for (let nd in net_devs) {
+			if (nd == '.' || nd == '..') continue;
+			let car = fs.readfile('/sys/class/net/' + nd + '/carrier');
+			if (car != null) {
+				let ct = trim(car);
+				if (ct == '1') carrier_map[nd] = true;
+				else if (ct == '0') carrier_map[nd] = false;
+			}
+		}
 		let cur0 = null;
 		try { cur0 = uci.cursor(); } catch (e) {}
 		let uci_wireless = [];
@@ -2104,7 +2160,7 @@ function handle_rpc(req, reply_cb) {
 						ifname: s.ifname || '',
 						device: s.device || '',
 						ssid: s.ssid || '',
-						mode: s.mode || 'ap',
+						mode: s.mode || '',
 						disabled: (s.disabled == '1')
 					});
 				});
@@ -2132,6 +2188,7 @@ function handle_rpc(req, reply_cb) {
 								runtime_ap_ifs[itf.ifname] = {
 									up: !!rinfo.up,
 									radio: rad,
+									mode: (itf.config && itf.config.mode) ? itf.config.mode : '',
 									ssid: (itf.config && itf.config.ssid) ? itf.config.ssid : ''
 								};
 								let hc = uctx.call('hostapd.' + itf.ifname, 'get_clients');
@@ -2155,13 +2212,14 @@ function handle_rpc(req, reply_cb) {
 			exec_argv_async('/sbin/ip', ['-j', 'addr', 'show'], 3500, CAP_GENERAL, function(r_addr) {
 				exec_argv_async('/sbin/ip', ['-j', 'route', 'show'], 3500, CAP_GENERAL, function(r_route) {
 					let finish_topo = function(vlan_raw, vlan_ok, fdb_raw, fdb_ok) {
-						reply_cb({
+						finish_all_topo({
 							ok: true,
 							ip_link_raw: r_link.ok ? r_link.output : null,
 							ip_addr_raw: r_addr.ok ? r_addr.output : null,
 							ip_route_raw: r_route.ok ? r_route.output : null,
 							bridge_vlan_raw: vlan_ok ? vlan_raw : null,
 							fdb_raw: fdb_ok ? fdb_raw : '',
+							carrier_map: carrier_map,
 							bridges: bridges,
 							uci_wireless: uci_wireless,
 							runtime_ap_ifs: runtime_ap_ifs,
