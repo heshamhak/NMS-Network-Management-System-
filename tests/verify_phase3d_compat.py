@@ -262,7 +262,7 @@ EXPECTED_SUITES = {
     "verify_phase4d_ucode.uc": ("UCODE4D_SUMMARY", 16),
     "verify_phase4e_ucode.uc": ("UCODE4E_SUMMARY", 23),
     "verify_phase4f_ucode.uc": ("UCODE4F_SUMMARY", 21),
-    "verify_phase5b_ucode.uc": ("UCODE5B_SUMMARY", 20),
+    "verify_phase5b_ucode.uc": ("UCODE5B_SUMMARY", 22),
 }
 
 
@@ -368,7 +368,7 @@ def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_s
                     "const BACKUP_MAX_B64 = 3 * 1024 * 1024;\n"
                     "let RUN_DIR = '/tmp/p3a_test/run5b';\n"
                     "let ROOT_MAP = '/tmp/p3a_test/root5b';\n"
-                    "let cfg = { fail_write_target: null, fail_rollback_target: null, fail_reload_svc: null, lock_held: false, freeze_calls: [], audits: [], reloads: [], in_rollback: false };\n"
+                    "let cfg = { fail_write_target: null, fail_rollback_target: null, fail_reload_svc: null, fail_rollback_reload_svc: null, lock_held: false, freeze_calls: [], audits: [], reloads: [], in_rollback: false };\n"
                     "function map_path(p) {\n"
                     "  if (type(p) == 'string' && (index(p, '/etc/config/') == 0 || index(p, '/etc/noc-console/') == 0 || p == '/etc/config' || p == '/etc/noc-console')) return ROOT_MAP + p;\n"
                     "  if (type(p) == 'string' && index(p, '/etc/init.d/') == 0) return ROOT_MAP + p;\n"
@@ -413,6 +413,10 @@ def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_s
                     "    if (cfg.fail_reload_svc && svc == cfg.fail_reload_svc && !cfg.in_rollback) {\n"
                     "      cfg.in_rollback = true;\n"
                     "      cb({ ok: false, error: 'injected_reload_fail_' + svc });\n"
+                    "      return;\n"
+                    "    }\n"
+                    "    if (cfg.fail_rollback_reload_svc && svc == cfg.fail_rollback_reload_svc && cfg.in_rollback) {\n"
+                    "      cb({ ok: false, error: 'injected_rollback_reload_fail_' + svc });\n"
                     "      return;\n"
                     "    }\n"
                     "    cb({ ok: true, output: '' });\n"

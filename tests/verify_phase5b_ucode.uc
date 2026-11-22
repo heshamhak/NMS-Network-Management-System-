@@ -43,6 +43,7 @@ function reset_sandbox() {
 	prod.cfg.fail_write_target = null;
 	prod.cfg.fail_rollback_target = null;
 	prod.cfg.fail_reload_svc = null;
+	prod.cfg.fail_rollback_reload_svc = null;
 	prod.cfg.lock_held = false;
 	prod.cfg.in_rollback = false;
 	prod.cfg.freeze_calls = [];
@@ -304,6 +305,39 @@ reset_sandbox();
 let r20 = null;
 prod.run_restore('admin', {}, (x) => { r20 = x; });
 check(r20 && r20.ok === false && r20.error_code == 'VALIDATION' && !prod.cfg.lock_held, 'P5B-PROD[empty_payload_rejected]');
+
+// ===================================================================
+// 21. P5B-PROD-11: Configs rollback service-reload failure triggers emergency freeze
+// ===================================================================
+reset_sandbox();
+prod.cfg.fail_reload_svc = 'firewall';
+prod.cfg.fail_rollback_reload_svc = 'firewall';
+let r21 = null;
+prod.run_restore('admin', {
+	configs: {
+		network: { lan: { '.type': 'interface', '.name': 'lan', proto: 'static', ipaddr: '10.66.66.1' } },
+		firewall: { def: { '.type': 'defaults', '.anonymous': true, input: 'DROP' } }
+	}
+}, (x) => { r21 = x; });
+check(
+	r21 && r21.ok === false && length(prod.cfg.freeze_calls) == 1 && !prod.cfg.lock_held,
+	'P5B-PROD[configs_rollback_reload_failure_triggers_freeze]',
+	sprintf('%J', r21)
+);
+
+// ===================================================================
+// 22. P5B-PROD-12: Archive rollback service-reload failure triggers emergency freeze
+// ===================================================================
+reset_sandbox();
+prod.cfg.fail_reload_svc = 'network';
+prod.cfg.fail_rollback_reload_svc = 'network';
+let r22 = null;
+prod.run_restore('admin', { archive_b64: arc11.b64 }, (x) => { r22 = x; });
+check(
+	r22 && r22.ok === false && length(prod.cfg.freeze_calls) == 1 && !prod.cfg.lock_held,
+	'P5B-PROD[archive_rollback_reload_failure_triggers_freeze]',
+	sprintf('%J', r22)
+);
 
 printf('UCODE5B_SUMMARY: %d passed, %d failed\n', passed, failed);
 exit(failed == 0 ? 0 : 1);

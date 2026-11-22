@@ -6,24 +6,27 @@ set -eu
 REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-echo "=== [1/5] Static & Security/WCAG/Schema Suite (verify_noc_p15.py) ==="
-python3 tests/verify_noc_p15.py
+run_strict() {
+  _label="$1"
+  _cmd="$2"
+  _allow_live_skip="${3:-0}"
+  echo "=== $_label ==="
+  _out="$(sh -c "$_cmd")"
+  printf '%s\n' "$_out"
+  if printf '%s\n' "$_out" | grep -Eq "SUMMARY:.*[1-9][0-9]* failed"; then
+    echo "CI ERROR: $_label reported failed tests!" >&2
+    exit 1
+  fi
+  if [ "$_allow_live_skip" != "1" ] && printf '%s\n' "$_out" | grep -Eq "(\[SKIP\]|[1-9][0-9]* skipped)"; then
+    echo "CI ERROR: $_label reported skipped tests!" >&2
+    exit 1
+  fi
+}
 
-echo "=== [2/5] Local & Integration Suite (verify_nms_local.py) ==="
-python3 tests/verify_nms_local.py
-
-echo "=== [3/5] OpenWrt 24.10.0 & 25.12.6 Chroot Compatibility Suite (verify_phase3d_compat.py) ==="
-OUT_3D="$(python3 tests/verify_phase3d_compat.py)"
-printf '%s\n' "$OUT_3D"
-if ! printf '%s\n' "$OUT_3D" | grep -Eq "PHASE 3D SUMMARY: [0-9]+ passed, 0 failed, 0 skipped"; then
-  echo "CI ERROR: verify_phase3d_compat.py had failures or skipped tests!" >&2
-  exit 1
-fi
-
-echo "=== [4/5] OpenWrt Native Packaging, Signing & Migration Suite (verify_phase5a_pkg.py) ==="
-python3 tests/verify_phase5a_pkg.py
-
-echo "=== [5/5] Frontend RBAC, Restore Parity & SSE Suite (verify_phase5c_ui.py) ==="
-python3 tests/verify_phase5c_ui.py
+run_strict "[1/5] Static & Security/WCAG/Schema Suite (verify_noc_p15.py)" "python3 tests/verify_noc_p15.py" 1
+run_strict "[2/5] Local & Integration Suite (verify_nms_local.py)" "python3 tests/verify_nms_local.py" 0
+run_strict "[3/5] OpenWrt 24.10.0 & 25.12.6 Chroot Compatibility Suite (verify_phase3d_compat.py)" "python3 tests/verify_phase3d_compat.py" 0
+run_strict "[4/5] OpenWrt Native Packaging, Signing & Migration Suite (verify_phase5a_pkg.py)" "python3 tests/verify_phase5a_pkg.py" 0
+run_strict "[5/5] Frontend RBAC, Restore Parity & SSE Suite (verify_phase5c_ui.py)" "python3 tests/verify_phase5c_ui.py" 0
 
 echo "=== ALL NMS CI SUITES PASSED (0 failed, 0 skipped) ==="

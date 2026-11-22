@@ -3541,17 +3541,18 @@ function handle_rpc(req, reply_cb) {
 			reload_services_seq(svcs, function(rel_res) {
 				if (!rel_res.ok) {
 					let rb_success = do_json_rollback();
-					reload_services_seq(svcs, function() {
-						if (!rb_success) {
+					reload_services_seq(svcs, function(rb_rel_res) {
+						if (!rb_success || !rb_rel_res || !rb_rel_res.ok) {
 							release_lock();
+							let rb_err = (!rb_success ? 'file_rollback_failed' : '') + ((!rb_rel_res || !rb_rel_res.ok) ? (' rollback_reload_failed:' + ((rb_rel_res && rb_rel_res.error) || 'unknown')) : '');
 							let fr = enter_emergency_freeze('sys_backup_restore configs reload+rollback failed');
-							audit_append(actor, 'sys_backup_restore', 'json_configs', 'rollback_failed', 'reload_error=' + rel_res.error + ' freeze_persisted=' + (fr.freeze_persisted ? '1' : '0'));
-							reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل إعادة تحميل الخدمات وفشل التراجع — تم تجميد التعديلات', errors: [rel_res.error] });
+							audit_append(actor, 'sys_backup_restore', 'json_configs', 'rollback_failed', 'reload_error=' + rel_res.error + ' ' + trim(rb_err) + ' freeze_persisted=' + (fr.freeze_persisted ? '1' : '0'));
+							reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل إعادة تحميل الخدمات وفشل التراجع — تم تجميد التعديلات', errors: [rel_res.error, trim(rb_err)] });
 						} else {
 							rm_rf(rb_dir);
 							release_lock();
 							audit_append(actor, 'sys_backup_restore', 'json_configs', 'rolled_back', 'reload_error=' + rel_res.error);
-							reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل إعادة تحميل الخدمات — تم التراجع إلى الحالة السابقة', errors: [rel_res.error] });
+							reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل إعادة تحميل الخدمات — تم التراجع إلى الحالة السابقة وإعادة تحميل الخدمات', errors: [rel_res.error] });
 						}
 					});
 					return;
@@ -3811,17 +3812,18 @@ function handle_rpc(req, reply_cb) {
 						rm_rf(stage_dir);
 						if (!rel_res.ok) {
 							let rb_success = do_rollback();
-							reload_services_seq(svcs, function() {
-								if (!rb_success) {
+							reload_services_seq(svcs, function(rb_rel_res) {
+								if (!rb_success || !rb_rel_res || !rb_rel_res.ok) {
 									release_lock();
+									let rb_err = (!rb_success ? 'file_rollback_failed' : '') + ((!rb_rel_res || !rb_rel_res.ok) ? (' rollback_reload_failed:' + ((rb_rel_res && rb_rel_res.error) || 'unknown')) : '');
 									let fr = enter_emergency_freeze('sys_backup_restore reload+rollback failed');
-									audit_append(actor, 'sys_backup_restore', 'archive', 'rollback_failed', 'reload_error=' + rel_res.error + ' freeze_persisted=' + (fr.freeze_persisted ? '1' : '0'));
-									reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل إعادة تحميل الخدمات وفشل التراجع — تم تجميد التعديلات', errors: [rel_res.error] });
+									audit_append(actor, 'sys_backup_restore', 'archive', 'rollback_failed', 'reload_error=' + rel_res.error + ' ' + trim(rb_err) + ' freeze_persisted=' + (fr.freeze_persisted ? '1' : '0'));
+									reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل إعادة تحميل الخدمات وفشل التراجع — تم تجميد التعديلات', errors: [rel_res.error, trim(rb_err)] });
 								} else {
 									rm_rf(rb_dir);
 									release_lock();
 									audit_append(actor, 'sys_backup_restore', 'archive', 'rolled_back', 'reload_error=' + rel_res.error);
-									reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل إعادة تحميل الخدمات — تم التراجع إلى الحالة السابقة', errors: [rel_res.error] });
+									reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل إعادة تحميل الخدمات — تم التراجع إلى الحالة السابقة وإعادة تحميل الخدمات', errors: [rel_res.error] });
 								}
 							});
 							return;
