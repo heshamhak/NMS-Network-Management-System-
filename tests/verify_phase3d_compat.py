@@ -285,12 +285,12 @@ def restore_preexisting_entry(dst_lib, entry_info, chown_fn=os.chown, lchown_fn=
     elif kind == "reg":
         with open(dst_lib, "wb") as bf:
             bf.write(data)
-        os.chmod(dst_lib, mode)
         cur_st = os.lstat(dst_lib)
         if cur_st.st_uid != uid or cur_st.st_gid != gid:
             chown_fn(dst_lib, uid, gid)
+        os.chmod(dst_lib, mode)
         ver_st = os.lstat(dst_lib)
-        if (not stat.S_ISREG(ver_st.st_mode) or (ver_st.st_mode & 0o777) != mode
+        if (not stat.S_ISREG(ver_st.st_mode) or stat.S_IMODE(ver_st.st_mode) != mode
                 or ver_st.st_uid != uid or ver_st.st_gid != gid or open(dst_lib, "rb").read() != data):
             raise RuntimeError(f"Failed to verify restored regular file {dst_lib}")
     else:
@@ -321,7 +321,7 @@ def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_s
                     # Unlink symlink BEFORE copying so we NEVER overwrite the symlink target
                     os.unlink(dst_lib)
                 elif stat.S_ISREG(st.st_mode):
-                    preexisting_backups.append((dst_lib, ("reg", open(dst_lib, "rb").read(), st.st_mode & 0o777, st.st_uid, st.st_gid)))
+                    preexisting_backups.append((dst_lib, ("reg", open(dst_lib, "rb").read(), stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid)))
                 else:
                     raise RuntimeError(f"Unsupported pre-existing entry type at {dst_lib}: mode={oct(st.st_mode)}")
             else:
@@ -678,6 +678,24 @@ def test_harness_integrity(prod_slice):
                 and stat.S_ISLNK(os.lstat(broken_link).st_mode),
                 "P3D-HARNESS[cleanup_and_restore_after_subprocess_timeout]"
             )
+
+            # Verify setuid (0o4755), setgid (0o2755), and sticky (0o1777) special permission bits restoration
+            for sp_mode, sp_name in ((0o4755, "setuid_4755"), (0o2755, "setgid_2755"), (0o1777, "sticky_1777")):
+                sp_bytes = f"// SPECIAL {sp_name}\n".encode()
+                with open(sentinel_reg, "wb") as f:
+                    f.write(sp_bytes)
+                os.chmod(sentinel_reg, sp_mode)
+                sp_orig = os.lstat(sentinel_reg)
+                run_ucode_suite_in_chroot(sb, f"special-{sp_name}", "verify_phase3b_ucode.uc", prod_slice)
+                sp_after = os.lstat(sentinel_reg)
+                sp_ok = (
+                    stat.S_ISREG(sp_after.st_mode)
+                    and stat.S_IMODE(sp_after.st_mode) == sp_mode
+                    and sp_after.st_uid == sp_orig.st_uid
+                    and sp_after.st_gid == sp_orig.st_gid
+                    and open(sentinel_reg, "rb").read() == sp_bytes
+                )
+                check(sp_ok, f"P3D-HARNESS[preserves_special_mode_{sp_name}]", f"mode={oct(stat.S_IMODE(sp_after.st_mode))}")
 
             # Ownership restoration failure check (must NOT silently ignore PermissionError)
             st_reg = os.lstat(sentinel_reg)
