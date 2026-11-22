@@ -580,49 +580,75 @@ start_service
 """
     subprocess.run(["sh", "-c", harness_sh], capture_output=True, text=True)
     procd_txt = open(procd_log).read() if os.path.isfile(procd_log) else ""
-    socat_args = next((l[len("PARAM=command "):].split() for l in procd_txt.splitlines() if l.startswith("PARAM=command /usr/bin/socat ")), None)
+    tls_proxy_args = None
+    in_tls_inst = False
+    for line in procd_txt.splitlines():
+        if line.startswith("INSTANCE="):
+            in_tls_inst = (line == "INSTANCE=noc_tls_proxy")
+        elif in_tls_inst and line.startswith("PARAM=command "):
+            tls_proxy_args = line[len("PARAM=command "):].split()
+            break
 
-    if socat_args and shutil.which("socat"):
+    if tls_proxy_args and os.path.exists(tls_proxy_args[0]):
         class LoopbackHandler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
+                body = b"NMS_SIM_PROCD_TLS_OK"
                 self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
                 self.end_headers()
-                self.wfile.write(b"NMS_SIM_PROCD_TLS_OK")
+                self.wfile.write(body)
             def log_message(self, *args):
                 pass
 
         srv = http.server.HTTPServer(("127.0.0.1", http_p), LoopbackHandler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        socat_proc = subprocess.Popen(socat_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proxy_proc = subprocess.Popen(tls_proxy_args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
             connected = False
+            last_err = ""
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-            for _ in range(25):
+            for _ in range(30):
                 try:
-                    with socket.create_connection((lan_sim_ip, https_p), timeout=1.0) as raw_s:
+                    with socket.create_connection((lan_sim_ip, https_p), timeout=1.5) as raw_s:
                         with ctx.wrap_socket(raw_s, server_hostname="nms.lan") as tls_s:
+                            tls_s.settimeout(2.0)
                             der = tls_s.getpeercert(binary_form=True)
                             sha256_hex = hashlib.sha256(der).hexdigest().upper()
                             fp_text = open(fp_p).read().replace(":", "").upper()
                             tls_s.sendall(b"GET / HTTP/1.1\r\nHost: nms.lan\r\nConnection: close\r\n\r\n")
-                            if b"NMS_SIM_PROCD_TLS_OK" in tls_s.recv(4096) and sha256_hex in fp_text:
-                                ok(f"SEC-01 (simulated procd): TLS handshake + HTTP via socat on {lan_sim_ip}:{https_p} -> 127.0.0.1:{http_p} passed")
+                            chunks = []
+                            while True:
+                                try:
+                                    part = tls_s.recv(4096)
+                                except socket.timeout:
+                                    break
+                                if not part:
+                                    break
+                                chunks.append(part)
+                                if b"NMS_SIM_PROCD_TLS_OK" in b"".join(chunks):
+                                    break
+                            resp_bytes = b"".join(chunks)
+                            if b"NMS_SIM_PROCD_TLS_OK" in resp_bytes and sha256_hex in fp_text:
+                                ok(f"SEC-01 (simulated procd): TLS handshake + HTTP via {os.path.basename(tls_proxy_args[0])} on {lan_sim_ip}:{https_p} -> 127.0.0.1:{http_p} passed")
                                 connected = True
                                 break
-                except OSError:
+                            last_err = f"unexpected resp={resp_bytes!r}"
+                except OSError as exc:
+                    last_err = str(exc)
                     time.sleep(0.1)
             if not connected:
-                fail("SEC-01 (simulated procd): TLS connection failed")
+                fail(f"SEC-01 (simulated procd): TLS connection failed ({last_err})")
             try:
                 with socket.create_connection((lan_sim_ip, http_p), timeout=0.5):
                     fail(f"SEC-01: unencrypted HTTP reachable on {lan_sim_ip}:{http_p}")
             except OSError:
                 ok(f"SEC-01: unencrypted HTTP refused on LAN IP {lan_sim_ip}:{http_p} (loopback-only confirmed)")
         finally:
-            socat_proc.terminate()
-            socat_proc.wait(timeout=3)
+            proxy_proc.terminate()
+            proxy_proc.wait(timeout=3)
             srv.shutdown()
             srv.server_close()
 
