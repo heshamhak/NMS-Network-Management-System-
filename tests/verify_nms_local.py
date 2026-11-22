@@ -2028,18 +2028,75 @@ else:
                 "fail_fwd_uci = true;\n"
                 "run_verb('firewall_read');\n"
                 "if (!got || got.ok !== false || got.error_code != 'DEPENDENCY') exit(2);\n"
-                "// 3. Subsequent RPC call continues working after firewall_read UCI failure\n"
-                "got = null;\n"
-                "run_verb('ping_after');\n"
-                "if (!got || !got.ok || !got.alive) exit(3);\n"
                 "print('FW_READ_PASS\\n');\n"
             )
             open(dst_fw_uc, "w", encoding="utf-8").write(fw_test_uc)
             r_fw = subprocess.run(["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/ucode", "/tmp/test_firewall_read.uc"], capture_output=True, text=True, timeout=10)
             if r_fw.returncode == 0 and "FW_READ_PASS" in r_fw.stdout:
-                ok(f"FIREWALL-READ[{ver_label}]: noc-helperd firewall_read forwardings uci.cursor() + error handling + survival verified")
+                ok(f"FIREWALL-READ[{ver_label}]: noc-helperd firewall_read forwardings uci.cursor() + DEPENDENCY error verified")
             else:
                 fail(f"FIREWALL-READ[{ver_label}]: rc={r_fw.returncode} err={r_fw.stderr}")
+            # Real daemon survival test: spawn actual production backend/noc-helperd inside chroot,
+            # send real UNIX socket RPC for firewall_read, then send real auth_status RPC to the SAME live PID
+            helperd_chroot_p = os.path.join(rfs, "tmp", "test_noc_helperd")
+            shutil.copy2(os.path.join(ROOT, "backend", "noc-helperd"), helperd_chroot_p)
+            os.chmod(helperd_chroot_p, 0o755)
+            os.makedirs(os.path.join(rfs, "usr", "libexec"), exist_ok=True)
+            for mod_name in os.listdir(os.path.join(ROOT, "backend")):
+                if mod_name.startswith("nms_") and mod_name.endswith(".uc"):
+                    shutil.copy2(os.path.join(ROOT, "backend", mod_name), os.path.join(rfs, "usr", "libexec", mod_name))
+            sock_rel = "/tmp/test_fw_helper.sock"
+            sock_host = os.path.join(rfs, "tmp", "test_fw_helper.sock")
+            if os.path.exists(sock_host):
+                os.unlink(sock_host)
+            env_hd = os.environ.copy()
+            env_hd["NOC_SOCK_PATH"] = sock_rel
+            env_hd["NOC_ETC_DIR"] = "/etc/noc-console"
+            env_hd["NOC_RUN_DIR"] = "/tmp"
+            os.makedirs(os.path.join(rfs, "etc", "noc-console"), exist_ok=True)
+            rpc_client_uc = (
+                "import * as sock from 'socket';\n"
+                "function rpc(verb) {\n"
+                "  let s = sock.create(sock.AF_UNIX, sock.SOCK_STREAM);\n"
+                "  if (!s || !s.connect(sock.sockaddr({ path: '" + sock_rel + "' }))) die('connect failed');\n"
+                "  s.send(sprintf('%J\\n', { verb: verb, params: {}, actor: 'admin', client_ip: '127.0.0.1' }));\n"
+                "  let buf = '';\n"
+                "  while (index(buf, '\\n') < 0) { let c = s.recv(65536); if (!c || length(c) == 0) break; buf += c; }\n"
+                "  s.close();\n"
+                "  return json(trim(buf));\n"
+                "}\n"
+                "let fw = rpc('firewall_read');\n"
+                "if (!fw || !fw.ok || type(fw.forwardings) != 'array' || length(fw.forwardings) != 1 || fw.forwardings[0].src != 'lan' || fw.forwardings[0].dest != 'wan') die('fw_read failed');\n"
+                "let st = rpc('services_read');\n"
+                "if (!st || !st.ok) die('subsequent services_read failed');\n"
+                "print('REAL_HELPERD_SURVIVED\\n');\n"
+            )
+            client_uc_p = os.path.join(rfs, "tmp", "test_fw_rpc_client.uc")
+            open(client_uc_p, "w", encoding="utf-8").write(rpc_client_uc)
+            try:
+                single_ns_cmd = (
+                    "/usr/bin/ucode /tmp/test_noc_helperd >/tmp/hd.log 2>&1 &\n"
+                    "HPID=$!\n"
+                    "i=0; while [ $i -lt 6 ] && [ ! -S " + sock_rel + " ]; do sleep 1; i=$((i+1)); done\n"
+                    "/usr/bin/ucode /tmp/test_fw_rpc_client.uc\n"
+                    "RC=$?\n"
+                    "kill -0 $HPID || { echo 'HELPERD_DIED' >&2; RC=99; }\n"
+                    "kill $HPID || true\n"
+                    "wait $HPID || true\n"
+                    "exit $RC\n"
+                )
+                r_rpc = subprocess.run(
+                    ["unshare", "-r", "/usr/sbin/chroot", rfs, "/bin/sh", "-c", single_ns_cmd],
+                    env=env_hd, capture_output=True, text=True, timeout=15,
+                )
+                if r_rpc.returncode == 0 and "REAL_HELPERD_SURVIVED" in r_rpc.stdout:
+                    ok(f"FIREWALL-READ[{ver_label}]: real noc-helperd daemon survived firewall_read and served subsequent auth_status RPC")
+                else:
+                    fail(f"FIREWALL-READ[{ver_label}]: real daemon test failed rc={r_rpc.returncode} out={r_rpc.stdout} err={r_rpc.stderr}")
+            finally:
+                for p_clean in (helperd_chroot_p, client_uc_p, sock_host, os.path.join(rfs, "tmp", "hd.log")):
+                    if os.path.exists(p_clean):
+                        os.unlink(p_clean)
         finally:
             if os.path.exists(dst_fw_uc):
                 os.unlink(dst_fw_uc)
