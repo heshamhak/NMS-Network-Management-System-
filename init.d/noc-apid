@@ -145,20 +145,26 @@ _child=\$!
 
 _i=0
 _ready=0
+_matched_inode=""
 while [ "\$_i" -lt 50 ]; do
 	if ! kill -0 "\$_child" 2>/dev/null; then
 		wait "\$_child" 2>/dev/null || true
 		exit 1
 	fi
-	if grep -Eq ":\${PORT_HEX} [0-9A-Fa-f]+:[0-9A-Fa-f]+ 0A " /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
-		_ready=1
-		break
-	fi
+	_inodes="\$(awk -v p=":\${PORT_HEX}" '\$2 ~ p"\$" && \$4 == "0A" { print \$10 }' /proc/net/tcp /proc/net/tcp6 2>/dev/null || true)"
+	for _ino in \$_inodes; do
+		if [ -n "\$_ino" ] && [ "\$_ino" != "0" ] && ls -l "/proc/\${_child}/fd" 2>/dev/null | grep -Fq "socket:[\${_ino}]"; then
+			_matched_inode="\$_ino"
+			_ready=1
+			break
+		fi
+	done
+	[ "\$_ready" -eq 1 ] && break
 	sleep 0.1
 	_i=\$((_i + 1))
 done
 
-if [ "\$_ready" -ne 1 ]; then
+if [ "\$_ready" -ne 1 ] || [ -z "\$_matched_inode" ]; then
 	exit 1
 fi
 
@@ -166,6 +172,7 @@ cat > "\${MARKER}.tmp.\$\$" <<MKEOF
 verified=1
 engine=\${ENGINE}
 pid=\${_child}
+inode=\${_matched_inode}
 lan_ip=\${LAN_IP}
 https_port=\${HTTPS_P}
 fingerprint=\${FP_VAL}

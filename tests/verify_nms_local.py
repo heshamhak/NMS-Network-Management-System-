@@ -1620,8 +1620,30 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
             "while True:\n"
             "    time.sleep(0.2)\n"
         )
+        conflict_child_py = os.path.join(st_td, "conflict_tls_child.py")
+        open(conflict_child_py, "w", encoding="utf-8").write(
+            "import socket, sys, time\n"
+            "# Stay alive briefly while another process already holds the port, then fail on bind\n"
+            "time.sleep(0.25)\n"
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "s.bind(('127.0.0.1', int(sys.argv[1])))\n"
+        )
         sup_proc = None
+        foreign_proc = None
         try:
+            # Test 0b: Pre-existing independent listener occupying https_live_p MUST NOT trick run_tls_proxy.sh into writing tls.verified
+            foreign_proc = subprocess.Popen([sys.executable, listener_py, str(https_live_p)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            time.sleep(0.15)
+            r_conflict = subprocess.run([st_runner, sys.executable, conflict_child_py, str(https_live_p)], capture_output=True, text=True, timeout=5)
+            foreign_rejected = (r_conflict.returncode != 0 and not os.path.exists(st_marker))
+            foreign_proc.terminate()
+            foreign_proc.wait(timeout=3)
+            foreign_proc = None
+            if foreign_rejected:
+                ok("SEC-01-TLS-LIFECYCLE[preexisting_foreign_listener_on_port_rejected]")
+            else:
+                fail(f"SEC-01-TLS-LIFECYCLE[preexisting_foreign_listener_on_port_rejected]: rc={r_conflict.returncode} marker_exists={os.path.exists(st_marker)}")
+
             # Start real run_tls_proxy.sh supervising the TCP listener on https_live_p
             sup_proc = subprocess.Popen([st_runner, sys.executable, listener_py, str(https_live_p)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             for _ in range(40):
@@ -1755,12 +1777,21 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
                 else:
                     fail(f"{desc}: rc={r_uc.returncode} out={r_uc.stdout} err={r_uc.stderr}")
 
-            # Test 6: Crash/kill the supervised TLS proxy child process -> st_marker is removed by run_tls_proxy.sh AND even a stale marker on disk evaluates tls_active == false immediately
+            # Test 6: Crash/kill the supervised TLS proxy child process -> st_marker is removed by run_tls_proxy.sh AND even a stale marker on disk (even if a foreign listener grabs the port!) evaluates tls_active == false immediately
             os.kill(child_pid1, 9)
             sup_proc.wait(timeout=5)
             marker_removed_on_crash = not os.path.exists(st_marker)
-            # Notice: /tmp/tls_active_test/marker_ok/tls.verified STILL has the stale marker on disk with pid=child_pid1!
-            # Yet because child_pid1 is dead and https_live_p is no longer listening in /proc/net/tcp, inst_ok.is_tls_active() MUST return false!
+            # Start an unrelated foreign listener on https_live_p and forge pid=foreign_proc.pid in stale marker while keeping old inode (or vice versa):
+            foreign_proc = subprocess.Popen([sys.executable, listener_py, str(https_live_p)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            time.sleep(0.15)
+            mk_foreign_inode_dir = os.path.join(uc_stage, "marker_foreign_inode")
+            shutil.copytree(mk_ok_dir, mk_foreign_inode_dir)
+            os.chmod(mk_foreign_inode_dir, 0o755)
+            # Even if pid in marker points to a live process, its socket inode (999999999) does NOT match the foreign listener's inode on https_live_p!
+            open(os.path.join(mk_foreign_inode_dir, "tls.verified"), "w").write(
+                f"verified=1\nengine=stunnel\npid={foreign_proc.pid}\ninode=999999999\nlan_ip=192.168.1.1\nhttps_port={https_live_p}\n"
+            )
+            os.chmod(os.path.join(mk_foreign_inode_dir, "tls.verified"), 0o644)
             uc_crash_check = (
                 uc_driver.split("// Test 1:")[0]
                 + f"let HP = '{https_live_p}';\n"
@@ -1770,9 +1801,15 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
                 "  NOC_TLS_MARKER: '/tmp/tls_active_test/marker_ok/tls.verified',\n"
                 "  NOC_TLS_CERT: '/etc/noc-console-noaccess/tls.crt', NOC_TLS_KEY: '/etc/noc-console-noaccess/tls.key'\n"
                 "});\n"
+                "let inst_foreign_ino = eval_instance({\n"
+                "  NOC_BIND_HOST: '127.0.0.1', NOC_HTTP_PORT: '8780', NOC_HTTPS_PORT: HP,\n"
+                "  NOC_LAN_IP: '192.168.1.1', NOC_TLS_VERIFIED: '1',\n"
+                "  NOC_TLS_MARKER: '/tmp/tls_active_test/marker_foreign_inode/tls.verified',\n"
+                "  NOC_TLS_CERT: '/etc/noc-console-noaccess/tls.crt', NOC_TLS_KEY: '/etc/noc-console-noaccess/tls.key'\n"
+                "});\n"
                 "let st_after_crash = inst_stale.dispatch('auth_status', 'GET', {}, {});\n"
                 "let lg_after_crash = inst_stale.dispatch('auth_login', 'POST', { origin: 'https://192.168.1.1:' + HP }, { username: 'admin', password: 'pw' });\n"
-                "if (inst_stale.is_tls_active() || st_after_crash.data.tls_active !== false || lg_after_crash.status != 403) exit(21);\n"
+                "if (inst_stale.is_tls_active() || inst_foreign_ino.is_tls_active() || st_after_crash.data.tls_active !== false || lg_after_crash.status != 403) exit(21);\n"
                 "print('PASS_CRASH_DEACTIVATED\\n');\n"
             )
             open(os.path.join(uc_stage, "run_tls_crash.uc"), "w", encoding="utf-8").write(uc_crash_check)
@@ -1780,6 +1817,9 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
                 ["unshare", "-rm", "sh", "-c", f"mount --rbind /proc {rfs_25}/proc && exec /usr/sbin/chroot {rfs_25} /usr/bin/ucode /tmp/tls_active_test/run_tls_crash.uc"],
                 capture_output=True, text=True, timeout=15,
             )
+            foreign_proc.terminate()
+            foreign_proc.wait(timeout=3)
+            foreign_proc = None
             if marker_removed_on_crash and r_crash.returncode == 0 and "PASS_CRASH_DEACTIVATED" in r_crash.stdout:
                 ok("SEC-01-TLS-LIFECYCLE[stunnel_crash_immediately_deactivates_tls_active]")
             else:

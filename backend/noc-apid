@@ -23,12 +23,18 @@ const TLS_CERT_PATH = getenv('NOC_TLS_CERT') || '/etc/noc-console/tls.crt';
 const TLS_KEY_PATH = getenv('NOC_TLS_KEY') || '/etc/noc-console/tls.key';
 const TLS_MARKER_PATH = getenv('NOC_TLS_MARKER') || '/tmp/noc-console-tls/tls.verified';
 
-function is_tls_port_listening(port_num) {
+function is_tls_port_listening_inode(port_num, expected_inode) {
+	if (!expected_inode || !match(expected_inode, /^[1-9][0-9]*$/)) return false;
 	let phex = sprintf('%04X', +port_num);
-	let pat = regexp(':' + phex + ' [0-9A-Fa-f]+:[0-9A-Fa-f]+ 0A ');
 	for (let p in ['/proc/net/tcp', '/proc/net/tcp6']) {
 		let raw = fs.readfile(p);
-		if (raw && match(raw, pat)) return true;
+		if (!raw) continue;
+		for (let line in split(raw, '\n')) {
+			let cols = split(trim(line), /[[:space:]]+/);
+			if (length(cols) >= 10 && cols[3] == '0A' && cols[9] == expected_inode) {
+				if (substr(cols[1], -5) == ':' + phex) return true;
+			}
+		}
 	}
 	return false;
 }
@@ -41,7 +47,7 @@ function is_pid_alive_non_zombie(pid_str) {
 	return !!(m && m[1] != 'Z' && m[1] != 'X');
 }
 
-// SEC-01: Never enable TLS_ACTIVE / Secure cookies from a flag alone; require loopback bind + live verified TLS terminator process + active listener + root marker
+// SEC-01: Never enable TLS_ACTIVE / Secure cookies from a flag alone; require loopback bind + live verified TLS terminator process + active listener inode + root marker
 function is_tls_active() {
 	if (!((getenv('NOC_TLS_VERIFIED') == '1') && (BIND_HOST == '127.0.0.1'))) return false;
 	let mst = fs.lstat(TLS_MARKER_PATH);
@@ -58,8 +64,9 @@ function is_tls_active() {
 				let ctxt = fs.readfile(pub_crt) || '';
 				if (index(mtxt, 'verified=1') >= 0 && index(ctxt, '-----BEGIN CERTIFICATE-----') >= 0 && index(ctxt, 'PRIVATE KEY') < 0 && index(mtxt, 'PRIVATE KEY') < 0) {
 					let pm = match(mtxt, /(^|\n)pid=([0-9]+)(\n|$)/);
-					if (!pm || !is_pid_alive_non_zombie(pm[2])) return false;
-					if (!is_tls_port_listening(HTTPS_PORT)) return false;
+					let im = match(mtxt, /(^|\n)inode=([1-9][0-9]*)(\n|$)/);
+					if (!pm || !im || !is_pid_alive_non_zombie(pm[2])) return false;
+					if (!is_tls_port_listening_inode(HTTPS_PORT, im[2])) return false;
 					return true;
 				}
 			}
