@@ -363,6 +363,8 @@ def build_apk(out_dir, version="5.0.0", release="1", apk_bin=None, sign_key=None
         if sign_key:
             cmd.extend(["--sign-key", sign_key])
         cmd.extend(["--output", out_path])
+        if os.geteuid() != 0 and shutil.which("unshare"):
+            cmd = ["unshare", "-r"] + cmd
         subprocess.run(cmd, check=True, capture_output=True, text=True)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
