@@ -1985,44 +1985,68 @@ if not m_helperd_fw:
 else:
     fw_fn_src = m_helperd_fw.group(1)
     for ver_label, rfs in (("24.10.0-opkg", "/tmp/openwrt-24.10-x86-64-rootfs"), ("25.12.6-apk", "/tmp/openwrt-x86-64-rootfs")):
-        if os.path.isdir(rfs) and os.path.isfile(os.path.join(rfs, "usr/bin/ucode")):
-            fw_cfg_p = os.path.join(rfs, "etc", "config", "firewall")
-            had_fw_cfg = os.path.isfile(fw_cfg_p)
-            orig_fw_cfg = open(fw_cfg_p, "rb").read() if had_fw_cfg else None
-            dst_fw_uc = os.path.join(rfs, "tmp", "test_firewall_read.uc")
-            try:
-                os.makedirs(os.path.dirname(fw_cfg_p), exist_ok=True)
-                open(fw_cfg_p, "w", encoding="utf-8").write(
-                    "config defaults\n\toption input 'REJECT'\n\toption output 'ACCEPT'\n\toption forward 'REJECT'\n\n"
-                    "config zone\n\toption name 'lan'\n\toption input 'ACCEPT'\n\toption output 'ACCEPT'\n\toption forward 'ACCEPT'\n\n"
-                    "config forwarding\n\toption src 'lan'\n\toption dest 'wan'\n"
-                )
-                fw_test_uc = (
-                    "import * as uci from 'uci';\n"
-                    "import * as fs from 'fs';\n"
-                    "import * as ubus from 'ubus';\n"
-                    "function exec_argv_async(exe, argv, t, cap, cb) { cb({ ok: true, output: '[]' }); }\n"
-                    "let verb = 'firewall_read';\n"
-                    "let got = null;\n"
-                    "function reply_cb(res) { got = res; }\n"
-                    "function run_fw() {\n" + fw_fn_src + "\n}\n"
-                    "run_fw();\n"
-                    "if (!got || !got.ok || type(got.forwardings) != 'array' || length(got.forwardings) != 1 || got.forwardings[0].src != 'lan' || got.forwardings[0].dest != 'wan') exit(1);\n"
-                    "print('FW_READ_PASS\\n');\n"
-                )
-                open(dst_fw_uc, "w", encoding="utf-8").write(fw_test_uc)
-                r_fw = subprocess.run(["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/ucode", "/tmp/test_firewall_read.uc"], capture_output=True, text=True, timeout=10)
-                if r_fw.returncode == 0 and "FW_READ_PASS" in r_fw.stdout:
-                    ok(f"FIREWALL-READ[{ver_label}]: noc-helperd firewall_read forwardings uci.cursor() regression verified")
-                else:
-                    fail(f"FIREWALL-READ[{ver_label}]: rc={r_fw.returncode} err={r_fw.stderr}")
-            finally:
-                if os.path.exists(dst_fw_uc):
-                    os.unlink(dst_fw_uc)
-                if had_fw_cfg and orig_fw_cfg is not None:
-                    open(fw_cfg_p, "wb").write(orig_fw_cfg)
-                elif os.path.exists(fw_cfg_p):
-                    os.unlink(fw_cfg_p)
+        if not (os.path.isdir(rfs) and os.path.isfile(os.path.join(rfs, "usr/bin/ucode"))):
+            fail(f"FIREWALL-READ[{ver_label}]: required OpenWrt rootfs missing at {rfs}")
+            continue
+        fw_cfg_p = os.path.join(rfs, "etc", "config", "firewall")
+        had_fw_cfg = os.path.isfile(fw_cfg_p)
+        orig_fw_cfg = open(fw_cfg_p, "rb").read() if had_fw_cfg else None
+        dst_fw_uc = os.path.join(rfs, "tmp", "test_firewall_read.uc")
+        try:
+            os.makedirs(os.path.dirname(fw_cfg_p), exist_ok=True)
+            open(fw_cfg_p, "w", encoding="utf-8").write(
+                "config defaults\n\toption input 'REJECT'\n\toption output 'ACCEPT'\n\toption forward 'REJECT'\n\n"
+                "config zone\n\toption name 'lan'\n\toption input 'ACCEPT'\n\toption output 'ACCEPT'\n\toption forward 'ACCEPT'\n\n"
+                "config forwarding\n\toption src 'lan'\n\toption dest 'wan'\n"
+            )
+            fw_test_uc = (
+                "import * as real_uci from 'uci';\n"
+                "import * as fs from 'fs';\n"
+                "import * as ubus from 'ubus';\n"
+                "let fail_fwd_uci = false;\n"
+                "let uci = {\n"
+                "  cursor: function() {\n"
+                "    let c = real_uci.cursor();\n"
+                "    return {\n"
+                "      get: (a, b, k) => c.get(a, b, k),\n"
+                "      foreach: function(pkg, typ, cb) {\n"
+                "        if (fail_fwd_uci && pkg == 'firewall' && typ == 'forwarding') die('simulated uci failure');\n"
+                "        return c.foreach(pkg, typ, cb);\n"
+                "      }\n"
+                "    };\n"
+                "  }\n"
+                "};\n"
+                "function exec_argv_async(exe, argv, t, cap, cb) { cb({ ok: true, output: '[]' }); }\n"
+                "let got = null;\n"
+                "function reply_cb(res) { got = res; }\n"
+                "function run_verb(verb) {\n" + fw_fn_src + "\n  if (verb == 'ping_after') reply_cb({ ok: true, alive: true });\n}\n"
+                "// 1. Normal firewall_read with forwarding rule\n"
+                "run_verb('firewall_read');\n"
+                "if (!got || !got.ok || type(got.forwardings) != 'array' || length(got.forwardings) != 1 || got.forwardings[0].src != 'lan' || got.forwardings[0].dest != 'wan') exit(1);\n"
+                "// 2. Failing UCI forwardings MUST return ok:false error_code:'DEPENDENCY' (no silent ok:true with empty array) and MUST NOT crash helperd\n"
+                "got = null;\n"
+                "fail_fwd_uci = true;\n"
+                "run_verb('firewall_read');\n"
+                "if (!got || got.ok !== false || got.error_code != 'DEPENDENCY') exit(2);\n"
+                "// 3. Subsequent RPC call continues working after firewall_read UCI failure\n"
+                "got = null;\n"
+                "run_verb('ping_after');\n"
+                "if (!got || !got.ok || !got.alive) exit(3);\n"
+                "print('FW_READ_PASS\\n');\n"
+            )
+            open(dst_fw_uc, "w", encoding="utf-8").write(fw_test_uc)
+            r_fw = subprocess.run(["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/ucode", "/tmp/test_firewall_read.uc"], capture_output=True, text=True, timeout=10)
+            if r_fw.returncode == 0 and "FW_READ_PASS" in r_fw.stdout:
+                ok(f"FIREWALL-READ[{ver_label}]: noc-helperd firewall_read forwardings uci.cursor() + error handling + survival verified")
+            else:
+                fail(f"FIREWALL-READ[{ver_label}]: rc={r_fw.returncode} err={r_fw.stderr}")
+        finally:
+            if os.path.exists(dst_fw_uc):
+                os.unlink(dst_fw_uc)
+            if had_fw_cfg and orig_fw_cfg is not None:
+                open(fw_cfg_p, "wb").write(orig_fw_cfg)
+            elif os.path.exists(fw_cfg_p):
+                os.unlink(fw_cfg_p)
 
 # 9. Option A Root-Interface (/) Redirect & Atomic LuCI Restore Verification (Sections A, B, C, D)
 print("\n=== 8. Root-Interface (/) Redirect & Atomic LuCI Restore (Option A) ===")

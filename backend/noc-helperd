@@ -2536,21 +2536,30 @@ function handle_rpc(req, reply_cb) {
 			let svcs = (uctx && uctx.call('service', 'list')) || {};
 			if (uctx) try { uctx.disconnect(); } catch (e) {}
 			let banip_running = !!(svcs.banip && svcs.banip.instances && svcs.banip.instances.banip && svcs.banip.instances.banip.running);
+			let fw_fwds = [];
+			let fwd_ok = true;
+			try {
+				let fwd_cur = uci.cursor();
+				if (!fwd_cur) {
+					fwd_ok = false;
+				} else {
+					fwd_cur.foreach('firewall', 'forwarding', function(s) {
+						push(fw_fwds, { id: s['.name'], src: s.src || '', dest: s.dest || '', enabled: s.enabled != '0' });
+					});
+				}
+			} catch (e) {
+				fwd_ok = false;
+			}
+			if (!fwd_ok) {
+				reply_cb({ ok: false, error_code: 'DEPENDENCY', message_ar: 'فشل قراءة قواعد التحويل في الجدار الناري' });
+				return;
+			}
 			reply_cb({
 				ok: true,
 				tables_json: tb.ok ? tb.output : '[]',
 				defaults: fw_defaults,
 				zones: fw_zones,
-				forwardings: (function() {
-					let fw_fwds = [];
-					try {
-						let fwd_cur = uci.cursor();
-						fwd_cur.foreach('firewall', 'forwarding', function(s) {
-							push(fw_fwds, { id: s['.name'], src: s.src || '', dest: s.dest || '', enabled: s.enabled != '0' });
-						});
-					} catch (e) {}
-					return fw_fwds;
-				})(),
+				forwardings: fw_fwds,
 				rules: fw_rules,
 				redirects: fw_redirects,
 				upnp_rules: upnp.rules || [],
