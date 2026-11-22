@@ -1437,6 +1437,7 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
     st_conf = os.path.join(st_td, "stunnel.conf")
     st_state_dir = os.path.join(st_td, "noc-console-tls")
     st_marker = os.path.join(st_state_dir, "tls.verified")
+    st_runner = os.path.join(st_state_dir, "run_tls_proxy.sh")
     subprocess.run(
         ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key_p, "-out", crt_p, "-days", "1", "-subj", "/CN=test.lan"],
         check=True, capture_output=True,
@@ -1452,6 +1453,7 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
     init_body = init_body.replace("STUNNEL_CONF=/tmp/noc-console/stunnel.conf", f"STUNNEL_CONF={st_conf}")
     init_body = init_body.replace("TLS_STATE_DIR=/tmp/noc-console-tls", f"TLS_STATE_DIR={st_state_dir}")
     init_body = init_body.replace("TLS_MARKER=/tmp/noc-console-tls/tls.verified", f"TLS_MARKER={st_marker}")
+    init_body = init_body.replace("TLS_RUNNER=/tmp/noc-console-tls/run_tls_proxy.sh", f"TLS_RUNNER={st_runner}")
     init_shim = os.path.join(st_td, "noc_apid_shim.sh")
     open(init_shim, "w", encoding="utf-8").write(init_body)
 
@@ -1555,13 +1557,46 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
     else:
         fail(f"SEC-01-STUNNEL[cidr_and_multi_ip_lan_ipaddr_stripped]: rc={r_cidr.returncode} conf={cidr_conf_txt!r}")
 
-    # 8e. SEC-01-TLS-ACTIVE (5 tests): root-owned TLS marker without private key, auth_status tls_active:true, Secure cookie, HTTPS Origin check, insecure HTTP mode isolation
-    r_mk = subprocess.run(
-        ["sh", "-c", cidr_harness],
+    # 8e. SEC-01-TLS-ACTIVE & SEC-01-TLS-LIFECYCLE (8 tests):
+    # - pre-listener readiness gate (no verified marker before listener binds HTTPS_PORT)
+    # - root-owned TLS marker without private key & forged/leaked rejection
+    # - auth_status tls_active:true
+    # - login cookie ; Secure flag
+    # - HTTPS Origin accepted & HTTP Origin rejected
+    # - insecure HTTP mode isolation
+    # - stunnel crash/stop immediately deactivates tls_active (zero stale window + marker cleanup)
+    # - stunnel restart restores tls_active:true while keeping private key isolated
+    https_live_p = free_port()
+    live_harness = (
+        "procd_open_instance() { echo \"INST:$1\"; }\n"
+        "procd_set_param() { echo \"PARAM:$*\"; }\n"
+        "procd_close_instance() { echo \"CLOSE\"; }\n"
+        "logger() { echo \"LOG:$*\"; }\n"
+        "uci() { case \"$*\" in *network.lan.ipaddr*) echo '192.168.1.1/24' ;; *) echo 'nms-router' ;; esac; }\n"
+        f". {init_shim}\n"
+        f"TLS_CERT={cidr_crt}; TLS_KEY={cidr_key}; TLS_FP={cidr_fp}; STUNNEL_CONF={cidr_conf}; HTTPS_PORT={https_live_p}; start_service\n"
+    )
+    r_prep = subprocess.run(
+        ["sh", "-c", live_harness],
         env={"PATH": f"{bin_stunnel}:/usr/bin:/bin"}, capture_output=True, text=True,
     )
+    # Verify marker does NOT exist after start_service before run_tls_proxy.sh starts a live listener
+    marker_absent_before_listen = (
+        r_prep.returncode == 0
+        and os.path.isfile(st_runner)
+        and os.path.isfile(os.path.join(st_state_dir, "tls.crt"))
+        and not os.path.exists(os.path.join(st_state_dir, "tls.key"))
+        and not os.path.exists(st_marker)
+    )
+    # Also verify run_tls_proxy.sh fails closed without writing marker if child exits without listening
+    r_bad_child = subprocess.run([st_runner, "sh", "-c", "exit 1"], capture_output=True, text=True, timeout=5)
+    if marker_absent_before_listen and r_bad_child.returncode != 0 and not os.path.exists(st_marker):
+        ok("SEC-01-TLS-LIFECYCLE[no_verified_marker_before_listener_ready]")
+    else:
+        fail(f"SEC-01-TLS-LIFECYCLE[no_verified_marker_before_listener_ready]: prep={marker_absent_before_listen} bad_rc={r_bad_child.returncode} exists={os.path.exists(st_marker)}")
+
     apid_src_full = open(os.path.join(ROOT, "backend", "noc-apid"), "r", encoding="utf-8").read()
-    m_tls_fn = re.search(r"(const TLS_CERT_PATH = .*?const TLS_ACTIVE = .*?;)", apid_src_full, re.S)
+    m_tls_fn = re.search(r"(const TLS_CERT_PATH = .*?function is_tls_active\(\) \{.*?\n\})", apid_src_full, re.S)
     m_lan_fn = re.search(r"(function get_lan_ip\(\) \{.*?\n\})", apid_src_full, re.S)
     m_orig_fn = re.search(r"(function is_origin_allowed\(headers, require_present\) \{.*?\n\})", apid_src_full, re.S)
     m_auth_st = re.search(r"(\tif \(action == 'auth_status'\) \{.*?\n\t\treturn;\n\t\})", apid_src_full, re.S)
@@ -1574,8 +1609,31 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
         if os.path.exists(uc_stage):
             shutil.rmtree(uc_stage, ignore_errors=True)
         os.makedirs(uc_stage, exist_ok=True)
+        listener_py = os.path.join(st_td, "dummy_tls_listener.py")
+        open(listener_py, "w", encoding="utf-8").write(
+            "import signal, socket, sys, time\n"
+            "signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))\n"
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            "s.bind(('127.0.0.1', int(sys.argv[1])))\n"
+            "s.listen(8)\n"
+            "while True:\n"
+            "    time.sleep(0.2)\n"
+        )
+        sup_proc = None
         try:
-            # Copy marker dir created by init.d/noc-apid into chroot /tmp/tls_active_test/marker_ok
+            # Start real run_tls_proxy.sh supervising the TCP listener on https_live_p
+            sup_proc = subprocess.Popen([st_runner, sys.executable, listener_py, str(https_live_p)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(40):
+                if os.path.isfile(st_marker):
+                    break
+                time.sleep(0.05)
+            assert os.path.isfile(st_marker), "run_tls_proxy.sh did not create tls.verified after listener started"
+            m_pid1 = re.search(r"^pid=([0-9]+)$", open(st_marker).read(), re.M)
+            assert m_pid1, f"missing pid in {open(st_marker).read()!r}"
+            child_pid1 = int(m_pid1.group(1))
+
+            # Copy marker dir created by run_tls_proxy.sh into chroot /tmp/tls_active_test/marker_ok
             mk_ok_dir = os.path.join(uc_stage, "marker_ok")
             shutil.copytree(st_state_dir, mk_ok_dir)
             os.chmod(mk_ok_dir, 0o755)
@@ -1595,8 +1653,6 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
 
             uc_driver = (
                 "import * as fs from 'fs';\n"
-                "let env_map = {};\n"
-                "function getenv(k) { return env_map[k]; }\n"
                 "let uci = { cursor: () => ({ get: (p, s, o) => '192.168.1.1/24' }) };\n"
                 "function get_sys_hostname() { return 'OpenWrt'; }\n"
                 "function urandom_hex(n) { return 'deadbeefcafebabe0123456789abcdef'; }\n"
@@ -1607,7 +1663,7 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
                 "  else if (verb == 'auth_login') cb({ ok: true, username: 'admin', role: 'admin' });\n"
                 "}\n"
                 "function eval_instance(e) {\n"
-                "  env_map = e;\n"
+                "  function getenv(k) { return e[k]; }\n"
                 "  let BIND_HOST = getenv('NOC_BIND_HOST') || '';\n"
                 "  let BIND_PORT = +(getenv('NOC_HTTP_PORT') || 8780);\n"
                 "  let HTTPS_PORT = +(getenv('NOC_HTTPS_PORT') || 8743);\n"
@@ -1625,64 +1681,65 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
                 "    })();\n"
                 "    return cli;\n"
                 "  }\n"
-                "  return { tls_active: TLS_ACTIVE, lan_ip: get_lan_ip(), is_origin_allowed: is_origin_allowed, dispatch: dispatch };\n"
+                "  return { is_tls_active: is_tls_active, lan_ip: get_lan_ip(), is_origin_allowed: is_origin_allowed, dispatch: dispatch };\n"
                 "}\n"
+                f"let HP = '{https_live_p}';\n"
                 "// Test 1: Verify TLS without private key (/etc/noc-console inaccessible) & reject forged/leaked markers\n"
                 "let inst_ok = eval_instance({\n"
-                "  NOC_BIND_HOST: '127.0.0.1', NOC_HTTP_PORT: '8780', NOC_HTTPS_PORT: '8743',\n"
+                "  NOC_BIND_HOST: '127.0.0.1', NOC_HTTP_PORT: '8780', NOC_HTTPS_PORT: HP,\n"
                 "  NOC_LAN_IP: '192.168.1.1', NOC_TLS_VERIFIED: '1',\n"
                 "  NOC_TLS_MARKER: '/tmp/tls_active_test/marker_ok/tls.verified',\n"
                 "  NOC_TLS_CERT: '/etc/noc-console-noaccess/tls.crt',\n"
                 "  NOC_TLS_KEY: '/etc/noc-console-noaccess/tls.key'\n"
                 "});\n"
                 "let inst_forged_perm = eval_instance({\n"
-                "  NOC_BIND_HOST: '127.0.0.1', NOC_TLS_VERIFIED: '1',\n"
+                "  NOC_BIND_HOST: '127.0.0.1', NOC_HTTPS_PORT: HP, NOC_TLS_VERIFIED: '1',\n"
                 "  NOC_TLS_MARKER: '/tmp/tls_active_test/marker_forged/tls.verified',\n"
                 "  NOC_TLS_CERT: '/etc/noc-console-noaccess/tls.crt', NOC_TLS_KEY: '/etc/noc-console-noaccess/tls.key'\n"
                 "});\n"
                 "let inst_forged_uid = eval_instance({\n"
-                "  NOC_BIND_HOST: '127.0.0.1', NOC_TLS_VERIFIED: '1', NOC_TLS_MARKER_UID: '999',\n"
+                "  NOC_BIND_HOST: '127.0.0.1', NOC_HTTPS_PORT: HP, NOC_TLS_VERIFIED: '1', NOC_TLS_MARKER_UID: '999',\n"
                 "  NOC_TLS_MARKER: '/tmp/tls_active_test/marker_ok/tls.verified',\n"
                 "  NOC_TLS_CERT: '/etc/noc-console-noaccess/tls.crt', NOC_TLS_KEY: '/etc/noc-console-noaccess/tls.key'\n"
                 "});\n"
                 "let inst_leak = eval_instance({\n"
-                "  NOC_BIND_HOST: '127.0.0.1', NOC_TLS_VERIFIED: '1',\n"
+                "  NOC_BIND_HOST: '127.0.0.1', NOC_HTTPS_PORT: HP, NOC_TLS_VERIFIED: '1',\n"
                 "  NOC_TLS_MARKER: '/tmp/tls_active_test/marker_leak/tls.verified',\n"
                 "  NOC_TLS_CERT: '/etc/noc-console-noaccess/tls.crt', NOC_TLS_KEY: '/etc/noc-console-noaccess/tls.key'\n"
                 "});\n"
-                "if (!inst_ok.tls_active || inst_forged_perm.tls_active || inst_forged_uid.tls_active || inst_leak.tls_active) exit(11);\n"
+                "if (!inst_ok.is_tls_active() || inst_forged_perm.is_tls_active() || inst_forged_uid.is_tls_active() || inst_leak.is_tls_active()) exit(11);\n"
                 "print('PASS_T1\\n');\n"
                 "// Test 2: auth_status reports tls_active: true and transport: https_tls\n"
                 "let st_res = inst_ok.dispatch('auth_status', 'GET', {}, {});\n"
                 "if (st_res.status != 200 || st_res.data.tls_active !== true || st_res.data.transport != 'https_tls') exit(12);\n"
                 "print('PASS_T2\\n');\n"
                 "// Test 3: Login Set-Cookie contains ; Secure\n"
-                "let lg_res = inst_ok.dispatch('auth_login', 'POST', { origin: 'https://192.168.1.1:8743' }, { username: 'admin', password: 'pw' });\n"
+                "let lg_res = inst_ok.dispatch('auth_login', 'POST', { origin: 'https://192.168.1.1:' + HP }, { username: 'admin', password: 'pw' });\n"
                 "let ck = lg_res.hdrs['Set-Cookie'] || '';\n"
                 "if (lg_res.status != 200 || index(ck, '; Secure') < 0 || index(ck, 'HttpOnly') < 0 || index(ck, 'SameSite=Strict') < 0) exit(13);\n"
                 "print('PASS_T3\\n');\n"
-                "// Test 4: Origin check accepts https://192.168.1.1:8743 and rejects http:// origins when TLS is active\n"
+                "// Test 4: Origin check accepts https://192.168.1.1:<HP> and rejects http:// origins when TLS is active\n"
                 "let lg_http_orig = inst_ok.dispatch('auth_login', 'POST', { origin: 'http://192.168.1.1:8780' }, { username: 'admin', password: 'pw' });\n"
-                "let lg_http_8743 = inst_ok.dispatch('auth_login', 'POST', { origin: 'http://192.168.1.1:8743' }, { username: 'admin', password: 'pw' });\n"
-                "let lg_loop_orig = inst_ok.dispatch('auth_login', 'POST', { origin: 'https://127.0.0.1:8743' }, { username: 'admin', password: 'pw' });\n"
-                "if (lg_http_orig.status != 403 || lg_http_8743.status != 403 || lg_loop_orig.status != 403) exit(14);\n"
+                "let lg_http_hp = inst_ok.dispatch('auth_login', 'POST', { origin: 'http://192.168.1.1:' + HP }, { username: 'admin', password: 'pw' });\n"
+                "let lg_loop_orig = inst_ok.dispatch('auth_login', 'POST', { origin: 'https://127.0.0.1:' + HP }, { username: 'admin', password: 'pw' });\n"
+                "if (lg_http_orig.status != 403 || lg_http_hp.status != 403 || lg_loop_orig.status != 403) exit(14);\n"
                 "print('PASS_T4\\n');\n"
                 "// Test 5: Insecure HTTP mode is never treated as HTTPS\n"
                 "let inst_http = eval_instance({\n"
-                "  NOC_BIND_HOST: '192.168.1.1', NOC_LAN_IP: '192.168.1.1', NOC_HTTP_PORT: '8780', NOC_HTTPS_PORT: '8743',\n"
+                "  NOC_BIND_HOST: '192.168.1.1', NOC_LAN_IP: '192.168.1.1', NOC_HTTP_PORT: '8780', NOC_HTTPS_PORT: HP,\n"
                 "  NOC_TLS_VERIFIED: '0', NOC_TLS_MARKER: '/tmp/tls_active_test/nonexistent/tls.verified',\n"
                 "  NOC_TLS_CERT: '/etc/noc-console-noaccess/tls.crt', NOC_TLS_KEY: '/etc/noc-console-noaccess/tls.key'\n"
                 "});\n"
                 "let st_http = inst_http.dispatch('auth_status', 'GET', {}, {});\n"
                 "let lg_http_ok = inst_http.dispatch('auth_login', 'POST', { origin: 'http://192.168.1.1:8780' }, { username: 'admin', password: 'pw' });\n"
-                "let lg_https_on_http = inst_http.dispatch('auth_login', 'POST', { origin: 'https://192.168.1.1:8743' }, { username: 'admin', password: 'pw' });\n"
-                "if (inst_http.tls_active || st_http.data.tls_active !== false || st_http.data.transport != 'http_lan_only') exit(15);\n"
+                "let lg_https_on_http = inst_http.dispatch('auth_login', 'POST', { origin: 'https://192.168.1.1:' + HP }, { username: 'admin', password: 'pw' });\n"
+                "if (inst_http.is_tls_active() || st_http.data.tls_active !== false || st_http.data.transport != 'http_lan_only') exit(15);\n"
                 "if (lg_http_ok.status != 200 || index(lg_http_ok.hdrs['Set-Cookie'] || '', 'Secure') >= 0 || lg_https_on_http.status != 403) exit(16);\n"
                 "print('PASS_T5\\n');\n"
             )
             open(os.path.join(uc_stage, "run_tls_active.uc"), "w", encoding="utf-8").write(uc_driver)
             r_uc = subprocess.run(
-                ["unshare", "-r", "/usr/sbin/chroot", rfs_25, "/usr/bin/ucode", "/tmp/tls_active_test/run_tls_active.uc"],
+                ["unshare", "-rm", "sh", "-c", f"mount --rbind /proc {rfs_25}/proc && exec /usr/sbin/chroot {rfs_25} /usr/bin/ucode /tmp/tls_active_test/run_tls_active.uc"],
                 capture_output=True, text=True, timeout=15,
             )
             no_key_in_marker = not os.path.exists(os.path.join(st_state_dir, "tls.key"))
@@ -1697,7 +1754,70 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
                     ok(desc)
                 else:
                     fail(f"{desc}: rc={r_uc.returncode} out={r_uc.stdout} err={r_uc.stderr}")
+
+            # Test 6: Crash/kill the supervised TLS proxy child process -> st_marker is removed by run_tls_proxy.sh AND even a stale marker on disk evaluates tls_active == false immediately
+            os.kill(child_pid1, 9)
+            sup_proc.wait(timeout=5)
+            marker_removed_on_crash = not os.path.exists(st_marker)
+            # Notice: /tmp/tls_active_test/marker_ok/tls.verified STILL has the stale marker on disk with pid=child_pid1!
+            # Yet because child_pid1 is dead and https_live_p is no longer listening in /proc/net/tcp, inst_ok.is_tls_active() MUST return false!
+            uc_crash_check = (
+                uc_driver.split("// Test 1:")[0]
+                + f"let HP = '{https_live_p}';\n"
+                "let inst_stale = eval_instance({\n"
+                "  NOC_BIND_HOST: '127.0.0.1', NOC_HTTP_PORT: '8780', NOC_HTTPS_PORT: HP,\n"
+                "  NOC_LAN_IP: '192.168.1.1', NOC_TLS_VERIFIED: '1',\n"
+                "  NOC_TLS_MARKER: '/tmp/tls_active_test/marker_ok/tls.verified',\n"
+                "  NOC_TLS_CERT: '/etc/noc-console-noaccess/tls.crt', NOC_TLS_KEY: '/etc/noc-console-noaccess/tls.key'\n"
+                "});\n"
+                "let st_after_crash = inst_stale.dispatch('auth_status', 'GET', {}, {});\n"
+                "let lg_after_crash = inst_stale.dispatch('auth_login', 'POST', { origin: 'https://192.168.1.1:' + HP }, { username: 'admin', password: 'pw' });\n"
+                "if (inst_stale.is_tls_active() || st_after_crash.data.tls_active !== false || lg_after_crash.status != 403) exit(21);\n"
+                "print('PASS_CRASH_DEACTIVATED\\n');\n"
+            )
+            open(os.path.join(uc_stage, "run_tls_crash.uc"), "w", encoding="utf-8").write(uc_crash_check)
+            r_crash = subprocess.run(
+                ["unshare", "-rm", "sh", "-c", f"mount --rbind /proc {rfs_25}/proc && exec /usr/sbin/chroot {rfs_25} /usr/bin/ucode /tmp/tls_active_test/run_tls_crash.uc"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if marker_removed_on_crash and r_crash.returncode == 0 and "PASS_CRASH_DEACTIVATED" in r_crash.stdout:
+                ok("SEC-01-TLS-LIFECYCLE[stunnel_crash_immediately_deactivates_tls_active]")
+            else:
+                fail(f"SEC-01-TLS-LIFECYCLE[stunnel_crash_immediately_deactivates_tls_active]: removed={marker_removed_on_crash} rc={r_crash.returncode} out={r_crash.stdout} err={r_crash.stderr}")
+
+            # Test 7: Restart run_tls_proxy.sh (simulating procd respawn) -> recreates marker with new PID, restores tls_active:true while keeping tls.key isolated
+            sup_proc = subprocess.Popen([st_runner, sys.executable, listener_py, str(https_live_p)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(40):
+                if os.path.isfile(st_marker):
+                    break
+                time.sleep(0.05)
+            m_pid2 = re.search(r"^pid=([0-9]+)$", open(st_marker).read(), re.M) if os.path.isfile(st_marker) else None
+            child_pid2 = int(m_pid2.group(1)) if m_pid2 else -1
+            shutil.copy2(st_marker, os.path.join(mk_ok_dir, "tls.verified"))
+            os.chmod(os.path.join(mk_ok_dir, "tls.verified"), 0o644)
+            r_recover = subprocess.run(
+                ["unshare", "-rm", "sh", "-c", f"mount --rbind /proc {rfs_25}/proc && exec /usr/sbin/chroot {rfs_25} /usr/bin/ucode /tmp/tls_active_test/run_tls_active.uc"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if (
+                child_pid2 > 0
+                and child_pid2 != child_pid1
+                and r_recover.returncode == 0
+                and "PASS_T2" in r_recover.stdout
+                and "PASS_T3" in r_recover.stdout
+                and "PASS_T4" in r_recover.stdout
+                and not os.path.exists(os.path.join(st_state_dir, "tls.key"))
+            ):
+                ok("SEC-01-TLS-LIFECYCLE[stunnel_restart_restores_tls_active_without_private_key]")
+            else:
+                fail(f"SEC-01-TLS-LIFECYCLE[stunnel_restart_restores_tls_active_without_private_key]: pid1={child_pid1} pid2={child_pid2} rc={r_recover.returncode}")
         finally:
+            if sup_proc is not None and sup_proc.poll() is None:
+                sup_proc.terminate()
+                try:
+                    sup_proc.wait(timeout=3)
+                except Exception:
+                    sup_proc.kill()
             shutil.rmtree(uc_stage, ignore_errors=True)
 
 print(f"\n=== SUMMARY: {len(passes)} passed, {len(failures)} failed ===")

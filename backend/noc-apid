@@ -23,8 +23,27 @@ const TLS_CERT_PATH = getenv('NOC_TLS_CERT') || '/etc/noc-console/tls.crt';
 const TLS_KEY_PATH = getenv('NOC_TLS_KEY') || '/etc/noc-console/tls.key';
 const TLS_MARKER_PATH = getenv('NOC_TLS_MARKER') || '/tmp/noc-console-tls/tls.verified';
 
-function verify_tls_runtime() {
-	if (getenv('NOC_TLS_VERIFIED') != '1' || BIND_HOST != '127.0.0.1') return false;
+function is_tls_port_listening(port_num) {
+	let phex = sprintf('%04X', +port_num);
+	let pat = regexp(':' + phex + ' [0-9A-Fa-f]+:[0-9A-Fa-f]+ 0A ');
+	for (let p in ['/proc/net/tcp', '/proc/net/tcp6']) {
+		let raw = fs.readfile(p);
+		if (raw && match(raw, pat)) return true;
+	}
+	return false;
+}
+
+function is_pid_alive_non_zombie(pid_str) {
+	if (!pid_str || !match(pid_str, /^[0-9]+$/)) return false;
+	let st_raw = fs.readfile('/proc/' + pid_str + '/stat');
+	if (!st_raw) return false;
+	let m = match(st_raw, /\)[[:space:]]+([A-Za-z])/);
+	return !!(m && m[1] != 'Z' && m[1] != 'X');
+}
+
+// SEC-01: Never enable TLS_ACTIVE / Secure cookies from a flag alone; require loopback bind + live verified TLS terminator process + active listener + root marker
+function is_tls_active() {
+	if (!((getenv('NOC_TLS_VERIFIED') == '1') && (BIND_HOST == '127.0.0.1'))) return false;
 	let mst = fs.lstat(TLS_MARKER_PATH);
 	if (mst && mst.type == 'file' && !mst.perm.group_write && !mst.perm.other_write) {
 		let mdir = replace(TLS_MARKER_PATH, /\/[^\/]+$/, '');
@@ -38,17 +57,17 @@ function verify_tls_runtime() {
 				let mtxt = fs.readfile(TLS_MARKER_PATH) || '';
 				let ctxt = fs.readfile(pub_crt) || '';
 				if (index(mtxt, 'verified=1') >= 0 && index(ctxt, '-----BEGIN CERTIFICATE-----') >= 0 && index(ctxt, 'PRIVATE KEY') < 0 && index(mtxt, 'PRIVATE KEY') < 0) {
+					let pm = match(mtxt, /(^|\n)pid=([0-9]+)(\n|$)/);
+					if (!pm || !is_pid_alive_non_zombie(pm[2])) return false;
+					if (!is_tls_port_listening(HTTPS_PORT)) return false;
 					return true;
 				}
 			}
 		}
 		return false;
 	}
-	return !!fs.stat(TLS_CERT_PATH) && !!fs.stat(TLS_KEY_PATH);
+	return false;
 }
-
-// SEC-01: Never enable TLS_ACTIVE / Secure cookies from a flag alone; require loopback bind + verified TLS terminator + root marker or cert/key
-const TLS_ACTIVE = (getenv('NOC_TLS_VERIFIED') == '1') && (BIND_HOST == '127.0.0.1') && verify_tls_runtime();
 const STAGING_MODE = getenv('NOC_STAGING_MODE') == '1';
 
 const MAX_HEADER_BYTES = 8192;
@@ -778,7 +797,7 @@ function is_origin_allowed(headers, require_present) {
 	let lan = get_lan_ip();
 	let hn = get_sys_hostname();
 	let allowed = {};
-	if (TLS_ACTIVE) {
+	if (is_tls_active()) {
 		allowed[sprintf('https://%s:%d', lan, HTTPS_PORT)] = true;
 		allowed[sprintf('https://%s:%d', hn, HTTPS_PORT)] = true;
 		allowed[sprintf('https://%s.lan:%d', hn, HTTPS_PORT)] = true;
@@ -815,7 +834,7 @@ function sanitize_hdr_val(v) {
 function send_http(cli, status_code, status_txt, ctype, body, extra_hdrs) {
 	let h = sprintf(
 		"HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\nPermissions-Policy: geolocation=(), microphone=(), camera=()\r\n%sContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data:; connect-src 'self'\r\n",
-		status_code, status_txt, ctype, length(body), TLS_ACTIVE ? "Cross-Origin-Opener-Policy: same-origin\r\n" : ""
+		status_code, status_txt, ctype, length(body), is_tls_active() ? "Cross-Origin-Opener-Policy: same-origin\r\n" : ""
 	);
 	if (extra_hdrs) {
 		for (let k in keys(extra_hdrs)) {
@@ -1105,9 +1124,10 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 	if (action == 'auth_status') {
 		let cur_s = get_session(headers);
 		call_helper('auth_status', {}, 'preauth', remote_ip, function(res) {
+			let tls_on = is_tls_active();
 			res.authenticated = !!cur_s;
-			res.tls_active = TLS_ACTIVE;
-			res.transport = TLS_ACTIVE ? 'https_tls' : 'http_lan_only';
+			res.tls_active = tls_on;
+			res.transport = tls_on ? 'https_tls' : 'http_lan_only';
 			res.https_port = HTTPS_PORT;
 			if (cur_s) {
 				res.username = cur_s.username;
@@ -1133,7 +1153,7 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 			let csrf = urandom_hex(16);
 			let now_t = time();
 			sessions[sid] = { id: sid, username: 'admin', role: 'admin', csrf: csrf, created_at: now_t, last_seen: now_t, ip: remote_ip };
-			let ck = sprintf('noc_session=%s; HttpOnly; SameSite=Strict; Path=/%s', sid, TLS_ACTIVE ? '; Secure' : '');
+			let ck = sprintf('noc_session=%s; HttpOnly; SameSite=Strict; Path=/%s', sid, is_tls_active() ? '; Secure' : '');
 			send_json_env(cli, 200, 'auth', { authenticated: true, role: 'admin', csrf_token: csrf, message_ar: res.message_ar }, [], { 'Set-Cookie': ck });
 		});
 		return;
@@ -1159,7 +1179,7 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 			let csrf = urandom_hex(16);
 			let now_t = time();
 			sessions[sid] = { id: sid, username: res.username, role: res.role, csrf: csrf, created_at: now_t, last_seen: now_t, ip: remote_ip };
-			let ck = sprintf('noc_session=%s; HttpOnly; SameSite=Strict; Path=/%s', sid, TLS_ACTIVE ? '; Secure' : '');
+			let ck = sprintf('noc_session=%s; HttpOnly; SameSite=Strict; Path=/%s', sid, is_tls_active() ? '; Secure' : '');
 			send_json_env(cli, 200, 'auth', { authenticated: true, username: res.username, role: res.role, csrf_token: csrf }, [], { 'Set-Cookie': ck });
 		});
 		return;
@@ -1172,7 +1192,7 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 		}
 		let sess = get_session(headers);
 		if (sess) delete sessions[sess.id];
-		send_json_env(cli, 200, 'auth', { authenticated: false }, [], { 'Set-Cookie': sprintf('noc_session=; HttpOnly; SameSite=Strict; Max-Age=0; Path=/%s', TLS_ACTIVE ? '; Secure' : '') });
+		send_json_env(cli, 200, 'auth', { authenticated: false }, [], { 'Set-Cookie': sprintf('noc_session=; HttpOnly; SameSite=Strict; Max-Age=0; Path=/%s', is_tls_active() ? '; Secure' : '') });
 		return;
 	}
 

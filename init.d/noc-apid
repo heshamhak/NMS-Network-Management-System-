@@ -11,6 +11,7 @@ TLS_FP=/etc/noc-console/tls.fingerprint
 STUNNEL_CONF=/tmp/noc-console/stunnel.conf
 TLS_STATE_DIR=/tmp/noc-console-tls
 TLS_MARKER=/tmp/noc-console-tls/tls.verified
+TLS_RUNNER=/tmp/noc-console-tls/run_tls_proxy.sh
 HTTPS_PORT=8743
 HTTP_PORT=8780
 
@@ -104,7 +105,7 @@ EOF
 	mv -f "$_tmp" "$STUNNEL_CONF"
 }
 
-write_tls_marker() {
+prepare_tls_state_dir() {
 	_engine="$1"
 	_lan_ip="$2"
 	rm -rf "$TLS_STATE_DIR" 2>/dev/null || true
@@ -116,16 +117,71 @@ write_tls_marker() {
 	chmod 0644 "${TLS_STATE_DIR}/tls.crt.tmp.$$"
 	mv -f "${TLS_STATE_DIR}/tls.crt.tmp.$$" "${TLS_STATE_DIR}/tls.crt"
 	_fp_val="$(cat "$TLS_FP" 2>/dev/null || true)"
-	cat > "${TLS_MARKER}.tmp.$$" <<EOF
+	_port_hex="$(printf '%04X' "$HTTPS_PORT")"
+	cat > "${TLS_RUNNER}.tmp.$$" <<EOF
+#!/bin/sh
+set -u
+MARKER="${TLS_MARKER}"
+PORT_HEX="${_port_hex}"
+ENGINE="${_engine}"
+LAN_IP="${_lan_ip}"
+HTTPS_P="${HTTPS_PORT}"
+FP_VAL="${_fp_val}"
+_child=""
+
+cleanup_tls() {
+	rm -f "\$MARKER" "\${MARKER}.tmp."* 2>/dev/null || true
+	if [ -n "\$_child" ] && kill -0 "\$_child" 2>/dev/null; then
+		kill -TERM "\$_child" 2>/dev/null || true
+		wait "\$_child" 2>/dev/null || true
+	fi
+}
+trap 'cleanup_tls; exit 0' INT TERM HUP
+trap 'cleanup_tls' EXIT
+
+rm -f "\$MARKER" "\${MARKER}.tmp."* 2>/dev/null || true
+"\$@" &
+_child=\$!
+
+_i=0
+_ready=0
+while [ "\$_i" -lt 50 ]; do
+	if ! kill -0 "\$_child" 2>/dev/null; then
+		wait "\$_child" 2>/dev/null || true
+		exit 1
+	fi
+	if grep -Eq ":\${PORT_HEX} [0-9A-Fa-f]+:[0-9A-Fa-f]+ 0A " /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+		_ready=1
+		break
+	fi
+	sleep 0.1
+	_i=\$((_i + 1))
+done
+
+if [ "\$_ready" -ne 1 ]; then
+	exit 1
+fi
+
+cat > "\${MARKER}.tmp.\$\$" <<MKEOF
 verified=1
-engine=${_engine}
-lan_ip=${_lan_ip}
-https_port=${HTTPS_PORT}
-fingerprint=${_fp_val}
+engine=\${ENGINE}
+pid=\${_child}
+lan_ip=\${LAN_IP}
+https_port=\${HTTPS_P}
+fingerprint=\${FP_VAL}
+MKEOF
+chown 0:0 "\${MARKER}.tmp.\$\$" 2>/dev/null || true
+chmod 0644 "\${MARKER}.tmp.\$\$"
+mv -f "\${MARKER}.tmp.\$\$" "\$MARKER"
+
+wait "\$_child"
+_rc=\$?
+rm -f "\$MARKER" "\${MARKER}.tmp."* 2>/dev/null || true
+exit "\$_rc"
 EOF
-	chown 0:0 "${TLS_MARKER}.tmp.$$" 2>/dev/null || true
-	chmod 0644 "${TLS_MARKER}.tmp.$$"
-	mv -f "${TLS_MARKER}.tmp.$$" "$TLS_MARKER"
+	chown 0:0 "${TLS_RUNNER}.tmp.$$" 2>/dev/null || true
+	chmod 0700 "${TLS_RUNNER}.tmp.$$"
+	mv -f "${TLS_RUNNER}.tmp.$$" "$TLS_RUNNER"
 }
 
 start_service() {
@@ -137,7 +193,7 @@ start_service() {
 	TLS_ENGINE="$(detect_tls_engine)"
 
 	if ensure_tls_cert && [ "$TLS_ENGINE" != "none" ]; then
-		write_tls_marker "$TLS_ENGINE" "$LAN_IP"
+		prepare_tls_state_dir "$TLS_ENGINE" "$LAN_IP"
 		procd_open_instance noc_apid
 		procd_set_param command "$PROG"
 		procd_set_param user noc-api
@@ -152,7 +208,7 @@ start_service() {
 			write_stunnel_conf "$LAN_IP"
 			STUNNEL_BIN="$(command -v stunnel)"
 			procd_open_instance noc_tls_proxy
-			procd_set_param command "$STUNNEL_BIN" "$STUNNEL_CONF"
+			procd_set_param command "$TLS_RUNNER" "$STUNNEL_BIN" "$STUNNEL_CONF"
 			procd_set_param respawn 3600 5 5
 			procd_set_param stdout 1
 			procd_set_param stderr 1
@@ -160,7 +216,7 @@ start_service() {
 		else
 			SOCAT_BIN="$(command -v socat)"
 			procd_open_instance noc_tls_proxy
-			procd_set_param command "$SOCAT_BIN" "OPENSSL-LISTEN:${HTTPS_PORT},bind=${LAN_IP},reuseaddr,fork,cert=${TLS_CERT},key=${TLS_KEY},verify=0" "TCP:127.0.0.1:${HTTP_PORT}"
+			procd_set_param command "$TLS_RUNNER" "$SOCAT_BIN" "OPENSSL-LISTEN:${HTTPS_PORT},bind=${LAN_IP},reuseaddr,fork,cert=${TLS_CERT},key=${TLS_KEY},verify=0" "TCP:127.0.0.1:${HTTP_PORT}"
 			procd_set_param respawn 3600 5 5
 			procd_set_param stdout 1
 			procd_set_param stderr 1
