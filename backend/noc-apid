@@ -1563,6 +1563,17 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 		return;
 	}
 
+	if (action == 'backup_restore' && method == 'POST') {
+		if (sess.role != 'admin') {
+			send_json_env(cli, 403, 'services', {}, [{ code: 'FORBIDDEN', section: 'services', message_ar: 'متاح لصلاحية المدير فقط', request_id: req_id }]);
+			return;
+		}
+		call_helper('sys_backup_restore', { archive_b64: body.archive_b64 || '', expected_sha256: body.expected_sha256 || '', configs: body.configs }, sess.username, remote_ip, function(res) {
+			send_json_env(cli, res.ok ? 200 : 400, 'services', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'services', message_ar: res.message_ar || 'فشلت عملية استعادة النسخة الاحتياطية', request_id: req_id }]);
+		});
+		return;
+	}
+
 	if (action == 'auth_users') {
 		if (sess.role != 'admin') {
 			send_json_env(cli, 403, 'auth', {}, [{ code: 'FORBIDDEN', section: 'auth', message_ar: 'متاح لصلاحية المدير فقط', request_id: req_id }]);

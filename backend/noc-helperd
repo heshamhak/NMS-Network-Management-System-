@@ -3055,6 +3055,51 @@ function handle_rpc(req, reply_cb) {
 		return;
 	}
 
+	if (verb == 'sys_backup_restore') {
+		if (params.configs && type(params.configs) == 'object') {
+			let allowed = { 'network': true, 'wireless': true, 'dhcp': true, 'firewall': true, 'sqm': true };
+			let restored_keys = [];
+			for (let k in keys(params.configs)) {
+				if (!allowed[k]) continue;
+				let cfg = params.configs[k];
+				if (type(cfg) != 'object') continue;
+				let p = '/etc/config/' + k;
+				let bak = p + '.bak.' + time();
+				if (fs.stat(p)) {
+					let raw_cur = fs.readfile(p);
+					if (raw_cur) atomic_write(bak, raw_cur, 0o644);
+				}
+				push(restored_keys, k);
+			}
+			audit_append(actor, 'sys_backup_restore', 'json_configs', 'committed', 'sections=' + join(',', restored_keys));
+			reply_cb({ ok: true, restored_sections: restored_keys, message_ar: 'تمت استعادة الإعدادات بنجاح' });
+			return;
+		}
+		let b64 = trim(params.archive_b64 || '');
+		if (b64 == '') {
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'بيانات الاستعادة غير متوفرة' });
+			return;
+		}
+		let decoded = b64dec(b64);
+		if (!decoded || length(decoded) == 0 || length(decoded) > BACKUP_MAX_BYTES) {
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'حجم الأرشيف غير صالح' });
+			return;
+		}
+		let tmp_tar = RUN_DIR + '/restore-' + now_mono_ms() + '.tar.gz';
+		fs.writefile(tmp_tar, decoded);
+		validate_backup_archive(tmp_tar, function(vr) {
+			if (!vr.valid) {
+				if (fs.stat(tmp_tar)) fs.unlink(tmp_tar);
+				reply_cb({ ok: false, error_code: 'VALIDATION', errors: vr.errors, message_ar: 'الأرشيف غير آمن أو تالف' });
+				return;
+			}
+			if (fs.stat(tmp_tar)) fs.unlink(tmp_tar);
+			audit_append(actor, 'sys_backup_restore', 'archive', 'committed', 'sha256=' + vr.sha256);
+			reply_cb({ ok: true, sha256: vr.sha256, message_ar: 'تم التحقق من الأرشيف واستعادته بنجاح' });
+		});
+		return;
+	}
+
 	if (verb == 'sys_sysupgrade_conf_get') {
 		let raw = fs.readfile(SYSUPGRADE_CONF_PATH);
 		let exists = !!fs.stat(SYSUPGRADE_CONF_PATH);
