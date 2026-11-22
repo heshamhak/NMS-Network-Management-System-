@@ -10,6 +10,7 @@ import * as nms_archive from '/usr/libexec/nms_archive.uc';
 import * as nms_network from '/usr/libexec/nms_network.uc';
 import * as nms_fw_wifi from '/usr/libexec/nms_fw_wifi.uc';
 import * as nms_discovery from '/usr/libexec/nms_discovery.uc';
+import * as nms_clients from '/usr/libexec/nms_clients.uc';
 
 const ETC_DIR = getenv('NOC_ETC_DIR') || '/etc/noc-console';
 const RUN_DIR = getenv('NOC_RUN_DIR') || '/tmp/noc-console';
@@ -34,6 +35,13 @@ let active_clients = 0;
 let last_tick_mono = 0;
 let reconciler_gaps = [];
 let reconciler_tick_count = 0;
+let last_effective_rules_sig = '';
+let cached_usage_by_mac = {};
+
+function now_hhmm_local() {
+	let lt = localtime();
+	return sprintf('%02d:%02d', lt.hour, lt.min);
+}
 
 function now_mono_ms() {
 	let c = clock(true);
@@ -840,8 +848,19 @@ function apply_bridge_block_rules(rules_obj, cb) {
 
 	let nft_path = ETC_DIR + '/noc_block.nft';
 	let aw = atomic_write(nft_path, join('\n', lines) + '\n', 0o600);
-	if (!aw.ok) return false;
+	if (!aw.ok) {
+		if (cb) cb({ ok: false, error: aw.error });
+		return false;
+	}
 	exec_argv_async('/usr/sbin/nft', ['-f', nft_path], 5000, CAP_GENERAL, cb);
+}
+
+function compute_current_effective_rules(manual_rules_override, quotas_override, scheds_override) {
+	let mr = manual_rules_override || read_json(ETC_DIR + '/client_rules.json', { blocked_macs: {}, blocked_ips: {}, nicknames: {}, rate_limits: {} });
+	let q = quotas_override || read_json(ETC_DIR + '/device_quotas.json', {});
+	let sc = scheds_override || read_json(ETC_DIR + '/device_schedules.json', []);
+	let ip_by_mac = nms_clients.parse_leases_ip_map(fs.readfile(LEASES_PATH) || '');
+	return nms_clients.compute_effective_client_rules(mr, q, sc, cached_usage_by_mac, ip_by_mac, now_hhmm_local(), get_gateway_macs(), get_gateway_ips());
 }
 
 function has_prohibited(s) {
@@ -2024,6 +2043,13 @@ function handle_rpc(req, reply_cb) {
 								}
 							} catch (e) {}
 						}
+						if (nlbw_ok) {
+							let next_usage = {};
+							for (let um in keys(nlbw_by_mac)) {
+								next_usage[um] = (nlbw_by_mac[um].rx_bytes || 0) + (nlbw_by_mac[um].tx_bytes || 0);
+							}
+							cached_usage_by_mac = next_usage;
+						}
 						reply_cb({
 							ok: true,
 							rules: rules,
@@ -2857,7 +2883,8 @@ function handle_rpc(req, reply_cb) {
 	if (verb == 'device_quotas_get') {
 		let quotas = read_json(ETC_DIR + '/device_quotas.json', {});
 		let scheds = read_json(ETC_DIR + '/device_schedules.json', []);
-		reply_cb({ ok: true, quotas: quotas, schedules: scheds });
+		let eff = compute_current_effective_rules(null, quotas, scheds);
+		reply_cb({ ok: true, quotas: quotas, schedules: scheds, active_schedules: eff.active_schedules, exceeded_quotas: eff.exceeded_quotas });
 		return;
 	}
 
@@ -3108,7 +3135,7 @@ function handle_rpc(req, reply_cb) {
 		'auth_totp_setup': true, 'auth_totp_enable': true, 'auth_totp_disable': true,
 		'rollback_confirm': true, 'rollback_revert': true,
 		'alerts_set': true, 'alerts_test': true, 'alerts_dispatch': true,
-		'client_quota_set': true, 'schedule_action_set': true,
+		'client_quota_set': true, 'schedule_action_set': true, 'schedule_action_delete': true,
 		'freeze_clear': true
 	};
 	if (!mutating_verbs[verb]) {
@@ -3377,15 +3404,19 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 	if (verb == 'client_block' || verb == 'client_unblock') {
 		let mac = lc(trim(params.mac || ''));
 		let ip = trim(params.ip || '');
-		if (!is_valid_mac(mac)) {
+		if (!nms_clients.is_valid_mac(mac)) {
 			release_lock();
 			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'عنوان MAC غير صالح' });
 			return;
 		}
+		if (ip == '') {
+			let ip_map = nms_clients.parse_leases_ip_map(fs.readfile(LEASES_PATH) || '');
+			if (ip_map[mac]) ip = ip_map[mac];
+		}
 		// P5 Self-lockout preconditions
 		let gw_macs = get_gateway_macs();
 		let gw_ips = get_gateway_ips();
-		if (gw_macs[mac] || (ip != '' && (gw_ips[ip] || ip == client_ip))) {
+		if (nms_clients.is_protected_client(mac, ip, client_ip, gw_macs, gw_ips)) {
 			release_lock();
 			audit_append(actor, verb, mac, 'refused', 'Self-block or gateway protection triggered');
 			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يمكن حظر البوابة الرئيسية أو الجهاز المدير المتصل حالياً' });
@@ -3397,13 +3428,14 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 		let next_rules = read_json(rules_path, { blocked_macs: {}, blocked_ips: {}, nicknames: {} });
 		if (verb == 'client_block') {
 			next_rules.blocked_macs[mac] = true;
-			if (is_valid_ipv4(ip)) next_rules.blocked_ips[ip] = true;
+			if (nms_clients.is_valid_ipv4(ip)) next_rules.blocked_ips[ip] = true;
 		} else {
 			delete next_rules.blocked_macs[mac];
 			if (ip != '') delete next_rules.blocked_ips[ip];
 		}
 		if (!atomic_write_or_reply(rules_path, sprintf('%J\n', next_rules), 0o600, null, null, actor, verb, reply_cb)) return;
-		apply_bridge_block_rules(next_rules, function(apply_res) {
+		let eff = compute_current_effective_rules(next_rules);
+		apply_bridge_block_rules(eff, function(apply_res) {
 			if (!apply_res.ok) {
 				rollback_client_rules(rules_path, snap_raw, prev_rules, verb, actor, verb, mac, function(rb) {
 					release_lock();
@@ -3436,6 +3468,7 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 					});
 					return;
 				}
+				last_effective_rules_sig = eff.signature;
 				release_lock();
 				audit_append(actor, verb, mac + (ip != '' ? ' (' + ip + ')' : ''), 'committed', 'Verified bridge+inet rule');
 				reply_cb({ ok: true, blocked: verb == 'client_block', message_ar: verb == 'client_block' ? 'تم حظر الجهاز على مسار الجسر والتوجيه مع بقاء DNS البوابة مستقراً ما لم يُحجب عبر الجدار' : 'تم إلغاء حظر الجهاز بنجاح' });
@@ -3474,14 +3507,23 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 		let ip = trim(params.ip || '');
 		let nick = replace(trim(params.nickname || ''), /[\r\n\t<>]/g, '');
 		let rate_kbps = +(params.rate_limit_kbps || 0);
-		if (!is_valid_mac(mac) || length(nick) > 48 || rate_kbps < 0 || rate_kbps > 1000000 || (rate_kbps > 0 && rate_kbps < 64)) {
+		if (!nms_clients.is_valid_mac(mac) || length(nick) > 48 || rate_kbps < 0 || rate_kbps > 1000000 || (rate_kbps > 0 && rate_kbps < 64)) {
 			release_lock();
 			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'بيانات الجهاز أو حد السرعة غير صالح (0 أو 64..1000000 Kbps)' });
 			return;
 		}
+		if (ip == '') {
+			let ip_map = nms_clients.parse_leases_ip_map(fs.readfile(LEASES_PATH) || '');
+			if (ip_map[mac]) ip = ip_map[mac];
+		}
+		if (rate_kbps > 0 && !nms_clients.is_valid_ipv4(ip)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'يتطلب تحديد عنوان IP صالح لتطبيق حد السرعة' });
+			return;
+		}
 		let gw_macs = get_gateway_macs();
 		let gw_ips = get_gateway_ips();
-		if (rate_kbps > 0 && (gw_macs[mac] || (ip != '' && (gw_ips[ip] || ip == client_ip)))) {
+		if (rate_kbps > 0 && nms_clients.is_protected_client(mac, ip, client_ip, gw_macs, gw_ips)) {
 			release_lock();
 			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يُسمح بتقييد سرعة البوابة أو الجهاز المدير' });
 			return;
@@ -3494,12 +3536,13 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 		if (!next_rules.rate_limits) next_rules.rate_limits = {};
 		if (nick != '') next_rules.nicknames[mac] = nick;
 		else delete next_rules.nicknames[mac];
-		if (ip != '' && is_valid_ipv4(ip)) {
+		if (ip != '' && nms_clients.is_valid_ipv4(ip)) {
 			if (rate_kbps > 0) next_rules.rate_limits[ip] = rate_kbps;
 			else delete next_rules.rate_limits[ip];
 		}
 		if (!atomic_write_or_reply(rules_path, sprintf('%J\n', next_rules), 0o600, null, null, actor, 'client_set_meta', reply_cb)) return;
-		apply_bridge_block_rules(next_rules, function(ar) {
+		let eff = compute_current_effective_rules(next_rules);
+		apply_bridge_block_rules(eff, function(ar) {
 			if (!ar.ok) {
 				rollback_client_rules(rules_path, snap_raw, prev_rules, 'client_set_meta', actor, 'client_set_meta', mac, function(rb) {
 					release_lock();
@@ -3515,6 +3558,7 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 				});
 				return;
 			}
+			last_effective_rules_sig = eff.signature;
 			release_lock();
 			audit_append(actor, 'client_set_meta', mac, 'committed', 'nick=' + nick + ' kbps=' + rate_kbps);
 			reply_cb({ ok: true, message_ar: 'تم حفظ بيانات وتقييد الجهاز بنجاح' });
@@ -3527,19 +3571,27 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 		let ip = trim(params.ip || '');
 		let hn = trim(params.hostname || '');
 		let enable = !!params.enable;
-		if (!is_valid_mac(mac) || (enable && (!is_valid_ipv4(ip) || ip == get_lan_ip())) || (hn != '' && !match(hn, /^[a-zA-Z0-9_-]{1,32}$/))) {
+		let existing_hosts = [];
+		try {
+			let cur0 = uci.cursor();
+			cur0.foreach('dhcp', 'host', function(s) {
+				push(existing_hosts, { sid: s['.name'], mac: s.mac || '', ip: s.ip || '', name: s.name || '' });
+			});
+		} catch (e) {}
+		let v = nms_clients.validate_static_lease_conflict(mac, ip, hn, enable, get_lan_ip(), get_gateway_ips(), existing_hosts);
+		if (!v.ok) {
 			release_lock();
-			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'بيانات تثبيت IP غير صالحة أو تتعارض مع البوابة' });
+			reply_cb({ ok: false, error_code: v.error_code || 'VALIDATION', message_ar: v.message_ar });
 			return;
 		}
-		let sid = 'noc_' + replace(mac, /:/g, '');
+		let sid = 'noc_' + replace(v.mac, /:/g, '');
 		try {
 			let cur = uci.cursor();
 			if (enable) {
 				cur.set('dhcp', sid, 'host');
-				cur.set('dhcp', sid, 'mac', mac);
-				cur.set('dhcp', sid, 'ip', ip);
-				if (hn != '') cur.set('dhcp', sid, 'name', hn);
+				cur.set('dhcp', sid, 'mac', v.mac);
+				cur.set('dhcp', sid, 'ip', v.ip);
+				if (v.hostname != '') cur.set('dhcp', sid, 'name', v.hostname);
 			} else {
 				cur.delete('dhcp', sid);
 			}
@@ -3551,7 +3603,7 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 		}
 		exec_argv_async('/etc/init.d/dnsmasq', ['reload'], 8000, CAP_GENERAL, function(r) {
 			release_lock();
-			audit_append(actor, 'client_static_lease', mac + '->' + ip, r.ok ? 'committed' : 'failed', 'enable=' + enable);
+			audit_append(actor, 'client_static_lease', v.mac + '->' + v.ip, r.ok ? 'committed' : 'failed', 'enable=' + enable);
 			reply_cb({ ok: r.ok, message_ar: enable ? 'تم تثبيت عنوان IP الثابت للجهاز' : 'تم إلغاء تثبيت العنوان الثابت' });
 		});
 		return;
@@ -4894,41 +4946,128 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 	}
 
 	if (verb == 'client_quota_set') {
-		let mac = lc(trim(params.mac || ''));
-		if (!match(mac, /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/)) {
+		let ip_map = nms_clients.parse_leases_ip_map(fs.readfile(LEASES_PATH) || '');
+		let v = nms_clients.validate_quota_input(params, ip_map, client_ip, get_gateway_macs(), get_gateway_ips());
+		if (!v.ok) {
 			release_lock();
-			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'عنوان MAC غير صالح' });
+			reply_cb({ ok: false, error_code: v.error_code || 'VALIDATION', status: v.error_code == 'FORBIDDEN' ? 403 : 400, message_ar: v.message_ar });
 			return;
 		}
-		let quotas = read_json(ETC_DIR + '/device_quotas.json', {});
-		let qmb = +(params.quota_mb || 0);
-		let tkbps = +(params.throttle_kbps || 0);
-		if (qmb <= 0 && tkbps <= 0) delete quotas[mac];
-		else quotas[mac] = { quota_mb: qmb, throttle_kbps: tkbps, updated_at: now_iso() };
-		if (!atomic_write_or_reply(ETC_DIR + '/device_quotas.json', sprintf('%J\n', quotas), 0o600, null, null, actor, 'client_quota_set', reply_cb)) return;
-		release_lock();
-		audit_append(actor, 'client_quota_set', mac, 'committed', sprintf('quota_mb=%d throttle=%d', qmb, tkbps));
-		reply_cb({ ok: true, message_ar: 'تم حفظ الحصة الشهرية للجهاز بنجاح' });
+		let qpath = ETC_DIR + '/device_quotas.json';
+		let prev_quotas = read_json(qpath, {});
+		let snap_raw = sprintf('%J\n', prev_quotas);
+		let quotas = read_json(qpath, {});
+		if (v.quota_mb <= 0 && v.throttle_kbps <= 0) delete quotas[v.mac];
+		else quotas[v.mac] = { quota_mb: v.quota_mb, throttle_kbps: v.throttle_kbps, updated_at: now_iso() };
+		if (!atomic_write_or_reply(qpath, sprintf('%J\n', quotas), 0o600, null, null, actor, 'client_quota_set', reply_cb)) return;
+		let eff = compute_current_effective_rules(null, quotas, null);
+		apply_bridge_block_rules(eff, function(ar) {
+			if (!ar.ok) {
+				let rb_aw = atomic_write(qpath, snap_raw, 0o600);
+				if (!rb_aw.ok) {
+					let fr = enter_emergency_freeze('client_quota_set rollback failed');
+					release_lock();
+					reply_cb({ ok: false, error_code: 'INTERNAL', rollback_failed: true, freeze_persisted: fr.freeze_persisted, message_ar: 'فشل حرج: تعذر التراجع عن الحصة — تم تجميد التعديلات' });
+					return;
+				}
+				apply_bridge_block_rules(compute_current_effective_rules(null, prev_quotas, null), function() {
+					release_lock();
+					reply_cb({ ok: false, error_code: 'INTERNAL', rolled_back: true, message_ar: 'تعذر تطبيق سياسة الحصة وتم التراجع تلقائياً' });
+				});
+				return;
+			}
+			last_effective_rules_sig = eff.signature;
+			release_lock();
+			audit_append(actor, 'client_quota_set', v.mac, 'committed', sprintf('quota_mb=%d throttle=%d', v.quota_mb, v.throttle_kbps));
+			reply_cb({ ok: true, exceeded: !!eff.exceeded_quotas[v.mac], message_ar: 'تم حفظ الحصة الشهرية للجهاز وتطبيقها بنجاح' });
+		});
 		return;
 	}
 
 	if (verb == 'schedule_action_set') {
-		let mac = lc(trim(params.mac || ''));
-		let action_type = trim(params.action_type || 'block');
-		let start_h = trim(params.start_time || '23:00');
-		let end_h = trim(params.end_time || '07:00');
-		if (!match(mac, /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/) || !match(start_h, /^[0-2][0-9]:[0-5][0-9]$/) || !match(end_h, /^[0-2][0-9]:[0-5][0-9]$/)) {
+		let ip_map = nms_clients.parse_leases_ip_map(fs.readfile(LEASES_PATH) || '');
+		let v = nms_clients.validate_schedule_input(params, ip_map, client_ip, get_gateway_macs(), get_gateway_ips());
+		if (!v.ok) {
 			release_lock();
-			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'بيانات الجدولة أو عنوان MAC غير صالحة' });
+			reply_cb({ ok: false, error_code: v.error_code || 'VALIDATION', status: v.error_code == 'FORBIDDEN' ? 403 : 400, message_ar: v.message_ar });
 			return;
 		}
-		let scheds = read_json(ETC_DIR + '/device_schedules.json', []);
-		push(scheds, { id: urandom_hex(4), mac: mac, action_type: action_type, start_time: start_h, end_time: end_h, enabled: true });
+		let spath = ETC_DIR + '/device_schedules.json';
+		let prev_scheds = read_json(spath, []);
+		let snap_raw = sprintf('%J\n', prev_scheds);
+		let scheds = read_json(spath, []);
+		let sid = urandom_hex(4);
+		let item = { id: sid, mac: v.mac, action_type: v.action_type, start_time: v.start_time, end_time: v.end_time, enabled: true };
+		if (v.action_type == 'throttle') item.throttle_kbps = v.throttle_kbps;
+		push(scheds, item);
 		if (length(scheds) > 40) scheds = slice(scheds, -40);
-		if (!atomic_write_or_reply(ETC_DIR + '/device_schedules.json', sprintf('%J\n', scheds), 0o600, null, null, actor, 'schedule_action_set', reply_cb)) return;
-		release_lock();
-		audit_append(actor, 'schedule_action_set', mac, 'committed', start_h + '-' + end_h + ' ' + action_type);
-		reply_cb({ ok: true, message_ar: 'تمت إضافة جدولة الإجراء للجهاز بنجاح' });
+		if (!atomic_write_or_reply(spath, sprintf('%J\n', scheds), 0o600, null, null, actor, 'schedule_action_set', reply_cb)) return;
+		let eff = compute_current_effective_rules(null, null, scheds);
+		apply_bridge_block_rules(eff, function(ar) {
+			if (!ar.ok) {
+				let rb_aw = atomic_write(spath, snap_raw, 0o600);
+				if (!rb_aw.ok) {
+					let fr = enter_emergency_freeze('schedule_action_set rollback failed');
+					release_lock();
+					reply_cb({ ok: false, error_code: 'INTERNAL', rollback_failed: true, freeze_persisted: fr.freeze_persisted, message_ar: 'فشل حرج: تعذر التراجع عن الجدولة — تم تجميد التعديلات' });
+					return;
+				}
+				apply_bridge_block_rules(compute_current_effective_rules(null, null, prev_scheds), function() {
+					release_lock();
+					reply_cb({ ok: false, error_code: 'INTERNAL', rolled_back: true, message_ar: 'تعذر تطبيق الجدولة وتم التراجع تلقائياً' });
+				});
+				return;
+			}
+			last_effective_rules_sig = eff.signature;
+			release_lock();
+			audit_append(actor, 'schedule_action_set', v.mac, 'committed', v.start_time + '-' + v.end_time + ' ' + v.action_type);
+			reply_cb({ ok: true, id: sid, active_now: !!eff.active_schedules[sid], message_ar: 'تمت إضافة جدولة الإجراء للجهاز بنجاح' });
+		});
+		return;
+	}
+
+	if (verb == 'schedule_action_delete') {
+		let sid = trim(params.id || '');
+		let mac = lc(trim(params.mac || ''));
+		if (sid == '' && !nms_clients.is_valid_mac(mac)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معرّف الجدولة أو عنوان MAC مطلوب' });
+			return;
+		}
+		let spath = ETC_DIR + '/device_schedules.json';
+		let prev_scheds = read_json(spath, []);
+		let snap_raw = sprintf('%J\n', prev_scheds);
+		let next_scheds = filter(prev_scheds, function(s) {
+			if (sid != '') return (s && s.id != sid);
+			return (s && lc(s.mac || '') != mac);
+		});
+		if (length(next_scheds) == length(prev_scheds)) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'NOT_FOUND', status: 404, message_ar: 'الجدولة المطلوبة غير موجودة' });
+			return;
+		}
+		if (!atomic_write_or_reply(spath, sprintf('%J\n', next_scheds), 0o600, null, null, actor, 'schedule_action_delete', reply_cb)) return;
+		let eff = compute_current_effective_rules(null, null, next_scheds);
+		apply_bridge_block_rules(eff, function(ar) {
+			if (!ar.ok) {
+				let rb_aw = atomic_write(spath, snap_raw, 0o600);
+				if (!rb_aw.ok) {
+					let fr = enter_emergency_freeze('schedule_action_delete rollback failed');
+					release_lock();
+					reply_cb({ ok: false, error_code: 'INTERNAL', rollback_failed: true, freeze_persisted: fr.freeze_persisted, message_ar: 'فشل حرج: تعذر التراجع عن حذف الجدولة — تم تجميد التعديلات' });
+					return;
+				}
+				apply_bridge_block_rules(compute_current_effective_rules(null, null, prev_scheds), function() {
+					release_lock();
+					reply_cb({ ok: false, error_code: 'INTERNAL', rolled_back: true, message_ar: 'تعذر تحديث قواعد الجدولة وتم التراجع تلقائياً' });
+				});
+				return;
+			}
+			last_effective_rules_sig = eff.signature;
+			release_lock();
+			audit_append(actor, 'schedule_action_delete', sid != '' ? sid : mac, 'committed', 'Removed schedule');
+			reply_cb({ ok: true, message_ar: 'تم حذف جدولة الجهاز وتحديث القواعد بنجاح' });
+		});
 		return;
 	}
 
@@ -5057,6 +5196,22 @@ function reconciler_tick() {
 				audit_append('reconciler', 'timed_disable_restore', 'protection_enabled', 'committed', 'TIMED_DISABLE_RESTORED');
 			}
 			release_lock();
+		}
+	}
+	if ((reconciler_tick_count % 30) == 0 && !auth_busy && !emergency_freeze_state) {
+		let eff = compute_current_effective_rules();
+		if (last_effective_rules_sig != '' && eff.signature != last_effective_rules_sig) {
+			if (acquire_lock('reconciler', 'client_policy_reconcile').ok) {
+				apply_bridge_block_rules(eff, function(r) {
+					if (r.ok) {
+						last_effective_rules_sig = eff.signature;
+						audit_append('reconciler', 'client_policy_reconcile', 'effective_rules', 'committed', 'Synced schedules/quotas');
+					}
+					release_lock();
+				});
+			}
+		} else if (last_effective_rules_sig == '') {
+			last_effective_rules_sig = eff.signature;
 		}
 	}
 	rec_timer = uloop.timer(1000, reconciler_tick);

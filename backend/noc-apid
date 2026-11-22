@@ -1711,9 +1711,10 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 			});
 			return;
 		}
-		if (action == 'client_quota_set' || action == 'schedule_action_set') {
+		if (action == 'client_quota_set' || action == 'schedule_action_set' || action == 'schedule_action_delete') {
 			call_helper(action, body, sess.username, remote_ip, function(res) {
-				send_json_env(cli, res.ok ? 200 : 400, 'clients', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'clients', message_ar: res.message_ar, request_id: req_id }]);
+				if (res.ok) delete cache_map['clients'];
+				send_json_env(cli, res.ok ? 200 : (res.status || 400), 'clients', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'clients', message_ar: res.message_ar, request_id: req_id }]);
 			});
 			return;
 		}
