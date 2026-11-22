@@ -449,6 +449,7 @@ install_managed_file "${REPO_ROOT}/backend/noc-helperd" "/usr/libexec/noc-helper
 install_managed_file "${REPO_ROOT}/backend/nms_archive.uc" "/usr/libexec/nms_archive.uc" 0644
 install_managed_file "${REPO_ROOT}/backend/nms_network.uc" "/usr/libexec/nms_network.uc" 0644
 install_managed_file "${REPO_ROOT}/backend/nms_fw_wifi.uc" "/usr/libexec/nms_fw_wifi.uc" 0644
+install_managed_file "${REPO_ROOT}/backend/nms_discovery.uc" "/usr/libexec/nms_discovery.uc" 0644
 install_managed_file "${REPO_ROOT}/backend/noc-apid" "/usr/libexec/noc-apid" 0755
 [ "$FAIL_POINT" = "after_backend" ] && { echo "ERROR: Injected failure after_backend" >&2; exit 1; }
 

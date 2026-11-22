@@ -6,6 +6,7 @@ import * as uloop from 'uloop';
 import * as digest from 'digest';
 import * as ubus from 'ubus';
 import * as uci from 'uci';
+import * as nms_discovery from '/usr/libexec/nms_discovery.uc';
 
 const HELPER_SOCK = getenv('NOC_HELPER_SOCK') || '/tmp/noc-console/helper.sock';
 const RUN_DIR = getenv('NOC_RUN_DIR') || '/tmp/noc-console';
@@ -659,9 +660,7 @@ function collect_overview_sync() {
 	let svcs_run = uc.services_running || {};
 
 	let cpu_info = fs.readfile('/proc/cpuinfo') || '';
-	let cpu_model = 'Intel(R) Celeron(R) J4125 CPU @ 2.00GHz';
-	let m_cpu = match(cpu_info, /model name\s*:\s*([^\n]+)/);
-	if (m_cpu) cpu_model = trim(m_cpu[1]);
+	let cpu_model = nms_discovery.detect_cpu_model(cpu_info, sys_board.system);
 
 	let proc_up = +split(trim(read_trim('/proc/uptime', '0')), /\s+/)[0];
 	let load_p = split(trim(read_trim('/proc/loadavg', '0 0 0')), /\s+/);
@@ -1407,60 +1406,33 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 	if (action == 'clients') {
 		cached_helper_call('clients', 4500, 'clients', 'clients_read', {}, sess.username, remote_ip, function(res, errs) {
 			if (!res.ok) return { ok: false, clients: [] };
-			let by_mac = {};
-			let mac_to_ips = {};
-			for (let line in split(res.leases_raw || '', '\n')) {
-				let p = split(trim(line), /\s+/);
-				if (length(p) < 4) continue;
-				let mac = lc(p[1]), ip = p[2], hn = p[3] != '*' ? p[3] : '';
-				if (!by_mac[mac]) {
-					if (length(keys(by_mac)) >= 256) continue; // enforce 256 MAC cap
-					by_mac[mac] = { mac: mac, ip: ip, ips: [], hostname: hn, online: false, arp_state: 'LEASED', blocked: false, overflow_ips: false };
+			let list = nms_discovery.merge_discovered_clients(res);
+			if (sess.role == 'readonly') {
+				for (let c in list) {
+					let orig_mac = c.mac;
+					c.mac = 'HIDDEN';
+					c.ip = 'PSEUDO-' + substr(digest.sha256(BOOT_ID + orig_mac), 0, 8);
+					c.ipv6 = [];
+					c.ips = [];
+					c.hostname = '';
+					c.nickname = '';
+					c.static_lease = false;
+					c.rate_limit_kbps = 0;
+					c.port = '';
+					c.bridge = '';
+					c.ssid = null;
+					c.rssi = null;
+					c.band = null;
+					c.display_name = 'جهاز محلي';
 				}
-				if (index(by_mac[mac].ips, ip) < 0) {
-					if (length(by_mac[mac].ips) < 8) push(by_mac[mac].ips, ip);
-					else by_mac[mac].overflow_ips = true;
-				}
-			}
-			for (let line in split(res.neigh4 || '', '\n')) {
-				let m = match(trim(line), /^([0-9.]+)\s+lladdr\s+([0-9a-fA-F:]+)\s+(\S+)/);
-				if (!m) continue;
-				let ip = m[1], mac = lc(m[2]), st = m[3];
-				if (!by_mac[mac]) {
-					if (length(keys(by_mac)) >= 256) continue;
-					by_mac[mac] = { mac: mac, ip: ip, ips: [], hostname: '', online: false, arp_state: st, blocked: false, overflow_ips: false };
-				}
-				if (index(by_mac[mac].ips, ip) < 0) {
-					if (length(by_mac[mac].ips) < 8) push(by_mac[mac].ips, ip);
-					else by_mac[mac].overflow_ips = true;
-				}
-				by_mac[mac].arp_state = st;
-				if (st == 'REACHABLE' || st == 'DELAY' || st == 'STALE') by_mac[mac].online = true;
-			}
-			let list = [];
-			let rules = res.rules || { blocked_macs: {}, blocked_ips: {}, nicknames: {}, rate_limits: {} };
-			let st_leases = res.static_leases || {};
-			for (let mac in keys(by_mac)) {
-				let c = by_mac[mac];
-				c.blocked = !!rules.blocked_macs[mac];
-				c.nickname = rules.nicknames[mac] || '';
-				c.static_lease = !!st_leases[mac];
-				c.rate_limit_kbps = (rules.rate_limits && rules.rate_limits[c.ip]) ? +rules.rate_limits[c.ip] : 0;
-				c.display_name = c.nickname || c.hostname || ('جهاز ' + (c.ip || mac));
-				let nb = (res.nlbw_by_mac && res.nlbw_by_mac[mac]) || (res.nlbw_by_ip && res.nlbw_by_ip[c.ip]) || { rx_bytes: 0, tx_bytes: 0, conns: 0 };
-				c.total_rx_bytes = +nb.rx_bytes || 0;
-				c.total_tx_bytes = +nb.tx_bytes || 0;
-				c.total_conns = +nb.conns || 0;
-				if (sess.role == 'readonly') {
-					c.mac = 'HIDDEN'; c.ip = 'PSEUDO-' + substr(digest.sha256(BOOT_ID + mac), 0, 8); c.ips = []; c.hostname = ''; c.nickname = ''; c.static_lease = false; c.rate_limit_kbps = 0; c.display_name = 'جهاز محلي';
-				}
-				push(list, c);
 			}
 			return {
 				ok: true,
 				br_netfilter: !!res.br_netfilter,
 				flow_offloading: !!res.flow_offloading,
 				counters_supported: !res.flow_offloading,
+				bridges: res.bridges || [],
+				discovery_status: res.discovery_status || {},
 				clients: list,
 				static_leases_list: sess.role == 'admin' ? (res.static_leases_list || []) : [],
 				local_domains: sess.role == 'admin' ? (res.local_domains || []) : []

@@ -256,6 +256,7 @@ EXPECTED_SUITES = {
     "verify_phase3a_ucode.uc": ("UCODE_SUMMARY", 48),
     "verify_phase3b_ucode.uc": ("UCODE3B_SUMMARY", 39),
     "verify_phase3c_ucode.uc": ("UCODE3C_SUMMARY", 47),
+    "verify_phase4a_ucode.uc": ("UCODE4A_SUMMARY", 15),
 }
 
 
@@ -310,7 +311,7 @@ def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_s
     preexisting_backups = []
     created_libexec = []
     try:
-        for mod in ("nms_archive.uc", "nms_network.uc", "nms_fw_wifi.uc"):
+        for mod in ("nms_archive.uc", "nms_network.uc", "nms_fw_wifi.uc", "nms_discovery.uc"):
             src_mod = os.path.join(REPO_ROOT, "backend", mod)
             shutil.copy2(src_mod, os.path.join(p3a_dir, mod))
             dst_lib = os.path.join(libexec_dir, mod)
@@ -457,6 +458,7 @@ def test_in_chroot_lifecycle(rootfs_dir, ver_label):
             and os.path.isfile(os.path.join(sb, "usr", "libexec", "nms_archive.uc"))
             and os.path.isfile(os.path.join(sb, "usr", "libexec", "nms_network.uc"))
             and os.path.isfile(os.path.join(sb, "usr", "libexec", "nms_fw_wifi.uc"))
+            and os.path.isfile(os.path.join(sb, "usr", "libexec", "nms_discovery.uc"))
             and os.path.isfile(os.path.join(sb, "usr", "libexec", "noc-helperd"))
             and os.path.isfile(os.path.join(sb, "usr", "libexec", "noc-apid"))
             and os.path.isfile(os.path.join(sb, "etc", "init.d", "noc-helperd"))
@@ -841,7 +843,7 @@ def main():
     prod_slice = build_helperd_prod_slice()
     print("=== Phase 3D: OpenWrt 24.10.0 (opkg) & 25.12.6 (apk) Chroot Suites & Lifecycle ===")
     for rootfs, ver in [(ROOTFS_2410, "24.10.0-opkg"), (ROOTFS_2512, "25.12.6-apk")]:
-        for sc in ("verify_phase3a_ucode.uc", "verify_phase3b_ucode.uc", "verify_phase3c_ucode.uc"):
+        for sc in ("verify_phase3a_ucode.uc", "verify_phase3b_ucode.uc", "verify_phase3c_ucode.uc", "verify_phase4a_ucode.uc"):
             run_ucode_suite_in_chroot(rootfs, ver, sc, prod_slice)
         test_in_chroot_lifecycle(rootfs, ver)
 

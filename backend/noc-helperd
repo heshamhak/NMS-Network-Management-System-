@@ -9,6 +9,7 @@ import * as uci from 'uci';
 import * as nms_archive from '/usr/libexec/nms_archive.uc';
 import * as nms_network from '/usr/libexec/nms_network.uc';
 import * as nms_fw_wifi from '/usr/libexec/nms_fw_wifi.uc';
+import * as nms_discovery from '/usr/libexec/nms_discovery.uc';
 
 const ETC_DIR = getenv('NOC_ETC_DIR') || '/etc/noc-console';
 const RUN_DIR = getenv('NOC_RUN_DIR') || '/tmp/noc-console';
@@ -1966,33 +1967,63 @@ function handle_rpc(req, reply_cb) {
 				}
 			});
 		} catch (e) {}
-		exec_argv_async('/sbin/ip', ['-4', 'neigh', 'show', 'dev', 'br-lan'], 4000, CAP_GENERAL, function(n4) {
-			exec_argv_async('/sbin/ip', ['-6', 'neigh', 'show', 'dev', 'br-lan'], 4000, CAP_GENERAL, function(n6) {
-				exec_argv_async('/usr/sbin/nlbw', ['-c', 'json', '-g', 'mac,ip,fam', '-o', '-rx_bytes'], 4000, 262144, function(nlr) {
-					let nlbw_by_mac = {};
-					let nlbw_by_ip = {};
-					if (nlr.ok && nlr.output) {
-						try {
-							let nj = json(nlr.output);
-							if (nj && nj.data) {
-								for (let row in nj.data) {
-									if (length(row) < 7) continue;
-									let rm = lc(trim(row[1] || ''));
-									let rip = trim(row[2] || '');
-									let conns = +(row[3] || 0), rxb = +(row[4] || 0), txb = +(row[6] || 0);
-									if (rm != '' && rm != '00:00:00:00:00:00') {
-										if (!nlbw_by_mac[rm]) nlbw_by_mac[rm] = { rx_bytes: 0, tx_bytes: 0, conns: 0 };
-										nlbw_by_mac[rm].rx_bytes += rxb; nlbw_by_mac[rm].tx_bytes += txb; nlbw_by_mac[rm].conns += conns;
-									}
-									if (rip != '') {
-										if (!nlbw_by_ip[rip]) nlbw_by_ip[rip] = { rx_bytes: 0, tx_bytes: 0, conns: 0 };
-										nlbw_by_ip[rip].rx_bytes += rxb; nlbw_by_ip[rip].tx_bytes += txb; nlbw_by_ip[rip].conns += conns;
-									}
+		let bridges = nms_discovery.discover_bridges_from_sysfs('/sys/class/net');
+		let bridge_exe = find_exe(['/sbin/bridge', '/usr/sbin/bridge']);
+		let wifi_stations = {};
+		let wifi_available = false;
+		try {
+			let uctx = ubus.connect();
+			if (uctx) {
+				let ws = uctx.call('network.wireless', 'status');
+				if (type(ws) == 'object') {
+					let hc_map = {};
+					for (let rad in keys(ws)) {
+						let rinfo = ws[rad];
+						if (!rinfo || type(rinfo.interfaces) != 'array') continue;
+						for (let itf in rinfo.interfaces) {
+							if (itf && itf.ifname) {
+								let hc = uctx.call('hostapd.' + itf.ifname, 'get_clients');
+								if (type(hc) == 'object') {
+									hc_map[itf.ifname] = hc;
+									wifi_available = true;
 								}
 							}
-						} catch (e) {}
+						}
 					}
-					exec_argv_async('/usr/sbin/nft', ['-j', 'list', 'tables'], 4000, CAP_GENERAL, function(nt) {
+					wifi_stations = nms_discovery.parse_wifi_stations(ws, hc_map);
+				}
+				try { uctx.disconnect(); } catch (e) {}
+			}
+		} catch (e) {}
+		exec_argv_async('/sbin/ip', ['-4', 'neigh', 'show'], 4000, CAP_GENERAL, function(n4) {
+			exec_argv_async('/sbin/ip', ['-6', 'neigh', 'show'], 4000, CAP_GENERAL, function(n6) {
+				let finish_clients = function(fdb_raw, fdb_ok) {
+					exec_argv_async('/usr/sbin/nlbw', ['-c', 'json', '-g', 'mac,ip,fam', '-o', '-rx_bytes'], 4000, 262144, function(nlr) {
+						let nlbw_by_mac = {};
+						let nlbw_by_ip = {};
+						let nlbw_ok = false;
+						if (nlr.ok && nlr.output) {
+							try {
+								let nj = json(nlr.output);
+								if (nj && nj.data) {
+									nlbw_ok = true;
+									for (let row in nj.data) {
+										if (length(row) < 7) continue;
+										let rm = lc(trim(row[1] || ''));
+										let rip = trim(row[2] || '');
+										let conns = +(row[3] || 0), rxb = +(row[4] || 0), txb = +(row[6] || 0);
+										if (rm != '' && rm != '00:00:00:00:00:00') {
+											if (!nlbw_by_mac[rm]) nlbw_by_mac[rm] = { rx_bytes: 0, tx_bytes: 0, conns: 0 };
+											nlbw_by_mac[rm].rx_bytes += rxb; nlbw_by_mac[rm].tx_bytes += txb; nlbw_by_mac[rm].conns += conns;
+										}
+										if (rip != '') {
+											if (!nlbw_by_ip[rip]) nlbw_by_ip[rip] = { rx_bytes: 0, tx_bytes: 0, conns: 0 };
+											nlbw_by_ip[rip].rx_bytes += rxb; nlbw_by_ip[rip].tx_bytes += txb; nlbw_by_ip[rip].conns += conns;
+										}
+									}
+								}
+							} catch (e) {}
+						}
 						reply_cb({
 							ok: true,
 							rules: rules,
@@ -2004,13 +2035,28 @@ function handle_rpc(req, reply_cb) {
 							leases_raw: leases_raw,
 							neigh4: n4.ok ? n4.output : '',
 							neigh6: n6.ok ? n6.output : '',
+							fdb_raw: fdb_raw,
+							bridges: bridges,
+							wifi_stations: wifi_stations,
+							discovery_status: {
+								neigh4: !!n4.ok,
+								neigh6: !!n6.ok,
+								fdb: fdb_ok,
+								wifi: wifi_available,
+								nlbw: nlbw_ok
+							},
 							br_netfilter: br_nf,
-							flow_offloading: flow_offload,
-							nft_tables: nt.ok ? nt.output : '',
-							overflow: nt.overflow
+							flow_offloading: flow_offload
 						});
 					});
-				});
+				};
+				if (bridge_exe) {
+					exec_argv_async(bridge_exe, ['fdb', 'show'], 4000, CAP_GENERAL, function(fdb_r) {
+						finish_clients(fdb_r.ok ? fdb_r.output : '', !!fdb_r.ok);
+					});
+				} else {
+					finish_clients('', false);
+				}
 			});
 		});
 		return;
