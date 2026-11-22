@@ -1978,6 +1978,52 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
                     sup_proc.kill()
             shutil.rmtree(uc_stage, ignore_errors=True)
 
+# 7c. Regression test: noc-helperd firewall_read with forwarding rules on BOTH OpenWrt 24.10.0 & 25.12.6
+m_helperd_fw = re.search(r"(\tif \(verb == 'firewall_read'\) \{.*?\n\t\treturn;\n\t\})", helperd_src, re.S)
+if not m_helperd_fw:
+    fail("P4F-API: failed to extract noc-helperd firewall_read")
+else:
+    fw_fn_src = m_helperd_fw.group(1)
+    for ver_label, rfs in (("24.10.0-opkg", "/tmp/openwrt-24.10-x86-64-rootfs"), ("25.12.6-apk", "/tmp/openwrt-x86-64-rootfs")):
+        if os.path.isdir(rfs) and os.path.isfile(os.path.join(rfs, "usr/bin/ucode")):
+            fw_cfg_p = os.path.join(rfs, "etc", "config", "firewall")
+            had_fw_cfg = os.path.isfile(fw_cfg_p)
+            orig_fw_cfg = open(fw_cfg_p, "rb").read() if had_fw_cfg else None
+            dst_fw_uc = os.path.join(rfs, "tmp", "test_firewall_read.uc")
+            try:
+                os.makedirs(os.path.dirname(fw_cfg_p), exist_ok=True)
+                open(fw_cfg_p, "w", encoding="utf-8").write(
+                    "config defaults\n\toption input 'REJECT'\n\toption output 'ACCEPT'\n\toption forward 'REJECT'\n\n"
+                    "config zone\n\toption name 'lan'\n\toption input 'ACCEPT'\n\toption output 'ACCEPT'\n\toption forward 'ACCEPT'\n\n"
+                    "config forwarding\n\toption src 'lan'\n\toption dest 'wan'\n"
+                )
+                fw_test_uc = (
+                    "import * as uci from 'uci';\n"
+                    "import * as fs from 'fs';\n"
+                    "import * as ubus from 'ubus';\n"
+                    "function exec_argv_async(exe, argv, t, cap, cb) { cb({ ok: true, output: '[]' }); }\n"
+                    "let verb = 'firewall_read';\n"
+                    "let got = null;\n"
+                    "function reply_cb(res) { got = res; }\n"
+                    "function run_fw() {\n" + fw_fn_src + "\n}\n"
+                    "run_fw();\n"
+                    "if (!got || !got.ok || type(got.forwardings) != 'array' || length(got.forwardings) != 1 || got.forwardings[0].src != 'lan' || got.forwardings[0].dest != 'wan') exit(1);\n"
+                    "print('FW_READ_PASS\\n');\n"
+                )
+                open(dst_fw_uc, "w", encoding="utf-8").write(fw_test_uc)
+                r_fw = subprocess.run(["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/ucode", "/tmp/test_firewall_read.uc"], capture_output=True, text=True, timeout=10)
+                if r_fw.returncode == 0 and "FW_READ_PASS" in r_fw.stdout:
+                    ok(f"FIREWALL-READ[{ver_label}]: noc-helperd firewall_read forwardings uci.cursor() regression verified")
+                else:
+                    fail(f"FIREWALL-READ[{ver_label}]: rc={r_fw.returncode} err={r_fw.stderr}")
+            finally:
+                if os.path.exists(dst_fw_uc):
+                    os.unlink(dst_fw_uc)
+                if had_fw_cfg and orig_fw_cfg is not None:
+                    open(fw_cfg_p, "wb").write(orig_fw_cfg)
+                elif os.path.exists(fw_cfg_p):
+                    os.unlink(fw_cfg_p)
+
 # 9. Option A Root-Interface (/) Redirect & Atomic LuCI Restore Verification (Sections A, B, C, D)
 print("\n=== 8. Root-Interface (/) Redirect & Atomic LuCI Restore (Option A) ===")
 launcher_html_p = os.path.join(ROOT, "frontend", "launcher_index.html")

@@ -2543,9 +2543,12 @@ function handle_rpc(req, reply_cb) {
 				zones: fw_zones,
 				forwardings: (function() {
 					let fw_fwds = [];
-					cur.foreach('firewall', 'forwarding', function(s) {
-						push(fw_fwds, { id: s['.name'], src: s.src || '', dest: s.dest || '', enabled: s.enabled != '0' });
-					});
+					try {
+						let fwd_cur = uci.cursor();
+						fwd_cur.foreach('firewall', 'forwarding', function(s) {
+							push(fw_fwds, { id: s['.name'], src: s.src || '', dest: s.dest || '', enabled: s.enabled != '0' });
+						});
+					} catch (e) {}
 					return fw_fwds;
 				})(),
 				rules: fw_rules,
