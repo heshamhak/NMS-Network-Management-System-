@@ -2007,7 +2007,7 @@ else:
 node_launcher_test = f"""
 const fs = require('fs');
 const code = fs.readFileSync({json.dumps(launcher_js_p)}, 'utf8');
-function runCase(proto, host, hostname, port) {{
+function runCase(proto, host, hostname, port, sysHn) {{
   let replaced = null;
   let linkHref = '#';
   const window = {{
@@ -2020,6 +2020,9 @@ function runCase(proto, host, hostname, port) {{
     }}
   }};
   const document = {{
+    documentElement: {{
+      getAttribute: (k) => (k === 'data-nms-sys-hostname' && sysHn) ? sysHn : null
+    }},
     getElementById: (id) => id === 'manualLink' ? {{ setAttribute: (k, v) => {{ if (k === 'href') linkHref = v; }} }} : null
   }};
   const fn = new Function('window', 'document', code);
@@ -2041,10 +2044,30 @@ for (const [host, hname, port, exp] of [
   ['gateway.home.arpa', 'gateway.home.arpa', '', 'https://gateway.home.arpa:8743/'],
   ['router', 'router', '', 'https://router:8743/'],
 ]) {{
-  const c = runCase('http:', host, hname, port);
+  const c = runCase('http:', host, hname, port, '');
   if (c.replaced !== exp || c.linkHref !== exp) {{
     console.error('Trusted host failed:', host, c);
     process.exit(1);
+  }}
+}}
+// System hostname parity: when data-nms-sys-hostname="edge-gw-01" is stamped by enable-root-redirect.sh,
+// edge-gw-01, edge-gw-01.lan, edge-gw-01.local, and edge-gw-01.home.arpa MUST be accepted, while unapproved names remain rejected
+for (const [host, hname, port, exp] of [
+  ['edge-gw-01', 'edge-gw-01', '', 'https://edge-gw-01:8743/'],
+  ['edge-gw-01.lan:80', 'edge-gw-01.lan', '80', 'https://edge-gw-01.lan:8743/'],
+  ['edge-gw-01.local', 'edge-gw-01.local', '', 'https://edge-gw-01.local:8743/'],
+  ['edge-gw-01.home.arpa', 'edge-gw-01.home.arpa', '', 'https://edge-gw-01.home.arpa:8743/'],
+]) {{
+  const cOk = runCase('http:', host, hname, port, 'edge-gw-01');
+  if (cOk.replaced !== exp || cOk.linkHref !== exp) {{
+    console.error('System hostname parity failed when stamped:', host, cOk);
+    process.exit(6);
+  }}
+  // Without data-nms-sys-hostname="edge-gw-01" (or with a different sys hostname), edge-gw-01 MUST be rejected
+  const cNo = runCase('http:', host, hname, port, 'other-gw');
+  if (cNo.replaced !== null || cNo.linkHref !== '#') {{
+    console.error('Unconfigured hostname was not rejected:', host, cNo);
+    process.exit(7);
   }}
 }}
 // HTTPS port 443 -> https://192.168.1.1:8743/
@@ -2156,6 +2179,20 @@ for ver_label, rfs in (("24.10.0-opkg", "/tmp/openwrt-24.10-x86-64-rootfs"), ("2
                     capture_output=True, text=True, timeout=10,
                 )
                 if rc.returncode != 0 or "Status: 302 Found\nLocation: https://192.168.1.1:8743/\n" not in rc.stdout:
+                    cgi_ok = False
+                    break
+            # Verify dynamic system hostname parity in CGI (NMS_SYS_HOSTNAME / UCI / /proc/sys/kernel/hostname)
+            for sys_h, exp_loc in [
+                ("edge-gw-01", "https://edge-gw-01:8743/"),
+                ("edge-gw-01.lan:80", "https://edge-gw-01.lan:8743/"),
+                ("edge-gw-01.local", "https://edge-gw-01.local:8743/"),
+                ("edge-gw-01.home.arpa:443", "https://edge-gw-01.home.arpa:8743/"),
+            ]:
+                rc_sys = subprocess.run(
+                    ["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/env", "NMS_SYS_HOSTNAME=edge-gw-01", f"HTTP_HOST={sys_h}", "/usr/bin/ucode", "/tmp/test_luci_redirect.uc"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if rc_sys.returncode != 0 or f"Status: 302 Found\nLocation: {exp_loc}\n" not in rc_sys.stdout:
                     cgi_ok = False
                     break
             if cgi_ok:
@@ -2297,24 +2334,60 @@ with tempfile.TemporaryDirectory(prefix="nms_root_redirect_lifecycle_") as rr_td
     else:
         fail(f"ROOT-REDIRECT-D[mid_activation_failure_rolls_back_cleanly]: rc={r_en_fail.returncode}")
 
-    # B1 & B2: Enable root redirect -> verifies pinned hashes, writes manifest, updates /www/index.html and /www/cgi-bin/luci to 8743
+    # B1 & B2: Enable root redirect (with configured UCI system hostname 'edge-gw-01') -> verifies pinned hashes, writes manifest,
+    # stamps data-nms-sys-hostname="edge-gw-01" into /www/index.html, and ensures 100% policy parity between launcher.js and luci_redirect_cgi.uc
+    os.makedirs(os.path.join(rr_td, "etc", "config"), exist_ok=True)
+    open(os.path.join(rr_td, "etc", "config", "system"), "w", encoding="utf-8").write("config system\n\toption hostname 'edge-gw-01'\n")
+    exp_stamped_idx_bytes = open(launcher_html_p, "rb").read().replace(
+        b'<html lang="ar" dir="rtl">',
+        b'<html lang="ar" dir="rtl" data-nms-sys-hostname="edge-gw-01">',
+    )
     r_en_ok = subprocess.run(["sh", enable_sh_p], env=env_rr, capture_output=True, text=True)
     # Run a second time (simulating NMS upgrade) -> MUST still NOT overwrite .luci.bak.html or .orig.bak with the new redirect files!
     r_en_up = subprocess.run(["sh", enable_sh_p], env=env_rr, capture_output=True, text=True)
     saved_manifest_bytes = open(manifest_p, "rb").read() if os.path.isfile(manifest_p) else b""
+
+    # Verify end-to-end parity between the stamped /www/index.html + /www/pro/launcher.js and /www/cgi-bin/luci for system hostname 'edge-gw-01'
+    parity_node_test = f"""
+const fs = require('fs');
+const html = fs.readFileSync({json.dumps(idx_p)}, 'utf8');
+const code = fs.readFileSync({json.dumps(os.path.join(rr_td, "www", "pro", "launcher.js"))}, 'utf8');
+const m = /data-nms-sys-hostname="([^"]+)"/.exec(html);
+if (!m || m[1] !== 'edge-gw-01') process.exit(10);
+function testHost(h) {{
+  let replaced = null;
+  const window = {{ location: {{ protocol: 'http:', host: h, hostname: h.split(':')[0], port: h.split(':')[1] || '', replace: (u) => {{ replaced = u; }} }} }};
+  const document = {{
+    documentElement: {{ getAttribute: (k) => k === 'data-nms-sys-hostname' ? m[1] : null }},
+    getElementById: () => ({{ setAttribute: () => {{}} }})
+  }};
+  (new Function('window', 'document', code))(window, document);
+  return replaced;
+}}
+if (testHost('edge-gw-01') !== 'https://edge-gw-01:8743/') process.exit(11);
+if (testHost('edge-gw-01.lan:80') !== 'https://edge-gw-01.lan:8743/') process.exit(12);
+if (testHost('edge-gw-01.local') !== 'https://edge-gw-01.local:8743/') process.exit(13);
+if (testHost('edge-gw-01.home.arpa') !== 'https://edge-gw-01.home.arpa:8743/') process.exit(14);
+if (testHost('unapproved-box.lan') !== null) process.exit(15);
+console.log('PARITY_OK');
+"""
+    r_par = subprocess.run(["node", "-e", parity_node_test], capture_output=True, text=True, timeout=10)
+
     if (
         r_en_ok.returncode == 0
         and r_en_up.returncode == 0
+        and r_par.returncode == 0
+        and "PARITY_OK" in r_par.stdout
         and hashlib.sha256(open(idx_bak_p, "rb").read()).hexdigest() == orig_idx_sha
         and hashlib.sha256(open(cgi_bak_p, "rb").read()).hexdigest() == orig_cgi_sha
-        and open(idx_p, "rb").read() == open(launcher_html_p, "rb").read()
+        and open(idx_p, "rb").read() == exp_stamped_idx_bytes
         and open(cgi_p, "rb").read() == open(luci_cgi_p, "rb").read()
         and (os.stat(os.path.join(rr_td, "etc", "noc-console")).st_mode & 0o777) == 0o700
         and len(saved_manifest_bytes.splitlines()) == 2
     ):
-        ok("ROOT-REDIRECT-B[enable_and_upgrade_preserve_preexisting_luci_backups_sha256]")
+        ok("ROOT-REDIRECT-B[enable_and_upgrade_preserve_preexisting_luci_backups_sha256_and_sys_hostname_parity]")
     else:
-        fail(f"ROOT-REDIRECT-B[enable_and_upgrade_preserve_preexisting_luci_backups_sha256]: rc1={r_en_ok.returncode} rc2={r_en_up.returncode} err={r_en_ok.stderr} {r_en_up.stderr}")
+        fail(f"ROOT-REDIRECT-B[enable_and_upgrade_preserve_preexisting_luci_backups_sha256_and_sys_hostname_parity]: rc1={r_en_ok.returncode} rc2={r_en_up.returncode} par={r_par.returncode} err={r_en_ok.stderr} {r_par.stderr}")
 
     # Blocker 2: Mandatory restore manifest verification
     # Test 1: Missing manifest -> restore-luci.sh MUST fail closed without touching /www/index.html or /www/cgi-bin/luci
@@ -2344,7 +2417,7 @@ with tempfile.TemporaryDirectory(prefix="nms_root_redirect_lifecycle_") as rr_td
         and r_m_incomplete.returncode != 0
         and r_m_malformed.returncode != 0
         and r_m_wrong_sha.returncode != 0
-        and open(idx_p, "rb").read() == open(launcher_html_p, "rb").read()
+        and open(idx_p, "rb").read() == exp_stamped_idx_bytes
         and open(cgi_p, "rb").read() == open(luci_cgi_p, "rb").read()
     ):
         ok("ROOT-REDIRECT-B[restore_luci_mandatory_manifest_missing_corrupt_or_hash_mismatch_fails_closed]")

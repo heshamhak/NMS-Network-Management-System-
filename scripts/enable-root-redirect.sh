@@ -220,12 +220,48 @@ EOF
 chmod 0600 "${LUCI_META}.tmp.$$"
 mv -f "${LUCI_META}.tmp.$$" "$LUCI_META"
 
-# 4. Install launcher.js, /www/index.html, and /www/cgi-bin/luci atomically
+get_sys_hostname() {
+  if [ -n "${NMS_SYS_HOSTNAME:-}" ]; then
+    printf '%s' "$NMS_SYS_HOSTNAME" | tr 'A-Z' 'a-z' | tr -d ' \t\r\n'
+    return 0
+  fi
+  if [ -z "$ROOT_PREFIX" ] && command -v uci >/dev/null 2>&1; then
+    _uh="$(uci -q get system.@system[0].hostname 2>/dev/null || true)"
+    if [ -n "$_uh" ]; then
+      printf '%s' "$_uh" | tr 'A-Z' 'a-z' | tr -d ' \t\r\n'
+      return 0
+    fi
+  fi
+  if [ -f "${ROOT_PREFIX}/etc/config/system" ]; then
+    _sh="$(awk '/option[[:space:]]+hostname/{gsub(/[\x27"]/,"",$3); print tolower($3); exit}' "${ROOT_PREFIX}/etc/config/system" 2>/dev/null || true)"
+    if [ -n "$_sh" ]; then
+      printf '%s' "$_sh" | tr -d ' \t\r\n'
+      return 0
+    fi
+  fi
+  if [ -f "${ROOT_PREFIX}/proc/sys/kernel/hostname" ]; then
+    tr 'A-Z' 'a-z' < "${ROOT_PREFIX}/proc/sys/kernel/hostname" | tr -d ' \t\r\n'
+    return 0
+  fi
+  if [ -z "$ROOT_PREFIX" ] && [ -f /proc/sys/kernel/hostname ]; then
+    tr 'A-Z' 'a-z' < /proc/sys/kernel/hostname | tr -d ' \t\r\n'
+    return 0
+  fi
+  printf '%s' "router"
+}
+
+SYS_HOSTNAME="$(get_sys_hostname)"
+if ! printf '%s\n' "$SYS_HOSTNAME" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'; then
+  SYS_HOSTNAME="router"
+fi
+
+# 4. Install launcher.js, /www/index.html (with stamped data-nms-sys-hostname), and /www/cgi-bin/luci atomically
 cp "$LAUNCHER_JS_SRC" "${PRO_DIR}/launcher.js.tmp.$$"
 chmod 0644 "${PRO_DIR}/launcher.js.tmp.$$"
 mv -f "${PRO_DIR}/launcher.js.tmp.$$" "${PRO_DIR}/launcher.js"
 
-cp "$LAUNCHER_HTML_SRC" "${WEB_INDEX}.tmp.$$"
+sed "s/<html lang=\"ar\" dir=\"rtl\">/<html lang=\"ar\" dir=\"rtl\" data-nms-sys-hostname=\"${SYS_HOSTNAME}\">/" "$LAUNCHER_HTML_SRC" > "${WEB_INDEX}.tmp.$$"
+EXP_INDEX_SHA="$(file_sha256 "${WEB_INDEX}.tmp.$$")"
 chmod 0644 "${WEB_INDEX}.tmp.$$"
 mv -f "${WEB_INDEX}.tmp.$$" "$WEB_INDEX"
 [ "$FAIL_POINT" = "after_index" ] && { echo "ERROR: Injected failure after_index" >&2; exit 1; }
@@ -235,10 +271,10 @@ chmod 0755 "${LUCI_CGI}.tmp.$$"
 mv -f "${LUCI_CGI}.tmp.$$" "$LUCI_CGI"
 [ "$FAIL_POINT" = "after_cgi" ] && { echo "ERROR: Injected failure after_cgi" >&2; exit 1; }
 
-# 5. Final verification: backups untouched and new files match sources
+# 5. Final verification: backups untouched and new files match expected hashes
 [ "$(file_sha256 "$WEB_INDEX_BAK")" = "$INDEX_BAK_SHA" ] || { echo "ERROR: $WEB_INDEX_BAK modified during activation" >&2; exit 1; }
 [ "$(file_sha256 "$LUCI_CGI_BAK")" = "$CGI_BAK_SHA" ] || { echo "ERROR: $LUCI_CGI_BAK modified during activation" >&2; exit 1; }
-[ "$(file_sha256 "$WEB_INDEX")" = "$(file_sha256 "$LAUNCHER_HTML_SRC")" ] || { echo "ERROR: $WEB_INDEX verification failed" >&2; exit 1; }
+[ "$(file_sha256 "$WEB_INDEX")" = "$EXP_INDEX_SHA" ] || { echo "ERROR: $WEB_INDEX verification failed" >&2; exit 1; }
 [ "$(file_sha256 "$LUCI_CGI")" = "$(file_sha256 "$REDIRECT_CGI_SRC")" ] || { echo "ERROR: $LUCI_CGI verification failed" >&2; exit 1; }
 
 COMMITTED=1

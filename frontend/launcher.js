@@ -47,9 +47,25 @@
 
   var APPROVED_BASE_NAMES = ['localhost', 'router', 'gateway', 'nms'];
 
+  function getConfiguredSysHostname() {
+    if (document && document.documentElement && typeof document.documentElement.getAttribute === 'function') {
+      var attr = document.documentElement.getAttribute('data-nms-sys-hostname');
+      if (attr && typeof attr === 'string') {
+        var clean = attr.trim().toLowerCase();
+        if (/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(clean)) return clean;
+      }
+    }
+    return '';
+  }
+
   function isApprovedLocalHostname(lower) {
-    for (var i = 0; i < APPROVED_BASE_NAMES.length; i++) {
-      var b = APPROVED_BASE_NAMES[i];
+    var list = APPROVED_BASE_NAMES.slice();
+    var sysHn = getConfiguredSysHostname();
+    if (sysHn && list.indexOf(sysHn) === -1) {
+      list.push(sysHn);
+    }
+    for (var i = 0; i < list.length; i++) {
+      var b = list[i];
       if (lower === b) return true;
       if (b !== 'localhost' && (lower === b + '.lan' || lower === b + '.local' || lower === b + '.home.arpa')) {
         return true;
