@@ -6,12 +6,14 @@ mkdir -p /tmp/openwrt-24.10-x86-64-rootfs /tmp/openwrt-x86-64-rootfs /tmp/openwr
 
 if [ ! -x /tmp/openwrt-24.10-x86-64-rootfs/bin/opkg ]; then
   curl -fsSL https://downloads.openwrt.org/releases/24.10.0/targets/x86/64/openwrt-24.10.0-x86-64-rootfs.tar.gz \
-    | tar -xz -C /tmp/openwrt-24.10-x86-64-rootfs
+    | tar -xz --no-same-owner --exclude='./dev/*' --exclude='dev/*' -C /tmp/openwrt-24.10-x86-64-rootfs
+  mkdir -p /tmp/openwrt-24.10-x86-64-rootfs/dev
 fi
 
 if [ ! -x /tmp/openwrt-x86-64-rootfs/usr/bin/apk ]; then
   curl -fsSL https://downloads.openwrt.org/releases/25.12.6/targets/x86/64/openwrt-25.12.6-x86-64-rootfs.tar.gz \
-    | tar -xz -C /tmp/openwrt-x86-64-rootfs
+    | tar -xz --no-same-owner --exclude='./dev/*' --exclude='dev/*' -C /tmp/openwrt-x86-64-rootfs
+  mkdir -p /tmp/openwrt-x86-64-rootfs/dev
 fi
 
 python3 - <<'PY'
