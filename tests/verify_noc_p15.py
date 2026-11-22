@@ -13,6 +13,7 @@ GATEWAY = os.environ.get("NOC_GATEWAY", "")
 SHIPPED_FILES = [
     "frontend/index.html",
     "frontend/launcher_index.html",
+    "frontend/launcher.js",
     "frontend/styles.css",
     "frontend/app.js",
     "frontend/nms-i18n.js",
@@ -20,6 +21,7 @@ SHIPPED_FILES = [
     "backend/noc-apid",
     "init.d/noc-helperd",
     "init.d/noc-apid",
+    "scripts/luci_redirect_cgi.uc",
     "schemas/noc_schemas.json",
     "frontend/glossary_ar.json",
 ]
@@ -79,12 +81,13 @@ for html_rel in ("frontend/index.html", "frontend/launcher_index.html"):
     else:
         ok(f"{html_rel}: 0 inline JS event attributes")
 
-index_txt = open(os.path.join(ROOT, "frontend/index.html"), "r", encoding="utf-8").read()
-inline_scripts = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>", index_txt, re.I)
-if inline_scripts:
-    fail(f"Inline <script> tag found in index.html: {inline_scripts}")
-else:
-    ok("index.html: strict script-src 'self' compatible (no inline scripts)")
+for html_check_rel in ("frontend/index.html", "frontend/launcher_index.html"):
+    htxt_chk = open(os.path.join(ROOT, html_check_rel), "r", encoding="utf-8").read()
+    inline_scripts = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>", htxt_chk, re.I)
+    if inline_scripts:
+        fail(f"Inline <script> tag found in {html_check_rel}: {inline_scripts}")
+    else:
+        ok(f"{html_check_rel}: strict script-src 'self' compatible (no inline scripts)")
 
 app_txt = open(os.path.join(ROOT, "frontend/app.js"), "r", encoding="utf-8").read()
 if ".innerHTML" in app_txt or "eval(" in app_txt or "new Function" in app_txt:

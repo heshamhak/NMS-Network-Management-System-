@@ -474,6 +474,9 @@ install_managed_file "${REPO_ROOT}/backend/nms_access_dhcp.uc" "/usr/libexec/nms
 install_managed_file "${REPO_ROOT}/backend/nms_sqm.uc" "/usr/libexec/nms_sqm.uc" 0644
 install_managed_file "${REPO_ROOT}/backend/nms_topology.uc" "/usr/libexec/nms_topology.uc" 0644
 install_managed_file "${REPO_ROOT}/backend/noc-apid" "/usr/libexec/noc-apid" 0755
+install_managed_file "${REPO_ROOT}/scripts/luci_redirect_cgi.uc" "/usr/libexec/nms_luci_redirect_cgi.uc" 0755
+install_managed_file "${REPO_ROOT}/scripts/restore-luci.sh" "/usr/sbin/restore-luci" 0755
+install_managed_file "${REPO_ROOT}/scripts/enable-root-redirect.sh" "/usr/sbin/enable-nms-root-redirect" 0755
 [ "$FAIL_POINT" = "after_backend" ] && { echo "ERROR: Injected failure after_backend" >&2; exit 1; }
 
 install_managed_file "${REPO_ROOT}/init.d/noc-helperd" "/etc/init.d/noc-helperd" 0755

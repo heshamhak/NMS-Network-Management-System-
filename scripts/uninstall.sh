@@ -12,6 +12,7 @@ if [ "${1:-}" = "--purge" ]; then
   PURGE=1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_PREFIX="${NMS_ROOT_PREFIX:-}"
 SKIP_SERVICE_STOP="${NMS_SKIP_SERVICE_STOP:-0}"
 
@@ -30,6 +31,18 @@ RESTORE_FILE="${ETC_DIR}/restorable_files.manifest"
 UNINSTALL_ERR=0
 
 echo "[1/4] Stopping and disabling NMS services..."
+if [ -f "${ETC_DIR}/luci_backup.manifest" ] || { [ -s "${ROOT_PREFIX}/www/index.luci.bak.html" ] && [ -s "${ROOT_PREFIX}/www/cgi-bin/luci.orig.bak" ]; }; then
+  RESTORE_LUCI_BIN="${SCRIPT_DIR}/restore-luci.sh"
+  if [ ! -f "$RESTORE_LUCI_BIN" ] && [ -f "${ROOT_PREFIX}/usr/sbin/restore-luci" ]; then
+    RESTORE_LUCI_BIN="${ROOT_PREFIX}/usr/sbin/restore-luci"
+  fi
+  if [ -f "$RESTORE_LUCI_BIN" ]; then
+    if ! NMS_ROOT_PREFIX="$ROOT_PREFIX" sh "$RESTORE_LUCI_BIN" --cleanup-nms-owned-backups; then
+      echo "UNINSTALL ERROR: failed to restore original LuCI files via restore-luci" >&2
+      UNINSTALL_ERR=1
+    fi
+  fi
+fi
 if [ "$SKIP_SERVICE_STOP" -eq 0 ] && [ -z "$ROOT_PREFIX" ]; then
   if [ -e /etc/init.d/noc-apid ]; then
     /etc/init.d/noc-apid stop || { echo "UNINSTALL ERROR: failed to stop /etc/init.d/noc-apid" >&2; UNINSTALL_ERR=1; }

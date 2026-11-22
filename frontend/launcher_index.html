@@ -3,13 +3,17 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>نظام إدارة الشبكة NMS — جاري التحويل</title>
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
+  <title>نظام إدارة الشبكة NMS — جاري التحويل الآمن</title>
+  <noscript>
+    <meta http-equiv="refresh" content="0; url=/cgi-bin/luci" />
+  </noscript>
   <style>
     html, body {
       margin: 0;
       padding: 0;
       background: #18181B;
-      color: #E4E4E7;
+      color: #F4F4F5;
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       display: flex;
       align-items: center;
@@ -40,19 +44,9 @@
 <body>
   <div class="box">
     <h1>نظام إدارة الشبكة NMS</h1>
-    <p id="statusMsg">جاري التحويل الآمن إلى بوابة التحكم المستقلة على المنفذ 8780...</p>
-    <a id="manualLink" href="#">فتح نظام إدارة الشبكة NMS</a>
+    <p id="statusMsg">جاري التحويل الآمن إلى واجهة الإدارة المشفرة على المنفذ 8743...</p>
+    <a id="manualLink" href="/cgi-bin/luci">فتح نظام إدارة الشبكة NMS</a>
   </div>
-  <script>
-    (function() {
-      var proto = 'http:';
-      var host = window.location.hostname || window.location.host.split(':')[0];
-      if (!host) return;
-      var target = proto + '//' + host + ':8780/';
-      var link = document.getElementById('manualLink');
-      if (link) link.href = target;
-      window.location.replace(target);
-    })();
-  </script>
+  <script src="/pro/launcher.js"></script>
 </body>
 </html>
