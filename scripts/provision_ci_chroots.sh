@@ -2,6 +2,13 @@
 # Provision isolated OpenWrt 24.10.0 (opkg) & 25.12.6 (apk) chroot rootfs and ucode modules for CI.
 set -eu
 
+if [ ! -x /usr/sbin/chroot ]; then
+  CHROOT_REAL="$(command -v chroot || true)"
+  if [ -n "$CHROOT_REAL" ] && [ -x "$CHROOT_REAL" ]; then
+    sudo ln -sf "$CHROOT_REAL" /usr/sbin/chroot
+  fi
+fi
+
 mkdir -p /tmp/openwrt-24.10-x86-64-rootfs /tmp/openwrt-x86-64-rootfs /tmp/openwrt-pkg-cache/25.12.6
 
 if [ ! -x /tmp/openwrt-24.10-x86-64-rootfs/bin/opkg ]; then
