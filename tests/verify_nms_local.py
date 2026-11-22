@@ -2008,6 +2008,7 @@ else:
                 "  cursor: function() {\n"
                 "    let c = real_uci.cursor();\n"
                 "    return {\n"
+                "      load: (pkg) => c.load(pkg),\n"
                 "      get: (a, b, k) => c.get(a, b, k),\n"
                 "      foreach: function(pkg, typ, cb) {\n"
                 "        if (fail_fwd_uci && pkg == 'firewall' && typ == 'forwarding') die('simulated uci failure');\n"
@@ -2067,8 +2068,12 @@ else:
                 "}\n"
                 "let fw = rpc('firewall_read');\n"
                 "if (!fw || !fw.ok || type(fw.forwardings) != 'array' || length(fw.forwardings) != 1 || fw.forwardings[0].src != 'lan' || fw.forwardings[0].dest != 'wan') die('fw_read failed');\n"
+                "import * as fs from 'fs';\n"
+                "fs.writefile('/etc/config/firewall', \"config 'unterminated_quote\\n\");\n"
+                "let fw_err = rpc('firewall_read');\n"
+                "if (!fw_err || fw_err.ok !== false || fw_err.error_code != 'DEPENDENCY') die('fw_read UCI failure did not return DEPENDENCY');\n"
                 "let st = rpc('services_read');\n"
-                "if (!st || !st.ok) die('subsequent services_read failed');\n"
+                "if (!st || !st.ok) die('subsequent services_read failed after UCI failure');\n"
                 "print('REAL_HELPERD_SURVIVED\\n');\n"
             )
             client_uc_p = os.path.join(rfs, "tmp", "test_fw_rpc_client.uc")

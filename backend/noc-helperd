@@ -2540,7 +2540,7 @@ function handle_rpc(req, reply_cb) {
 			let fwd_ok = true;
 			try {
 				let fwd_cur = uci.cursor();
-				if (!fwd_cur) {
+				if (!fwd_cur || !fwd_cur.load('firewall')) {
 					fwd_ok = false;
 				} else {
 					fwd_cur.foreach('firewall', 'forwarding', function(s) {
