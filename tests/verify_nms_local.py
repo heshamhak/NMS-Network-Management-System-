@@ -2003,7 +2003,7 @@ if (
 else:
     fail("ROOT-REDIRECT-A/C[static_no_8780_no_inline_js_no_hardcoded_ip]")
 
-# A2 & C2: Node DOM execution of launcher.js (http://, https://, dynamic hostname, loop prevention on :8743, untrusted host rejection)
+# A2 & C2 (Blocker 1): Node DOM execution of launcher.js (trusted private IPv4/IPv6/local domain vs untrusted external domains/public IPs/injections)
 node_launcher_test = f"""
 const fs = require('fs');
 const code = fs.readFileSync({json.dumps(launcher_js_p)}, 'utf8');
@@ -2026,102 +2026,233 @@ function runCase(proto, host, hostname, port) {{
   fn(window, document);
   return {{ replaced, linkHref }};
 }}
-// 1. http://192.168.1.1/ -> https://192.168.1.1:8743/
-const c1 = runCase('http:', '192.168.1.1', '192.168.1.1', '');
-if (c1.replaced !== 'https://192.168.1.1:8743/' || c1.linkHref !== 'https://192.168.1.1:8743/') process.exit(1);
-// 2. https://192.168.1.1/ (port 443) -> https://192.168.1.1:8743/
-const c2 = runCase('https:', '192.168.1.1', '192.168.1.1', '');
-if (c2.replaced !== 'https://192.168.1.1:8743/') process.exit(2);
-// 3. Dynamic host http://router.lan/ -> https://router.lan:8743/
-const c3 = runCase('http:', 'router.lan:80', 'router.lan', '80');
-if (c3.replaced !== 'https://router.lan:8743/') process.exit(3);
-// 4. Loop prevention: already on https://192.168.1.1:8743/ -> replaced must remain null
-const c4 = runCase('https:', '192.168.1.1:8743', '192.168.1.1', '8743');
-if (c4.replaced !== null || c4.linkHref !== 'https://192.168.1.1:8743/') process.exit(4);
-// 5. Untrusted / malformed host injection rejected -> replaced must remain null
-const c5 = runCase('http:', 'evil.com/path', 'evil.com/path', '');
-const c6 = runCase('http:', 'evil.com@192.168.1.1', 'evil.com@192.168.1.1', '');
-if (c5.replaced !== null || c6.replaced !== null) process.exit(5);
+// Trusted private IPv4: 192.168.1.1, 10.0.0.1, 172.16.5.1, 100.99.45.10 (Tailscale CGNAT), 127.0.0.1
+for (const [host, hname, port, exp] of [
+  ['192.168.1.1', '192.168.1.1', '', 'https://192.168.1.1:8743/'],
+  ['10.0.0.1:80', '10.0.0.1', '80', 'https://10.0.0.1:8743/'],
+  ['172.16.5.1', '172.16.5.1', '', 'https://172.16.5.1:8743/'],
+  ['100.99.45.10', '100.99.45.10', '', 'https://100.99.45.10:8743/'],
+  ['127.0.0.1', '127.0.0.1', '', 'https://127.0.0.1:8743/'],
+  ['[::1]:80', '[::1]', '80', 'https://[::1]:8743/'],
+  ['[fd7a:115c:a1e0::1]', '[fd7a:115c:a1e0::1]', '', 'https://[fd7a:115c:a1e0::1]:8743/'],
+  ['[fe80::1]', '[fe80::1]', '', 'https://[fe80::1]:8743/'],
+  ['router.lan:80', 'router.lan', '80', 'https://router.lan:8743/'],
+  ['openwrt.local', 'openwrt.local', '', 'https://openwrt.local:8743/'],
+  ['gateway.home.arpa', 'gateway.home.arpa', '', 'https://gateway.home.arpa:8743/'],
+  ['openwrt', 'openwrt', '', 'https://openwrt:8743/'],
+]) {{
+  const c = runCase('http:', host, hname, port);
+  if (c.replaced !== exp || c.linkHref !== exp) {{
+    console.error('Trusted host failed:', host, c);
+    process.exit(1);
+  }}
+}}
+// HTTPS port 443 -> https://192.168.1.1:8743/
+const cHttps = runCase('https:', '192.168.1.1', '192.168.1.1', '');
+if (cHttps.replaced !== 'https://192.168.1.1:8743/') process.exit(2);
+// Loop prevention: already on https://192.168.1.1:8743/ -> replaced must remain null
+const cLoop = runCase('https:', '192.168.1.1:8743', '192.168.1.1', '8743');
+if (cLoop.replaced !== null || cLoop.linkHref !== 'https://192.168.1.1:8743/') process.exit(4);
+// Untrusted valid-looking external domains, public IPs, and malformed authorities MUST be rejected
+for (const [host, hname, port] of [
+  ['evil.com', 'evil.com', ''],
+  ['attacker.org:8080', 'attacker.org', '8080'],
+  ['sub.example.net', 'sub.example.net', ''],
+  ['8.8.8.8', '8.8.8.8', ''],
+  ['1.1.1.1:443', '1.1.1.1', '443'],
+  ['172.32.0.1', '172.32.0.1', ''],
+  ['192.168.1.999', '192.168.1.999', ''],
+  ['[2001:4860:4860::8888]', '[2001:4860:4860::8888]', ''],
+  ['evil.com/path', 'evil.com/path', ''],
+  ['evil.com@192.168.1.1', 'evil.com@192.168.1.1', ''],
+  ['192.168.1.1:bad', '192.168.1.1', 'bad'],
+]) {{
+  const c = runCase('http:', host, hname, port);
+  if (c.replaced !== null || c.linkHref !== '#') {{
+    console.error('Untrusted host was not rejected:', host, c);
+    process.exit(5);
+  }}
+}}
 console.log('LAUNCHER_JS_PASS');
 """
 r_nl = subprocess.run(["node", "-e", node_launcher_test], capture_output=True, text=True, timeout=10)
 if r_nl.returncode == 0 and "LAUNCHER_JS_PASS" in r_nl.stdout:
-    ok("ROOT-REDIRECT-A/C[launcher_js_http_https_dynamic_host_no_loop_and_injection_rejected]")
+    ok("ROOT-REDIRECT-A/C[launcher_js_trusted_host_policy_and_external_domain_rejected]")
 else:
-    fail(f"ROOT-REDIRECT-A/C[launcher_js_http_https_dynamic_host_no_loop_and_injection_rejected]: rc={r_nl.returncode} err={r_nl.stderr}")
+    fail(f"ROOT-REDIRECT-A/C[launcher_js_trusted_host_policy_and_external_domain_rejected]: rc={r_nl.returncode} err={r_nl.stderr}")
 
-# A3, C3 & D4: Execute /www/cgi-bin/luci (luci_redirect_cgi.uc) on BOTH OpenWrt 24.10.0 and 25.12.6 chroots
+# A3, C3 & D4 (Blocker 1): Execute /www/cgi-bin/luci (luci_redirect_cgi.uc) on BOTH OpenWrt 24.10.0 and 25.12.6 chroots
 for ver_label, rfs in (("24.10.0-opkg", "/tmp/openwrt-24.10-x86-64-rootfs"), ("25.12.6-apk", "/tmp/openwrt-x86-64-rootfs")):
     if os.path.isdir(rfs) and os.path.isfile(os.path.join(rfs, "usr/bin/ucode")):
         dst_cgi = os.path.join(rfs, "tmp", "test_luci_redirect.uc")
         shutil.copy2(luci_cgi_p, dst_cgi)
         try:
-            r_c1 = subprocess.run(
-                ["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/env", "HTTP_HOST=192.168.1.1", "/usr/bin/ucode", "/tmp/test_luci_redirect.uc"],
-                capture_output=True, text=True, timeout=10,
-            )
-            r_c2 = subprocess.run(
-                ["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/env", "HTTP_HOST=myrouter.lan:443", "/usr/bin/ucode", "/tmp/test_luci_redirect.uc"],
-                capture_output=True, text=True, timeout=10,
-            )
-            r_c_bad = subprocess.run(
-                ["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/env", "HTTP_HOST=evil.example.com/attack@192.168.1.1", "/usr/bin/ucode", "/tmp/test_luci_redirect.uc"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if (
-                r_c1.returncode == 0
-                and "Status: 302 Found\nLocation: https://192.168.1.1:8743/\n" in r_c1.stdout
-                and r_c2.returncode == 0
-                and "Status: 302 Found\nLocation: https://myrouter.lan:8743/\n" in r_c2.stdout
-                and r_c_bad.returncode == 0
-                and "evil.example.com" not in r_c_bad.stdout
-                and "Location: https://192.168.1.1:8743/\n" in r_c_bad.stdout
-            ):
-                ok(f"ROOT-REDIRECT-A/C/D[luci_cgi_302_dynamic_and_injection_rejected_{ver_label}]")
+            trusted_cases = [
+                ("192.168.1.1", "https://192.168.1.1:8743/"),
+                ("10.0.0.1:80", "https://10.0.0.1:8743/"),
+                ("172.16.0.1", "https://172.16.0.1:8743/"),
+                ("100.99.45.10:443", "https://100.99.45.10:8743/"),
+                ("[::1]:80", "https://[::1]:8743/"),
+                ("[fd7a:115c:a1e0::1]:443", "https://[fd7a:115c:a1e0::1]:8743/"),
+                ("myrouter.lan:443", "https://myrouter.lan:8743/"),
+                ("openwrt.local", "https://openwrt.local:8743/"),
+                ("gateway.home.arpa", "https://gateway.home.arpa:8743/"),
+                ("openwrt", "https://openwrt:8743/"),
+            ]
+            untrusted_cases = [
+                "evil.com",
+                "attacker.org:8080",
+                "sub.example.net",
+                "8.8.8.8",
+                "172.32.0.1",
+                "192.168.1.999",
+                "[2001:4860:4860::8888]",
+                "evil.example.com/attack@192.168.1.1",
+                "192.168.1.1:badport",
+                "[::1]:badport",
+            ]
+            cgi_ok = True
+            for h_in, exp_loc in trusted_cases:
+                rc = subprocess.run(
+                    ["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/env", f"HTTP_HOST={h_in}", "/usr/bin/ucode", "/tmp/test_luci_redirect.uc"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if rc.returncode != 0 or f"Status: 302 Found\nLocation: {exp_loc}\n" not in rc.stdout:
+                    cgi_ok = False
+                    break
+            for h_bad in untrusted_cases:
+                rc = subprocess.run(
+                    ["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/env", f"HTTP_HOST={h_bad}", "/usr/bin/ucode", "/tmp/test_luci_redirect.uc"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if rc.returncode != 0 or "Status: 302 Found\nLocation: https://192.168.1.1:8743/\n" not in rc.stdout:
+                    cgi_ok = False
+                    break
+            if cgi_ok:
+                ok(f"ROOT-REDIRECT-A/C/D[luci_cgi_302_trusted_host_policy_and_external_domain_rejected_{ver_label}]")
             else:
-                fail(f"ROOT-REDIRECT-A/C/D[luci_cgi_302_dynamic_and_injection_rejected_{ver_label}]: {r_c1.stdout!r} {r_c2.stdout!r} {r_c_bad.stdout!r}")
+                fail(f"ROOT-REDIRECT-A/C/D[luci_cgi_302_trusted_host_policy_and_external_domain_rejected_{ver_label}]")
         finally:
             if os.path.exists(dst_cgi):
                 os.unlink(dst_cgi)
 
-# B1..B6 & D1..D5: Full lifecycle test of enable-root-redirect.sh, restore-luci.sh, mid-operation failures, idempotency,
-# pre-existing backup preservation (router state where .luci.bak.html and .orig.bak already exist!), and uninstall.sh
+# B1..B6 & D1..D5 (Blockers 2, 3, 4): Full lifecycle test of enable-root-redirect.sh, restore-luci.sh, mandatory manifest,
+# complete two-file rollback across all commit boundaries, pinned router backup hashes, idempotency, and uninstall.sh
 with tempfile.TemporaryDirectory(prefix="nms_root_redirect_lifecycle_") as rr_td:
     os.makedirs(os.path.join(rr_td, "www", "cgi-bin"), exist_ok=True)
     os.makedirs(os.path.join(rr_td, "www", "pro"), exist_ok=True)
     os.makedirs(os.path.join(rr_td, "etc", "noc-console"), exist_ok=True)
     os.chmod(os.path.join(rr_td, "etc", "noc-console"), 0o700)
 
-    orig_idx_bytes = b'<!DOCTYPE html><html><head><meta http-equiv="refresh" content="0; URL=cgi-bin/luci/" /></head><body>LuCI Original</body></html>\n'
-    orig_cgi_bytes = b"#!/usr/bin/env ucode\n'use strict';\nimport dispatch from 'luci.dispatcher';\n"
+    # Exact byte-for-byte stock OpenWrt 25.12.6 LuCI files matching the pinned router hashes
+    orig_idx_bytes = (
+        b'<!DOCTYPE html>\n<html>\n\t<head>\n'
+        b'\t\t<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />\n'
+        b'\t\t<meta http-equiv="Pragma" content="no-cache" />\n'
+        b'\t\t<meta http-equiv="Expires" content="0" />\n'
+        b'\t\t<meta http-equiv="Expires" content="Thu, 01 Jan 1970 00:00:00 GMT" />\n'
+        b'\t\t<meta http-equiv="refresh" content="0; URL=cgi-bin/luci/" />\n'
+        b'\t\t<style>\n'
+        b'\t\t\tbody { background: white; font-family: arial, helvetica, sans-serif; }\n'
+        b'\t\t\ta { color: black; }\n\n'
+        b'\t\t\t@media (prefers-color-scheme: dark) {\n'
+        b'\t\t\t\tbody { background: black; }\n'
+        b'\t\t\t\ta { color: white; }\n'
+        b'\t\t\t}\n'
+        b'\t\t</style>\n'
+        b'\t</head>\n\t<body>\n'
+        b'\t\t<a href="cgi-bin/luci/">LuCI - Lua Configuration Interface</a>\n'
+        b'\t</body>\n</html>\n'
+    )
+    orig_cgi_bytes = (
+        b"#!/usr/bin/env ucode\n\n'use strict';\n\n"
+        b"import { stdin, stdout } from 'fs';\n\n"
+        b"import dispatch from 'luci.dispatcher';\n"
+        b"import request from 'luci.http';\n\n"
+        b"const input_bufsize = 4096;\n"
+        b"let input_available = +getenv('CONTENT_LENGTH') || 0;\n\n"
+        b"function read(len) {\n"
+        b"\tif (input_available == 0) {\n"
+        b"\t\tstdin.close();\n\n"
+        b"\t\treturn null;\n"
+        b"\t}\n\n"
+        b"\tlet chunk = stdin.read(min(input_available, len ?? input_bufsize, input_bufsize));\n\n"
+        b"\tif (chunk == null) {\n"
+        b"\t\tinput_available = 0;\n"
+        b"\t\tstdin.close();\n"
+        b"\t}\n"
+        b"\telse {\n"
+        b"\t\tinput_available -= length(chunk);\n"
+        b"\t}\n\n"
+        b"\treturn chunk;\n"
+        b"}\n\n"
+        b"function write(data) {\n"
+        b"\treturn stdout.write(data);\n"
+        b"}\n\n"
+        b"let req = request(getenv(), read, write);\n\n"
+        b"dispatch(req);\n\n"
+        b"req.close();\n"
+    )
     orig_idx_sha = hashlib.sha256(orig_idx_bytes).hexdigest()
     orig_cgi_sha = hashlib.sha256(orig_cgi_bytes).hexdigest()
+    assert orig_idx_sha == "f68138db6165da195c2b8347ebdfa43b1c1a13e1c96386d2abed09578cb06b30"
+    assert orig_cgi_sha == "aced6c9b2e621bb6e1dd1bb7d675925e9325ed901f49b1aabb0696a06942dacb"
 
     idx_p = os.path.join(rr_td, "www", "index.html")
     idx_bak_p = os.path.join(rr_td, "www", "index.luci.bak.html")
     cgi_p = os.path.join(rr_td, "www", "cgi-bin", "luci")
     cgi_bak_p = os.path.join(rr_td, "www", "cgi-bin", "luci.orig.bak")
+    manifest_p = os.path.join(rr_td, "etc", "noc-console", "luci_backup.manifest")
     user_apk_p = os.path.join(rr_td, "www", "pro", "OpenWrt_Pro_Manager.apk")
     user_auth_p = os.path.join(rr_td, "etc", "noc-console", "auth.json")
     open(user_apk_p, "wb").write(b"USER_APK_BINARY_KEEP")
     open(user_auth_p, "wb").write(b'{"users":{"admin":{}}}')
     os.chmod(user_auth_p, 0o600)
 
-    # Simulate exact real-router state: /www/index.luci.bak.html and /www/cgi-bin/luci.orig.bak pre-exist,
-    # while /www/index.html and /www/cgi-bin/luci currently contain old Nov-21 :8780 redirect stubs!
-    open(idx_bak_p, "wb").write(orig_idx_bytes)
-    os.chmod(idx_bak_p, 0o644)
-    open(cgi_bak_p, "wb").write(orig_cgi_bytes)
-    os.chmod(cgi_bak_p, 0o755)
     old_stub_idx = b"<html><body>Old 8780 stub :8780/</body></html>\n"
     old_stub_cgi = b"#!/usr/bin/env ucode\nlet target = 'http://192.168.1.1:8780/';\n"
     open(idx_p, "wb").write(old_stub_idx)
     open(cgi_p, "wb").write(old_stub_cgi)
     os.chmod(cgi_p, 0o755)
 
-    # D1: Mid-activation failure (after_index) MUST roll back /www/index.html and /www/cgi-bin/luci to pre-activation state and keep backups intact
     env_rr = os.environ.copy()
     env_rr["NMS_ROOT_PREFIX"] = rr_td
+
+    # Blocker 4: Pinned router backup hash check in enable-root-redirect.sh
+    # If backups have wrong/tampered bytes, enable-root-redirect.sh MUST fail closed without overwriting backups or targets
+    tampered_idx_bak = b"<html>Tampered backup</html>\n"
+    open(idx_bak_p, "wb").write(tampered_idx_bak)
+    os.chmod(idx_bak_p, 0o644)
+    open(cgi_bak_p, "wb").write(orig_cgi_bytes)
+    os.chmod(cgi_bak_p, 0o755)
+    r_pin_fail1 = subprocess.run(["sh", enable_sh_p], env=env_rr, capture_output=True, text=True)
+
+    open(idx_bak_p, "wb").write(orig_idx_bytes)
+    os.chmod(idx_bak_p, 0o644)
+    tampered_cgi_bak = b"#!/usr/bin/env ucode\n// tampered\n"
+    open(cgi_bak_p, "wb").write(tampered_cgi_bak)
+    os.chmod(cgi_bak_p, 0o755)
+    r_pin_fail2 = subprocess.run(["sh", enable_sh_p], env=env_rr, capture_output=True, text=True)
+
+    if (
+        r_pin_fail1.returncode != 0
+        and r_pin_fail2.returncode != 0
+        and open(idx_p, "rb").read() == old_stub_idx
+        and open(cgi_p, "rb").read() == old_stub_cgi
+        and open(cgi_bak_p, "rb").read() == tampered_cgi_bak
+        and not os.path.exists(manifest_p)
+    ):
+        ok("ROOT-REDIRECT-B/D[pinned_backup_hash_mismatch_rejected_without_overwrite]")
+    else:
+        fail(f"ROOT-REDIRECT-B/D[pinned_backup_hash_mismatch_rejected_without_overwrite]: r1={r_pin_fail1.returncode} r2={r_pin_fail2.returncode}")
+
+    # Restore authentic stock LuCI backup bytes matching pinned hashes
+    open(idx_bak_p, "wb").write(orig_idx_bytes)
+    os.chmod(idx_bak_p, 0o644)
+    open(cgi_bak_p, "wb").write(orig_cgi_bytes)
+    os.chmod(cgi_bak_p, 0o755)
+
+    # D1: Mid-activation failure (after_index) MUST roll back /www/index.html and /www/cgi-bin/luci to pre-activation state and keep backups intact
     env_rr_fail = env_rr.copy()
     env_rr_fail["NMS_TEST_ROOT_REDIRECT_FAIL_POINT"] = "after_index"
     r_en_fail = subprocess.run(["sh", enable_sh_p], env=env_rr_fail, capture_output=True, text=True)
@@ -2136,10 +2267,11 @@ with tempfile.TemporaryDirectory(prefix="nms_root_redirect_lifecycle_") as rr_td
     else:
         fail(f"ROOT-REDIRECT-D[mid_activation_failure_rolls_back_cleanly]: rc={r_en_fail.returncode}")
 
-    # B1 & B2: Enable root redirect -> preserves pre-existing .luci.bak.html and .orig.bak WITHOUT overwriting them, updates /www/index.html and /www/cgi-bin/luci to 8743
+    # B1 & B2: Enable root redirect -> verifies pinned hashes, writes manifest, updates /www/index.html and /www/cgi-bin/luci to 8743
     r_en_ok = subprocess.run(["sh", enable_sh_p], env=env_rr, capture_output=True, text=True)
     # Run a second time (simulating NMS upgrade) -> MUST still NOT overwrite .luci.bak.html or .orig.bak with the new redirect files!
     r_en_up = subprocess.run(["sh", enable_sh_p], env=env_rr, capture_output=True, text=True)
+    saved_manifest_bytes = open(manifest_p, "rb").read() if os.path.isfile(manifest_p) else b""
     if (
         r_en_ok.returncode == 0
         and r_en_up.returncode == 0
@@ -2148,23 +2280,71 @@ with tempfile.TemporaryDirectory(prefix="nms_root_redirect_lifecycle_") as rr_td
         and open(idx_p, "rb").read() == open(launcher_html_p, "rb").read()
         and open(cgi_p, "rb").read() == open(luci_cgi_p, "rb").read()
         and (os.stat(os.path.join(rr_td, "etc", "noc-console")).st_mode & 0o777) == 0o700
+        and len(saved_manifest_bytes.splitlines()) == 2
     ):
         ok("ROOT-REDIRECT-B[enable_and_upgrade_preserve_preexisting_luci_backups_sha256]")
     else:
         fail(f"ROOT-REDIRECT-B[enable_and_upgrade_preserve_preexisting_luci_backups_sha256]: rc1={r_en_ok.returncode} rc2={r_en_up.returncode} err={r_en_ok.stderr} {r_en_up.stderr}")
 
-    # B4: Mid-restore failure (after_index_move) MUST NOT leave half-written/inconsistent files
-    env_res_fail = env_rr.copy()
-    env_res_fail["NMS_TEST_RESTORE_LUCI_FAIL_POINT"] = "after_index_move"
-    r_res_fail = subprocess.run(["sh", restore_sh_p], env=env_res_fail, capture_output=True, text=True)
+    # Blocker 2: Mandatory restore manifest verification
+    # Test 1: Missing manifest -> restore-luci.sh MUST fail closed without touching /www/index.html or /www/cgi-bin/luci
+    os.unlink(manifest_p)
+    r_m_missing = subprocess.run(["sh", restore_sh_p], env=env_rr, capture_output=True, text=True)
+    # Test 2: Incomplete manifest (only 1 record) -> fail closed
+    open(manifest_p, "wb").write(saved_manifest_bytes.splitlines()[0] + b"\n")
+    r_m_incomplete = subprocess.run(["sh", restore_sh_p], env=env_rr, capture_output=True, text=True)
+    # Test 3: Malformed manifest (invalid SHA-256 / bad mode) -> fail closed
+    open(manifest_p, "wb").write(
+        b"/www/index.html|badsha|644|0:0|0|/www/index.luci.bak.html\n"
+        b"/www/cgi-bin/luci|aced6c9b2e621bb6e1dd1bb7d675925e9325ed901f49b1aabb0696a06942dacb|755|0:0|0|/www/cgi-bin/luci.orig.bak\n"
+    )
+    r_m_malformed = subprocess.run(["sh", restore_sh_p], env=env_rr, capture_output=True, text=True)
+    # Test 4: Valid manifest format but wrong expected SHA-256 -> fail closed before modifying either file
+    open(manifest_p, "wb").write(
+        b"/www/index.html|0000000000000000000000000000000000000000000000000000000000000000|644|0:0|0|/www/index.luci.bak.html\n"
+        b"/www/cgi-bin/luci|aced6c9b2e621bb6e1dd1bb7d675925e9325ed901f49b1aabb0696a06942dacb|755|0:0|0|/www/cgi-bin/luci.orig.bak\n"
+    )
+    r_m_wrong_sha = subprocess.run(["sh", restore_sh_p], env=env_rr, capture_output=True, text=True)
+    # Restore authentic manifest
+    open(manifest_p, "wb").write(saved_manifest_bytes)
+    os.chmod(manifest_p, 0o600)
+
     if (
-        r_res_fail.returncode != 0
+        r_m_missing.returncode != 0
+        and r_m_incomplete.returncode != 0
+        and r_m_malformed.returncode != 0
+        and r_m_wrong_sha.returncode != 0
         and open(idx_p, "rb").read() == open(launcher_html_p, "rb").read()
         and open(cgi_p, "rb").read() == open(luci_cgi_p, "rb").read()
     ):
-        ok("ROOT-REDIRECT-B[restore_luci_failure_rolls_back_without_partial_files]")
+        ok("ROOT-REDIRECT-B[restore_luci_mandatory_manifest_missing_corrupt_or_hash_mismatch_fails_closed]")
     else:
-        fail(f"ROOT-REDIRECT-B[restore_luci_failure_rolls_back_without_partial_files]: rc={r_res_fail.returncode}")
+        fail(
+            f"ROOT-REDIRECT-B[restore_luci_mandatory_manifest_missing_corrupt_or_hash_mismatch_fails_closed]: "
+            f"rcs={r_m_missing.returncode},{r_m_incomplete.returncode},{r_m_malformed.returncode},{r_m_wrong_sha.returncode}"
+        )
+
+    # Blocker 3 (B4): Complete two-file rollback across ALL commit boundaries (before_commit, after_index_move, after_cgi_move, during_final_verify)
+    pre_idx_bytes = open(idx_p, "rb").read()
+    pre_cgi_bytes = open(cgi_p, "rb").read()
+    rollback_all_ok = True
+    for fp in ("before_commit", "after_index_move", "after_cgi_move", "during_final_verify"):
+        env_res_fail = env_rr.copy()
+        env_res_fail["NMS_TEST_RESTORE_LUCI_FAIL_POINT"] = fp
+        r_rf = subprocess.run(["sh", restore_sh_p], env=env_res_fail, capture_output=True, text=True)
+        if (
+            r_rf.returncode == 0
+            or open(idx_p, "rb").read() != pre_idx_bytes
+            or open(cgi_p, "rb").read() != pre_cgi_bytes
+            or hashlib.sha256(open(idx_bak_p, "rb").read()).hexdigest() != orig_idx_sha
+            or hashlib.sha256(open(cgi_bak_p, "rb").read()).hexdigest() != orig_cgi_sha
+        ):
+            rollback_all_ok = False
+            break
+    if rollback_all_ok:
+        ok("ROOT-REDIRECT-B[restore_luci_two_file_rollback_across_all_commit_boundaries]")
+    else:
+        fail(f"ROOT-REDIRECT-B[restore_luci_two_file_rollback_across_all_commit_boundaries]: failed at {fp}")
 
     # B2, B3 & D5: Standalone restore-luci (even when NMS daemons are completely down/absent) restores original LuCI byte-for-byte, and repeated execution is idempotent
     r_res1 = subprocess.run(["sh", restore_sh_p], env=env_rr, capture_output=True, text=True)

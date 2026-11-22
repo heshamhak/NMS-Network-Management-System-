@@ -4,12 +4,15 @@ set -eu
 # NMS Root-Interface Redirect Activator (Option A)
 # Safely installs /www/index.html (launcher_index.html) and /www/cgi-bin/luci (luci_redirect_cgi.uc)
 # while preserving original LuCI backups (/www/index.luci.bak.html and /www/cgi-bin/luci.orig.bak)
-# with SHA-256 verification and transactional rollback.
+# with pinned SHA-256 verification and transactional rollback.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT_PREFIX="${NMS_ROOT_PREFIX:-}"
 FAIL_POINT="${NMS_TEST_ROOT_REDIRECT_FAIL_POINT:-}"
+
+PINNED_INDEX_BAK_SHA="${NMS_EXPECTED_INDEX_BAK_SHA:-f68138db6165da195c2b8347ebdfa43b1c1a13e1c96386d2abed09578cb06b30}"
+PINNED_CGI_BAK_SHA="${NMS_EXPECTED_CGI_BAK_SHA:-aced6c9b2e621bb6e1dd1bb7d675925e9325ed901f49b1aabb0696a06942dacb}"
 
 if [ -z "$ROOT_PREFIX" ] && [ "$(id -u)" -ne 0 ]; then
   echo "ERROR: Please run enable-root-redirect.sh as root." >&2
@@ -36,7 +39,9 @@ fi
 if [ ! -f "$LAUNCHER_JS_SRC" ] && [ -f "${PRO_DIR}/launcher.js" ]; then
   LAUNCHER_JS_SRC="${PRO_DIR}/launcher.js"
 fi
-if [ ! -f "$REDIRECT_CGI_SRC" ] && [ -f "/usr/libexec/nms_luci_redirect_cgi.uc" ]; then
+if [ ! -f "$REDIRECT_CGI_SRC" ] && [ -f "${ROOT_PREFIX}/usr/libexec/nms_luci_redirect_cgi.uc" ]; then
+  REDIRECT_CGI_SRC="${ROOT_PREFIX}/usr/libexec/nms_luci_redirect_cgi.uc"
+elif [ ! -f "$REDIRECT_CGI_SRC" ] && [ -f "/usr/libexec/nms_luci_redirect_cgi.uc" ]; then
   REDIRECT_CGI_SRC="/usr/libexec/nms_luci_redirect_cgi.uc"
 fi
 
@@ -132,6 +137,10 @@ else
     exit 1
   fi
   _src_sha="$(file_sha256 "$WEB_INDEX")"
+  if [ "$_src_sha" != "$PINNED_INDEX_BAK_SHA" ]; then
+    echo "ERROR: Pinned SHA-256 verification failed for $WEB_INDEX (expected $PINNED_INDEX_BAK_SHA, got $_src_sha)" >&2
+    exit 1
+  fi
   cp -p "$WEB_INDEX" "${WEB_INDEX_BAK}.tmp.$$"
   _bak_sha="$(file_sha256 "${WEB_INDEX_BAK}.tmp.$$")"
   if [ -z "$_src_sha" ] || [ "$_src_sha" != "$_bak_sha" ]; then
@@ -156,6 +165,10 @@ else
     exit 1
   fi
   _src_sha="$(file_sha256 "$LUCI_CGI")"
+  if [ "$_src_sha" != "$PINNED_CGI_BAK_SHA" ]; then
+    echo "ERROR: Pinned SHA-256 verification failed for $LUCI_CGI (expected $PINNED_CGI_BAK_SHA, got $_src_sha)" >&2
+    exit 1
+  fi
   cp -p "$LUCI_CGI" "${LUCI_CGI_BAK}.tmp.$$"
   _bak_sha="$(file_sha256 "${LUCI_CGI_BAK}.tmp.$$")"
   if [ -z "$_src_sha" ] || [ "$_src_sha" != "$_bak_sha" ]; then
@@ -170,6 +183,17 @@ fi
 
 INDEX_BAK_SHA="$(file_sha256 "$WEB_INDEX_BAK")"
 CGI_BAK_SHA="$(file_sha256 "$LUCI_CGI_BAK")"
+
+# Enforce pinned SHA-256 verification on existing backups without ever overwriting them
+if [ "$INDEX_BAK_SHA" != "$PINNED_INDEX_BAK_SHA" ]; then
+  echo "ERROR: Existing backup $WEB_INDEX_BAK SHA-256 ($INDEX_BAK_SHA) does not match pinned value ($PINNED_INDEX_BAK_SHA)" >&2
+  exit 1
+fi
+if [ "$CGI_BAK_SHA" != "$PINNED_CGI_BAK_SHA" ]; then
+  echo "ERROR: Existing backup $LUCI_CGI_BAK SHA-256 ($CGI_BAK_SHA) does not match pinned value ($PINNED_CGI_BAK_SHA)" >&2
+  exit 1
+fi
+
 INDEX_BAK_MODE="$(get_mode "$WEB_INDEX_BAK")"
 CGI_BAK_MODE="$(get_mode "$LUCI_CGI_BAK")"
 INDEX_BAK_OWNER="$(get_owner "$WEB_INDEX_BAK")"
