@@ -12,6 +12,7 @@ import * as nms_fw_wifi from '/usr/libexec/nms_fw_wifi.uc';
 import * as nms_discovery from '/usr/libexec/nms_discovery.uc';
 import * as nms_clients from '/usr/libexec/nms_clients.uc';
 import * as nms_access_dhcp from '/usr/libexec/nms_access_dhcp.uc';
+import * as nms_sqm from '/usr/libexec/nms_sqm.uc';
 
 const ETC_DIR = getenv('NOC_ETC_DIR') || '/etc/noc-console';
 const RUN_DIR = getenv('NOC_RUN_DIR') || '/tmp/noc-console';
@@ -2233,7 +2234,8 @@ function handle_rpc(req, reply_cb) {
 				ok: tc_res.ok || !tc_res.overflow,
 				error_code: tc_res.overflow ? 'TIMEOUT' : null,
 				config: sqm_cfg,
-				tc_stats: scrub_prohibited(tc_res.output)
+				tc_stats: scrub_prohibited(tc_res.output),
+				tc_summary: nms_sqm.parse_tc_qdisc_summary(tc_res.output, sqm_cfg.interface)
 			});
 		});
 		return;
@@ -3652,57 +3654,25 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 	}
 
 	if (verb == 'sqm_update') {
-		let en = params.enabled ? '1' : '0';
-		let iface = trim(params.interface || '');
-		let dl = +(params.download_kbps || 0);
-		let ul = +(params.upload_kbps || 0);
-		let qdisc = trim(params.qdisc || 'cake');
-		let script = trim(params.script || 'piece_of_cake.qos');
-		let overh = +(params.overhead || 44);
-		let linkl = trim(params.linklayer || 'ethernet');
-		let sq_dscp = params.squash_dscp === false ? '0' : '1';
-		let sq_ing = params.squash_ingress === false ? '0' : '1';
-		let in_ecn = trim(params.ingress_ecn || 'ECN');
-		let eg_ecn = trim(params.egress_ecn || 'ECN');
-		let dbg = params.debug_logging ? '1' : '0';
-		let verb_lvl = +(params.verbosity != null ? params.verbosity : 5);
-		let allow_if = { 'pppoe-wan': true, 'wlan0': true, 'eth0': true, 'br-lan': true };
-		let allow_qd = { 'cake': true, 'fq_codel': true };
-		let allow_sc = { 'piece_of_cake.qos': true, 'layer_cake.qos': true, 'simple.qos': true };
-		let allow_ll = { 'ethernet': true, 'atm': true, 'none': true };
-		let allow_ecn = { 'ECN': true, 'NOECN': true };
-		if (!allow_if[iface] || !allow_qd[qdisc] || !allow_sc[script] || !allow_ll[linkl] || !allow_ecn[in_ecn] || !allow_ecn[eg_ecn] || dl < 0 || dl > 1000000 || ul < 0 || ul > 1000000 || overh < 0 || overh > 128 || verb_lvl < 0 || verb_lvl > 10) {
+		let v = nms_sqm.validate_sqm_config(params, function(iface) {
+			return !!fs.stat('/sys/class/net/' + iface);
+		});
+		if (!v.ok) {
 			release_lock();
-			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معاملات SQM غير صالحة' });
+			reply_cb({ ok: false, error_code: v.error_code || 'VALIDATION', message_ar: v.message_ar });
 			return;
 		}
-		try {
-			let cur = uci.cursor();
-			cur.set('sqm', 'eth1', 'queue');
-			cur.set('sqm', 'eth1', 'enabled', en);
-			cur.set('sqm', 'eth1', 'interface', iface);
-			cur.set('sqm', 'eth1', 'download', '' + int(dl));
-			cur.set('sqm', 'eth1', 'upload', '' + int(ul));
-			cur.set('sqm', 'eth1', 'qdisc', qdisc);
-			cur.set('sqm', 'eth1', 'script', script);
-			cur.set('sqm', 'eth1', 'overhead', '' + int(overh));
-			cur.set('sqm', 'eth1', 'linklayer', linkl);
-			cur.set('sqm', 'eth1', 'squash_dscp', sq_dscp);
-			cur.set('sqm', 'eth1', 'squash_ingress', sq_ing);
-			cur.set('sqm', 'eth1', 'ingress_ecn', in_ecn);
-			cur.set('sqm', 'eth1', 'egress_ecn', eg_ecn);
-			cur.set('sqm', 'eth1', 'debug_logging', dbg);
-			cur.set('sqm', 'eth1', 'verbosity', '' + int(verb_lvl));
-			cur.commit('sqm');
-		} catch (e) {
+		let deps = {
+			uci_cursor: function() { return uci.cursor(); },
+			reload_sqm: function(cb2) { exec_argv_async('/etc/init.d/sqm', ['reload'], 12000, CAP_GENERAL, cb2); },
+			show_tc: function(iface, cb2) { exec_argv_async('/sbin/tc', ['-s', 'qdisc', 'show', 'dev', iface], 5000, CAP_GENERAL, cb2); },
+			enter_emergency_freeze: enter_emergency_freeze,
+			audit_append: audit_append,
+			actor: actor
+		};
+		nms_sqm.apply_sqm_tx(v, deps, function(txr) {
 			release_lock();
-			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل حفظ إعدادات SQM' });
-			return;
-		}
-		exec_argv_async('/etc/init.d/sqm', ['reload'], 12000, CAP_GENERAL, function(r) {
-			release_lock();
-			audit_append(actor, 'sqm_update', iface, r.ok ? 'committed' : 'failed', sprintf('en=%s dl=%d ul=%d', en, int(dl), int(ul)));
-			reply_cb({ ok: r.ok, message_ar: r.ok ? 'تم حفظ وتطبيق إعدادات SQM بنجاح' : 'تم الحفظ لكن فشل إعادة تحميل SQM' });
+			reply_cb(txr);
 		});
 		return;
 	}
