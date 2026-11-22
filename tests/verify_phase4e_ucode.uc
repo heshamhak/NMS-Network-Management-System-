@@ -412,5 +412,22 @@ nms_sqm.apply_sqm_tx(v_ok, {
 }, function(r) { res14 = r; });
 check(!res14.ok && res14.rolled_back === false && res14.rollback_failed === true && length(fr14) == 1, 'P4E-RB[prev_disabled_tc_query_fail_freezes]');
 
+// 23. build_sqm_topology: strict rt.up === true required (rejects up: false, missing up, up: null, non-Boolean up)
+let check_up_val = function(has_up, up_val) {
+	let entry = { 'interface': 'wwan', l3_device: 'wlan0', device: 'wlan0' };
+	if (has_up) entry.up = up_val;
+	let tp = nms_sqm.build_sqm_topology(t_uci, { interface: [entry] }, ['eth1'], function() { return true; });
+	return nms_sqm.validate_sqm_config({ enabled: true, interface: 'wlan0', download_kbps: 4000, upload_kbps: 2000 }, tp).ok;
+};
+check(
+	check_up_val(true, true) === true &&
+	check_up_val(true, false) === false &&
+	check_up_val(false, null) === false &&
+	check_up_val(true, null) === false &&
+	check_up_val(true, 'true') === false &&
+	check_up_val(true, 1) === false,
+	'P4E-TOPO[requires_strict_boolean_up_true]'
+);
+
 printf('UCODE4E_SUMMARY: %d passed, %d failed\n', passed, failed);
 exit(failed == 0 ? 0 : 1);

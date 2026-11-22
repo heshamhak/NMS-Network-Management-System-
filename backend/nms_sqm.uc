@@ -94,7 +94,7 @@ export function build_sqm_topology(uci_cur, ubus_dump, br_if_entries, iface_exis
 		for (let wn in keys(wan_nets)) {
 			if (wn == 'lan' || wn == 'loopback' || non_wan_nets[wn]) continue;
 			let rt = rt_by_net[wn];
-			if (!rt || rt.up === false) continue;
+			if (!rt || rt.up !== true) continue;
 			let rt_l3 = rt.l3_device || '';
 			let rt_l2 = rt.device || '';
 			let rt_dev = rt_l3 != '' ? rt_l3 : rt_l2;
