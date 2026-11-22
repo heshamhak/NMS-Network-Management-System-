@@ -584,7 +584,8 @@
       var stCls = c.blocked ? 'broken' : (devUp ? 'active' : 'disabled');
       var badge = c.blocked ? 'محجوب' : (devUp ? 'متصل' : 'غير متصل');
       var dKey = c.mac || c.ip || nid;
-      var instBps = devUp ? (isLive ? (deviceInstantBps[dKey] || 0) : (simSpeeds[c.ip] || 0)) : 0;
+      var backendBps = (c.rate_supported && c.rx_bps != null && c.tx_bps != null) ? (Number(c.rx_bps) + Number(c.tx_bps)) : null;
+      var instBps = devUp ? (isLive ? (backendBps != null ? backendBps : (deviceInstantBps[dKey] || 0)) : (simSpeeds[c.ip] || 0)) : 0;
       if (devUp && !isLive) simTotalBps += instBps;
 
       colDevices.appendChild(makeNode({

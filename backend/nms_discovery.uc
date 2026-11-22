@@ -302,3 +302,60 @@ export function merge_discovered_clients(inputs) {
 	}
 	return list;
 };
+
+const MAX_RATE_CACHE = 512;
+const RATE_STALE_MS = 300000;
+
+export function compute_client_rates(clients, prev_map, now_ms, flow_offloading, nlbw_ok) {
+	if (type(clients) != 'array') return clients;
+	let pmap = (type(prev_map) == 'object') ? prev_map : {};
+	let counters_ok = !flow_offloading && !!nlbw_ok;
+	let reason_unavail = flow_offloading ? 'flow_offloading' : 'nlbw_unavailable';
+
+	// Prune stale entries to keep memory bounded
+	for (let k in keys(pmap)) {
+		if ((now_ms - pmap[k].ts_ms) > RATE_STALE_MS) delete pmap[k];
+	}
+
+	for (let c in clients) {
+		if (!counters_ok) {
+			c.rate_supported = false;
+			c.rx_bps = null;
+			c.tx_bps = null;
+			c.rate_reason = reason_unavail;
+			continue;
+		}
+		let key = c.mac || c.ip || '';
+		let rx = +c.total_rx_bytes || 0;
+		let tx = +c.total_tx_bytes || 0;
+		let prev = key != '' ? pmap[key] : null;
+		c.rate_supported = true;
+		if (!prev) {
+			c.rx_bps = null;
+			c.tx_bps = null;
+			c.rate_reason = 'pending_baseline';
+		} else {
+			let dt = now_ms - prev.ts_ms;
+			if (dt < 500) {
+				c.rx_bps = prev.last_rx_bps != null ? prev.last_rx_bps : null;
+				c.tx_bps = prev.last_tx_bps != null ? prev.last_tx_bps : null;
+				c.rate_reason = c.rx_bps != null ? 'ok' : 'pending_baseline';
+			} else if (rx < prev.rx || tx < prev.tx) {
+				c.rx_bps = null;
+				c.tx_bps = null;
+				c.rate_reason = 'counter_reset';
+			} else {
+				c.rx_bps = int(((rx - prev.rx) * 8 * 1000) / dt);
+				c.tx_bps = int(((tx - prev.tx) * 8 * 1000) / dt);
+				c.rate_reason = 'ok';
+			}
+		}
+		if (key != '' && (pmap[key] || length(keys(pmap)) < MAX_RATE_CACHE)) {
+			let should_update = !prev || ((now_ms - prev.ts_ms) >= 500) || (rx < prev.rx || tx < prev.tx);
+			if (should_update) {
+				pmap[key] = { rx: rx, tx: tx, ts_ms: now_ms, last_rx_bps: c.rx_bps, last_tx_bps: c.tx_bps };
+			}
+		}
+	}
+	return clients;
+};

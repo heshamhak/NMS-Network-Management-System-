@@ -210,14 +210,18 @@ function call_helper(verb, params, actor, client_ip, cb) {
 }
 
 // --- Direct In-Process /proc & /sys Collectors (ZERO subshell forks per P18) ---
+let last_cpu_pct = {};
+let last_steal_pct = 0;
+let boot_cpu_cores = null;
+let prev_client_rates = {};
+
 function collect_cpu() {
 	let mono = now_mono_ms();
 	let raw = fs.readfile('/proc/stat') || '';
-	let cur = {};
 	let cores = [];
 	let total_pct = null;
 	let total_status = 'unknown';
-	let steal_pct = 0;
+	let steal_pct = last_steal_pct;
 
 	for (let line in split(raw, '\n')) {
 		let p = split(trim(line), /\s+/);
@@ -226,11 +230,12 @@ function collect_cpu() {
 		let user = +p[1], nice = +p[2], sys = +p[3], idle = +p[4], iowait = +p[5], irq = +p[6], softirq = +p[7], steal = length(p) > 8 ? +p[8] : 0;
 		let total = user + nice + sys + idle + iowait + irq + softirq + steal;
 		let busy = total - idle - iowait - steal;
-		cur[name] = { total: total, busy: busy, steal: steal, mono: mono };
 
-		let pct = null;
-		let st = 'unknown';
-		if (prev_cpu[name]) {
+		let pct = last_cpu_pct[name] != null ? last_cpu_pct[name] : null;
+		let st = pct != null ? 'ok' : 'unknown';
+		if (!prev_cpu[name]) {
+			prev_cpu[name] = { total: total, busy: busy, steal: steal, mono: mono };
+		} else {
 			let dt = total - prev_cpu[name].total;
 			let db = busy - prev_cpu[name].busy;
 			let ds = steal - prev_cpu[name].steal;
@@ -240,7 +245,12 @@ function collect_cpu() {
 				if (pct < 0) pct = 0;
 				if (pct > 100) pct = 100;
 				st = 'ok';
-				if (name == 'cpu') steal_pct = int((ds * 1000) / dt) / 10.0;
+				last_cpu_pct[name] = pct;
+				if (name == 'cpu') {
+					steal_pct = int((ds * 1000) / dt) / 10.0;
+					last_steal_pct = steal_pct;
+				}
+				prev_cpu[name] = { total: total, busy: busy, steal: steal, mono: mono };
 			}
 		}
 		if (name == 'cpu') {
@@ -250,14 +260,15 @@ function collect_cpu() {
 			push(cores, { name: name, pct: pct, status: st });
 		}
 	}
-	prev_cpu = cur;
+	if (boot_cpu_cores == null && length(cores) > 0) boot_cpu_cores = length(cores);
+	let exp_cores = boot_cpu_cores != null ? boot_cpu_cores : length(cores);
 	return {
 		metric: make_metric(total_pct, 'percent', 'procfs', total_status, null, mono),
 		total_pct: total_pct != null ? total_pct : 0,
 		steal_pct: steal_pct,
 		detected_cores: length(cores),
-		expected_cores: 4,
-		core_drift: length(cores) != 4,
+		expected_cores: exp_cores,
+		core_drift: length(cores) != exp_cores,
 		cores: cores
 	};
 }
@@ -1407,6 +1418,8 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 		cached_helper_call('clients', 4500, 'clients', 'clients_read', {}, sess.username, remote_ip, function(res, errs) {
 			if (!res.ok) return { ok: false, clients: [] };
 			let list = nms_discovery.merge_discovered_clients(res);
+			let nlbw_ok = !!(res.discovery_status && res.discovery_status.nlbw);
+			nms_discovery.compute_client_rates(list, prev_client_rates, now_mono_ms(), !!res.flow_offloading, nlbw_ok);
 			if (sess.role == 'readonly') {
 				for (let c in list) {
 					let orig_mac = c.mac;
@@ -1425,6 +1438,8 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 					c.rssi = null;
 					c.band = null;
 					c.wifi_auth = null;
+					c.rx_bps = null;
+					c.tx_bps = null;
 					c.display_name = 'جهاز محلي';
 				}
 			}
@@ -1432,7 +1447,12 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 				ok: true,
 				br_netfilter: !!res.br_netfilter,
 				flow_offloading: !!res.flow_offloading,
-				counters_supported: !res.flow_offloading,
+				counters_supported: !res.flow_offloading && nlbw_ok,
+				telemetry_status: {
+					counters_supported: !res.flow_offloading && nlbw_ok,
+					flow_offloading: !!res.flow_offloading,
+					nlbw_available: nlbw_ok
+				},
 				bridges: res.bridges || [],
 				discovery_status: res.discovery_status || {},
 				clients: list,

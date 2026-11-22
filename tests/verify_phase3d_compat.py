@@ -257,6 +257,7 @@ EXPECTED_SUITES = {
     "verify_phase3b_ucode.uc": ("UCODE3B_SUMMARY", 39),
     "verify_phase3c_ucode.uc": ("UCODE3C_SUMMARY", 47),
     "verify_phase4a_ucode.uc": ("UCODE4A_SUMMARY", 19),
+    "verify_phase4b_ucode.uc": ("UCODE4B_SUMMARY", 7),
 }
 
 
@@ -843,7 +844,7 @@ def main():
     prod_slice = build_helperd_prod_slice()
     print("=== Phase 3D: OpenWrt 24.10.0 (opkg) & 25.12.6 (apk) Chroot Suites & Lifecycle ===")
     for rootfs, ver in [(ROOTFS_2410, "24.10.0-opkg"), (ROOTFS_2512, "25.12.6-apk")]:
-        for sc in ("verify_phase3a_ucode.uc", "verify_phase3b_ucode.uc", "verify_phase3c_ucode.uc", "verify_phase4a_ucode.uc"):
+        for sc in ("verify_phase3a_ucode.uc", "verify_phase3b_ucode.uc", "verify_phase3c_ucode.uc", "verify_phase4a_ucode.uc", "verify_phase4b_ucode.uc"):
             run_ucode_suite_in_chroot(rootfs, ver, sc, prod_slice)
         test_in_chroot_lifecycle(rootfs, ver)
 
