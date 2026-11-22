@@ -252,6 +252,24 @@ def build_helperd_prod_slice():
     )
 
 
+EXPECTED_SUITES = {
+    "verify_phase3a_ucode.uc": ("UCODE_SUMMARY", 48),
+    "verify_phase3b_ucode.uc": ("UCODE3B_SUMMARY", 39),
+    "verify_phase3c_ucode.uc": ("UCODE3C_SUMMARY", 47),
+}
+
+
+def evaluate_ucode_suite_output(script_name, returncode, stdout):
+    prefix, exp_passed = EXPECTED_SUITES[script_name]
+    matches = re.findall(rf"^{re.escape(prefix)}:\s*(\d+)\s+passed,\s*(\d+)\s+failed\s*$", stdout or "", re.M)
+    if returncode != 0 or len(matches) != 1:
+        return False, f"rc={returncode} summary_matches={len(matches)}"
+    got_passed, got_failed = int(matches[0][0]), int(matches[0][1])
+    if got_failed != 0 or got_passed != exp_passed:
+        return False, f"expected={exp_passed}/0 got={got_passed}/{got_failed}"
+    return True, f"{got_passed} passed, {got_failed} failed (expected {exp_passed})"
+
+
 def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_src):
     if not os.path.isdir(rootfs_dir) or not os.path.isfile(os.path.join(rootfs_dir, "usr/bin/ucode")):
         skip(f"P3D-CHROOT[{ver_label},{script_name}]", f"rootfs missing at {rootfs_dir}")
@@ -262,13 +280,19 @@ def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_s
     os.makedirs(p3a_dir, exist_ok=True)
     libexec_dir = os.path.join(rootfs_dir, "usr", "libexec")
     os.makedirs(libexec_dir, exist_ok=True)
-    staged_libexec = []
+    preexisting_backups = []
+    created_libexec = []
     try:
         for mod in ("nms_archive.uc", "nms_network.uc", "nms_fw_wifi.uc"):
-            shutil.copy2(os.path.join(REPO_ROOT, "backend", mod), os.path.join(p3a_dir, mod))
+            src_mod = os.path.join(REPO_ROOT, "backend", mod)
+            shutil.copy2(src_mod, os.path.join(p3a_dir, mod))
             dst_lib = os.path.join(libexec_dir, mod)
-            shutil.copy2(os.path.join(REPO_ROOT, "backend", mod), dst_lib)
-            staged_libexec.append(dst_lib)
+            if os.path.lexists(dst_lib):
+                st = os.lstat(dst_lib)
+                preexisting_backups.append((dst_lib, open(dst_lib, "rb").read(), st.st_mode & 0o777, st.st_uid, st.st_gid))
+            else:
+                created_libexec.append(dst_lib)
+            shutil.copy2(src_mod, dst_lib)
         with open(os.path.join(p3a_dir, "helperd_aw_prod.uc"), "w", encoding="utf-8") as f:
             f.write(helperd_prod_src)
         shutil.copy2(os.path.join(REPO_ROOT, "tests", script_name), os.path.join(p3a_dir, script_name))
@@ -286,16 +310,21 @@ def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_s
             ["unshare", "-r", "/usr/sbin/chroot", rootfs_dir, "/usr/bin/ucode", f"/tmp/p3a_test/{script_name}"] + args,
             capture_output=True, text=True, timeout=30
         )
-        summary_lines = [ln for ln in res.stdout.splitlines() if "SUMMARY:" in ln]
-        has_summary = len(summary_lines) == 1
-        zero_failed = has_summary and ("0 failed" in summary_lines[0]) and ("0 passed" not in summary_lines[0])
-        ok = (res.returncode == 0) and zero_failed
-        check(ok, f"P3D-CHROOT[{ver_label},{script_name}]", summary_lines[0] if summary_lines else (res.stderr or res.stdout)[-240:])
+        ok, detail = evaluate_ucode_suite_output(script_name, res.returncode, res.stdout)
+        check(ok, f"P3D-CHROOT[{ver_label},{script_name}]", detail if ok else f"{detail} tail={(res.stderr or res.stdout)[-200:]}")
     finally:
         shutil.rmtree(p3a_dir, ignore_errors=True)
-        for p in staged_libexec:
-            if os.path.exists(p):
+        for p in created_libexec:
+            if os.path.lexists(p):
                 os.unlink(p)
+        for dst_lib, raw_bytes, mode, uid, gid in preexisting_backups:
+            with open(dst_lib, "wb") as bf:
+                bf.write(raw_bytes)
+            os.chmod(dst_lib, mode)
+            try:
+                os.chown(dst_lib, uid, gid)
+            except PermissionError:
+                pass
 
 
 def verify_sysupgrade_preservation(sb, expected_bytes, orig_uid, orig_gid, label):
@@ -362,6 +391,28 @@ def test_in_chroot_lifecycle(rootfs_dir, ver_label):
                 capture_output=True, text=True, timeout=30
             )
 
+        # Probe required ucode modules inside the isolated rootfs (no network/pkg install allowed)
+        probe = subprocess.run(
+            ["unshare", "-r", "/usr/sbin/chroot", sb, "/usr/bin/ucode", "-e",
+             "import * as a from 'fs'; import * as b from 'ubus'; import * as c from 'uci'; "
+             "import * as d from 'socket'; import * as e from 'math'; import * as f from 'struct'; "
+             "import * as g from 'uloop'; import * as h from 'digest';"],
+            capture_output=True, text=True, timeout=10
+        )
+        if probe.returncode != 0:
+            # Verify install.sh fails closed without attempting package install, and preserves LuCI + /etc/sysupgrade.conf
+            r_fail_pre = run_in_openwrt(["/tmp/nms_repo/scripts/install.sh", "--allow-insecure-lan-http"])
+            pre_fail_ok = (
+                r_fail_pre.returncode != 0
+                and "package installation is disabled" in (r_fail_pre.stderr + r_fail_pre.stdout)
+                and open(os.path.join(sb, "www", "index.html"), "rb").read() == luci_html
+                and open(os.path.join(sb, "etc", "config", "uhttpd"), "rb").read() == luci_uhttpd
+            )
+            check(pre_fail_ok, f"P3D-CHROOT-PREREQ[{ver_label},fails_closed_when_ucode_mods_missing]")
+            verify_sysupgrade_preservation(sb, sysupgrade_orig, su_orig_st.st_uid, su_orig_st.st_gid, f"P3D-CHROOT-SYSUPGRADE[{ver_label},preserved_on_prereq_abort]")
+            skip(f"P3D-CHROOT-LIFECYCLE[{ver_label}]", "minimal offline rootfs lacks ucode-mod-socket/struct/uloop/digest and network pkg install is forbidden")
+            return
+
         # 1. Fresh Install inside actual OpenWrt rootfs
         r_inst = run_in_openwrt(["/tmp/nms_repo/scripts/install.sh", "--allow-insecure-lan-http"])
         inst_ok = (
@@ -393,9 +444,31 @@ def test_in_chroot_lifecycle(rootfs_dir, ver_label):
         )
         verify_sysupgrade_preservation(sb, sysupgrade_orig, su_orig_st.st_uid, su_orig_st.st_gid, f"P3D-CHROOT-SYSUPGRADE[{ver_label},preserved_after_upgrade]")
 
-        # 3. Failed Install Rollback (fail_point=after_backend) -> must NOT corrupt /etc/sysupgrade.conf or LuCI
+        # 3. Failed Install Rollback (fail_point=after_backend) -> must restore managed files & manifest, clean tmp, and keep LuCI/sysupgrade.conf intact
+        import hashlib
+        def snap_state():
+            tracked = [
+                os.path.join(sb, "usr", "libexec", "noc-helperd"),
+                os.path.join(sb, "usr", "libexec", "nms_archive.uc"),
+                os.path.join(sb, "etc", "noc-console", "installed_files.manifest"),
+            ]
+            return {p: (hashlib.sha256(open(p, "rb").read()).hexdigest(), os.lstat(p).st_mode & 0o777) for p in tracked}
+
+        pre_fail_state = snap_state()
         r_fail = run_in_openwrt(["/tmp/nms_repo/scripts/install.sh", "--allow-insecure-lan-http"], {"NMS_TEST_FAIL_POINT": "after_backend"})
-        check(r_fail.returncode != 0, f"P3D-CHROOT-FAILROLLBACK[{ver_label},aborted_cleanly]")
+        post_fail_state = snap_state()
+        orphan_tmps = [
+            fn for d in (os.path.join(sb, "etc", "noc-console"), os.path.join(sb, "usr", "libexec"))
+            for fn in os.listdir(d) if ".tmp." in fn or ".bak." in fn
+        ]
+        rb_ok = (
+            r_fail.returncode != 0
+            and post_fail_state == pre_fail_state
+            and len(orphan_tmps) == 0
+            and open(os.path.join(sb, "www", "index.html"), "rb").read() == luci_html
+            and open(os.path.join(sb, "etc", "config", "uhttpd"), "rb").read() == luci_uhttpd
+        )
+        check(rb_ok, f"P3D-CHROOT-FAILROLLBACK[{ver_label},restored_managed_files_manifest_and_luci]", f"rc={r_fail.returncode} orphans={orphan_tmps}")
         verify_sysupgrade_preservation(sb, sysupgrade_orig, su_orig_st.st_uid, su_orig_st.st_gid, f"P3D-CHROOT-SYSUPGRADE[{ver_label},preserved_after_failed_install]")
 
         # 4. Clean Uninstall inside actual OpenWrt rootfs
@@ -424,6 +497,143 @@ def test_architecture_portability():
     check(len(elf_hits) == 0, "P3D-ARCH[zero_elf_binaries_in_deliverables]", str(elf_hits))
 
 
+def test_sandboxed_lifecycle_with_rollback():
+    import hashlib
+    with tempfile.TemporaryDirectory(prefix="nms_p3d_sb_") as tmp:
+        sb = os.path.join(tmp, "sandbox")
+        os.makedirs(os.path.join(sb, "etc", "config"), exist_ok=True)
+        os.makedirs(os.path.join(sb, "etc", "init.d"), exist_ok=True)
+        os.makedirs(os.path.join(sb, "www"), exist_ok=True)
+        os.makedirs(os.path.join(sb, "usr", "libexec"), exist_ok=True)
+        os.makedirs(os.path.join(sb, "tmp"), exist_ok=True)
+        shutil.copy2(os.path.join(ROOTFS_2512, "etc", "passwd"), os.path.join(sb, "etc", "passwd"))
+        shutil.copy2(os.path.join(ROOTFS_2512, "etc", "group"), os.path.join(sb, "etc", "group"))
+
+        luci_html = b"<html><body>LuCI-Active</body></html>\n"
+        luci_uhttpd = b"config uhttpd 'main'\n\tlist listen_http '0.0.0.0:80'\n"
+        sysupgrade_orig = b"# User custom sysupgrade\n/etc/dropbear/\n/etc/config/wireless\n"
+        with open(os.path.join(sb, "www", "index.html"), "wb") as f:
+            f.write(luci_html)
+        with open(os.path.join(sb, "etc", "config", "uhttpd"), "wb") as f:
+            f.write(luci_uhttpd)
+        su_path = os.path.join(sb, "etc", "sysupgrade.conf")
+        with open(su_path, "wb") as f:
+            f.write(sysupgrade_orig)
+        os.chmod(su_path, 0o644)
+        su_orig_st = os.lstat(su_path)
+
+        runner = os.path.join(tmp, "svc_runner.sh")
+        with open(runner, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(runner, 0o755)
+
+        env = os.environ.copy()
+        env["NMS_ROOT_PREFIX"] = sb
+        env["NMS_SKIP_SERVICE_START"] = "1"
+        env["NMS_SERVICE_RUNNER"] = runner
+
+        r1 = subprocess.run(["/bin/sh", os.path.join(REPO_ROOT, "scripts", "install.sh")], env=env, capture_output=True, text=True, timeout=30)
+        check(r1.returncode == 0 and os.path.isfile(os.path.join(sb, "etc", "noc-console", "tls.crt")), "P3D-SB-INSTALL[fresh]")
+        verify_sysupgrade_preservation(sb, sysupgrade_orig, su_orig_st.st_uid, su_orig_st.st_gid, "P3D-SB-SYSUPGRADE[after_install]")
+
+        r2 = subprocess.run(["/bin/sh", os.path.join(REPO_ROOT, "scripts", "install.sh")], env=env, capture_output=True, text=True, timeout=30)
+        check(r2.returncode == 0, "P3D-SB-UPGRADE[in_place]")
+        verify_sysupgrade_preservation(sb, sysupgrade_orig, su_orig_st.st_uid, su_orig_st.st_gid, "P3D-SB-SYSUPGRADE[after_upgrade]")
+
+        tracked = [
+            os.path.join(sb, "usr", "libexec", "noc-helperd"),
+            os.path.join(sb, "usr", "libexec", "nms_archive.uc"),
+            os.path.join(sb, "etc", "noc-console", "installed_files.manifest"),
+        ]
+        pre_snap = {p: (hashlib.sha256(open(p, "rb").read()).hexdigest(), os.lstat(p).st_mode & 0o777) for p in tracked}
+        env_fail = env.copy()
+        env_fail["NMS_TEST_FAIL_POINT"] = "after_backend"
+        rf = subprocess.run(["/bin/sh", os.path.join(REPO_ROOT, "scripts", "install.sh")], env=env_fail, capture_output=True, text=True, timeout=30)
+        post_snap = {p: (hashlib.sha256(open(p, "rb").read()).hexdigest(), os.lstat(p).st_mode & 0o777) for p in tracked}
+        orphans = [fn for d in (os.path.join(sb, "etc", "noc-console"), os.path.join(sb, "usr", "libexec")) for fn in os.listdir(d) if ".tmp." in fn or ".bak." in fn]
+        check(
+            rf.returncode != 0 and post_snap == pre_snap and len(orphans) == 0
+            and open(os.path.join(sb, "www", "index.html"), "rb").read() == luci_html
+            and open(os.path.join(sb, "etc", "config", "uhttpd"), "rb").read() == luci_uhttpd,
+            "P3D-SB-FAILROLLBACK[restored_managed_files_manifest_and_luci]",
+            f"rc={rf.returncode} orphans={orphans}"
+        )
+        verify_sysupgrade_preservation(sb, sysupgrade_orig, su_orig_st.st_uid, su_orig_st.st_gid, "P3D-SB-SYSUPGRADE[after_failed_install]")
+
+        ru = subprocess.run(["/bin/sh", os.path.join(REPO_ROOT, "scripts", "uninstall.sh")], env=env, capture_output=True, text=True, timeout=30)
+        check(
+            ru.returncode == 0
+            and not os.path.exists(os.path.join(sb, "usr", "libexec", "noc-helperd"))
+            and not os.path.exists(os.path.join(sb, "etc", "noc-console", "installed_files.manifest"))
+            and open(os.path.join(sb, "www", "index.html"), "rb").read() == luci_html,
+            "P3D-SB-UNINSTALL[clean_restore_and_luci_intact]"
+        )
+        verify_sysupgrade_preservation(sb, sysupgrade_orig, su_orig_st.st_uid, su_orig_st.st_gid, "P3D-SB-SYSUPGRADE[after_uninstall]")
+
+
+def test_harness_integrity(prod_slice):
+    # 1. Negative summary evaluator checks (must reject missing, duplicated, reduced, failed, or nonzero rc)
+    neg_cases = [
+        ("missing_summary", 0, "all good\n"),
+        ("duplicated_summary", 0, "UCODE_SUMMARY: 48 passed, 0 failed\nUCODE_SUMMARY: 48 passed, 0 failed\n"),
+        ("reduced_count", 0, "UCODE_SUMMARY: 47 passed, 0 failed\n"),
+        ("nonzero_failed", 0, "UCODE_SUMMARY: 48 passed, 1 failed\n"),
+        ("nonzero_rc", 1, "UCODE_SUMMARY: 48 passed, 0 failed\n"),
+    ]
+    for lbl, rc, out in neg_cases:
+        ok, _ = evaluate_ucode_suite_output("verify_phase3a_ucode.uc", rc, out)
+        check(not ok, f"P3D-HARNESS-NEG[{lbl}_rejected]")
+
+    # 2. Pre-existing staged /usr/libexec file preservation & restoration
+    if os.path.isdir(ROOTFS_2512):
+        with tempfile.TemporaryDirectory(prefix="nms_p3d_preexist_") as tmp:
+            sb = os.path.join(tmp, "rootfs")
+            shutil.copytree(ROOTFS_2512, sb, symlinks=True)
+            os.makedirs(os.path.join(sb, "usr", "libexec"), exist_ok=True)
+            for fn in ("nms_network.uc", "nms_fw_wifi.uc"):
+                lp = os.path.join(sb, "usr", "libexec", fn)
+                if os.path.lexists(lp):
+                    os.unlink(lp)
+            sentinel_path = os.path.join(sb, "usr", "libexec", "nms_archive.uc")
+            sentinel_bytes = b"// PRE-EXISTING CUSTOM MODULE\n"
+            with open(sentinel_path, "wb") as f:
+                f.write(sentinel_bytes)
+            os.chmod(sentinel_path, 0o640)
+            run_ucode_suite_in_chroot(sb, "preexist-check", "verify_phase3b_ucode.uc", prod_slice)
+            restored_ok = (
+                os.path.isfile(sentinel_path)
+                and open(sentinel_path, "rb").read() == sentinel_bytes
+                and (os.lstat(sentinel_path).st_mode & 0o777) == 0o640
+                and not os.path.lexists(os.path.join(sb, "usr", "libexec", "nms_network.uc"))
+                and not os.path.lexists(os.path.join(sb, "usr", "libexec", "nms_fw_wifi.uc"))
+            )
+            check(restored_ok, "P3D-HARNESS[preserves_and_restores_preexisting_libexec_file]")
+
+        # 3. Missing ucode module MUST fail cleanly when NMS_SKIP_PKG_INSTALL=1 (no apk/opkg attempted)
+        with tempfile.TemporaryDirectory(prefix="nms_p3d_prereq_") as tmp:
+            sb = os.path.join(tmp, "rootfs")
+            shutil.copytree(ROOTFS_2512, sb, symlinks=True)
+            repo_dst = os.path.join(sb, "tmp", "nms_repo")
+            for sub in ("backend", "frontend", "init.d", "scripts", "schemas"):
+                shutil.copytree(os.path.join(REPO_ROOT, sub), os.path.join(repo_dst, sub), symlinks=True)
+            uc_bin = os.path.join(sb, "usr", "bin", "ucode")
+            os.unlink(uc_bin)
+            with open(uc_bin, "w") as f:
+                f.write("#!/bin/sh\necho \"$*\" | grep -q \"digest\" && exit 1\nexit 0\n")
+            os.chmod(uc_bin, 0o755)
+            r_pre = subprocess.run(
+                ["unshare", "-r", "/usr/sbin/chroot", sb, "/bin/sh", "-c",
+                 "env NMS_SKIP_PKG_INSTALL=1 NMS_SKIP_SERVICE_START=1 /bin/sh /tmp/nms_repo/scripts/install.sh --allow-insecure-lan-http"],
+                capture_output=True, text=True, timeout=15
+            )
+            pre_ok = (
+                r_pre.returncode != 0
+                and "digest" in (r_pre.stderr + r_pre.stdout)
+                and not os.path.exists(os.path.join(sb, "usr", "libexec", "noc-helperd"))
+            )
+            check(pre_ok, "P3D-PREREQ[missing_ucode_mod_fails_offline_without_pkg_install]", (r_pre.stderr or r_pre.stdout)[-200:])
+
+
 def main():
     prod_slice = build_helperd_prod_slice()
     print("=== Phase 3D: OpenWrt 24.10.0 (opkg) & 25.12.6 (apk) Chroot Suites & Lifecycle ===")
@@ -432,6 +642,8 @@ def main():
             run_ucode_suite_in_chroot(rootfs, ver, sc, prod_slice)
         test_in_chroot_lifecycle(rootfs, ver)
 
+    test_sandboxed_lifecycle_with_rollback()
+    test_harness_integrity(prod_slice)
     test_architecture_portability()
     print(f"\n=== PHASE 3D SUMMARY: {passed} passed, {failed} failed, {skipped} skipped ===")
     sys.exit(0 if failed == 0 else 1)

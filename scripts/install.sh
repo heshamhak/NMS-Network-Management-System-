@@ -45,9 +45,12 @@ TLS_PKGS="socat openssl-util"
 
 # --- Stage 0: Irreversible System Prerequisite Installation (Pre-Transaction) ---
 echo "[0/6] Checking system prerequisites (non-transactional OS packages)..."
-if [ -z "$ROOT_PREFIX" ] && [ "$SKIP_PKG_INSTALL" -ne 1 ]; then
+if [ -z "$ROOT_PREFIX" ]; then
   if ! command -v ucode >/dev/null 2>&1; then
-    if command -v apk >/dev/null 2>&1; then
+    if [ "$SKIP_PKG_INSTALL" -eq 1 ]; then
+      echo "ERROR: 'ucode' not found and package installation is disabled (NMS_SKIP_PKG_INSTALL=1)." >&2
+      exit 1
+    elif command -v apk >/dev/null 2>&1; then
       apk update >/dev/null 2>&1 || true
       apk add $REQUIRED_PKGS
     elif command -v opkg >/dev/null 2>&1; then
@@ -66,7 +69,10 @@ if [ -z "$ROOT_PREFIX" ] && [ "$SKIP_PKG_INSTALL" -ne 1 ]; then
     fi
   done
   if [ -n "$MISSING_MODS" ]; then
-    if command -v apk >/dev/null 2>&1; then
+    if [ "$SKIP_PKG_INSTALL" -eq 1 ]; then
+      echo "ERROR: Required ucode modules missing (${MISSING_MODS}) and package installation is disabled." >&2
+      exit 1
+    elif command -v apk >/dev/null 2>&1; then
       apk update >/dev/null 2>&1 || true
       apk add $MISSING_MODS
     elif command -v opkg >/dev/null 2>&1; then
