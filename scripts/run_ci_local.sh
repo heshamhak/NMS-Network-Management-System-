@@ -27,5 +27,6 @@ run_strict "[2/5] Local & Integration Suite (verify_nms_local.py)" "python3 test
 run_strict "[3/5] OpenWrt 24.10.0 & 25.12.6 Chroot Compatibility Suite (verify_phase3d_compat.py)" "python3 tests/verify_phase3d_compat.py"
 run_strict "[4/5] OpenWrt Native Packaging, Signing & Migration Suite (verify_phase5a_pkg.py)" "python3 tests/verify_phase5a_pkg.py"
 run_strict "[5/5] Frontend RBAC, Restore Parity & SSE Suite (verify_phase5c_ui.py)" "python3 tests/verify_phase5c_ui.py"
+run_strict "[6/6] Post-Deployment Smoke Check Suite (verify_smoke_check.py)" "python3 tests/verify_smoke_check.py"
 
 echo "=== ALL NMS CI SUITES PASSED (0 failed, 0 skipped) ==="
