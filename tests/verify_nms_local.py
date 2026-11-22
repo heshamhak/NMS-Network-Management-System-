@@ -1517,5 +1517,39 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
     finally:
         os.chmod(bad_dir, 0o755)
 
+    # 8d. OpenWrt UCI CIDR / multi-IP network.lan.ipaddr ("192.168.1.1/24 10.0.0.1/24") MUST strip /prefix for stunnel & SAN
+    cidr_dir = os.path.join(st_td, "cidr_certs")
+    os.makedirs(cidr_dir)
+    cidr_crt = os.path.join(cidr_dir, "tls.crt")
+    cidr_key = os.path.join(cidr_dir, "tls.key")
+    cidr_fp = os.path.join(cidr_dir, "tls.fingerprint")
+    cidr_conf = os.path.join(st_td, "stunnel_cidr.conf")
+    cidr_harness = (
+        "procd_open_instance() { echo \"INST:$1\"; }\n"
+        "procd_set_param() { echo \"PARAM:$*\"; }\n"
+        "procd_close_instance() { echo \"CLOSE\"; }\n"
+        "logger() { echo \"LOG:$*\"; }\n"
+        "uci() { echo '192.168.1.1/24 10.0.0.1/24'; }\n"
+        f". {init_shim}\n"
+        f"TLS_CERT={cidr_crt}; TLS_KEY={cidr_key}; TLS_FP={cidr_fp}; STUNNEL_CONF={cidr_conf}; start_service\n"
+    )
+    r_cidr = subprocess.run(
+        ["sh", "-c", cidr_harness],
+        env={"PATH": f"{bin_stunnel}:/usr/bin:/bin"}, capture_output=True, text=True,
+    )
+    cidr_conf_txt = open(cidr_conf).read() if os.path.isfile(cidr_conf) else ""
+    cert_txt = ""
+    if os.path.isfile(cidr_crt):
+        cert_txt = subprocess.run(["openssl", "x509", "-in", cidr_crt, "-noout", "-text"], capture_output=True, text=True).stdout
+    if (
+        r_cidr.returncode == 0
+        and "accept = 192.168.1.1:8743" in cidr_conf_txt
+        and "/24" not in cidr_conf_txt
+        and "IP Address:192.168.1.1" in cert_txt
+    ):
+        ok("SEC-01-STUNNEL[cidr_and_multi_ip_lan_ipaddr_stripped]")
+    else:
+        fail(f"SEC-01-STUNNEL[cidr_and_multi_ip_lan_ipaddr_stripped]: rc={r_cidr.returncode} conf={cidr_conf_txt!r}")
+
 print(f"\n=== SUMMARY: {len(passes)} passed, {len(failures)} failed ===")
 sys.exit(1 if failures else 0)

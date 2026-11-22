@@ -15,8 +15,16 @@ HTTP_PORT=8780
 EXTRA_COMMANDS="renew_cert"
 EXTRA_HELP="	renew_cert	Regenerate TLS certificate and update SHA-256 fingerprint"
 
+get_lan_ip() {
+	_raw="$(uci -q get network.lan.ipaddr 2>/dev/null || true)"
+	set -- $_raw
+	_first="${1:-}"
+	_ip="${_first%%/*}"
+	[ -n "$_ip" ] && printf '%s\n' "$_ip" || printf '%s\n' "192.168.1.1"
+}
+
 generate_tls_cert() {
-	LAN_IP="$(uci -q get network.lan.ipaddr 2>/dev/null || echo '192.168.1.1')"
+	LAN_IP="$(get_lan_ip)"
 	HOSTNAME_VAL="$(uci -q get system.@system[0].hostname 2>/dev/null || hostname 2>/dev/null || echo 'nms')"
 
 	if command -v openssl >/dev/null 2>&1; then
@@ -98,7 +106,7 @@ start_service() {
 	mkdir -p /tmp/noc-console
 	chmod 0755 /tmp/noc-console
 
-	LAN_IP="$(uci -q get network.lan.ipaddr 2>/dev/null || echo '192.168.1.1')"
+	LAN_IP="$(get_lan_ip)"
 	ALLOW_INSECURE="${NOC_ALLOW_INSECURE_HTTP:-0}"
 	TLS_ENGINE="$(detect_tls_engine)"
 

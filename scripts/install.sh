@@ -384,11 +384,19 @@ if [ "$TLS_READY" -eq 1 ]; then
   fi
 fi
 
-if [ "$NEED_NEW_TLS" -eq 1 ]; then
-  LAN_IP="192.168.1.1"
+get_lan_ip() {
+  _raw=""
   if [ -z "$ROOT_PREFIX" ] && command -v uci >/dev/null 2>&1; then
-    LAN_IP="$(uci -q get network.lan.ipaddr 2>/dev/null || echo '192.168.1.1')"
+    _raw="$(uci -q get network.lan.ipaddr 2>/dev/null || true)"
   fi
+  set -- $_raw
+  _first="${1:-}"
+  _ip="${_first%%/*}"
+  [ -n "$_ip" ] && printf '%s\n' "$_ip" || printf '%s\n' "192.168.1.1"
+}
+
+if [ "$NEED_NEW_TLS" -eq 1 ]; then
+  LAN_IP="$(get_lan_ip)"
   openssl req -x509 -newkey rsa:2048 -nodes \
     -keyout "${TX_TMP_DIR}/tls.key" -out "${TX_TMP_DIR}/tls.crt" -days 825 \
     -subj "/CN=nms.lan" \
@@ -531,7 +539,7 @@ COMMITTED=1
 echo "[6/6] NMS installation transaction committed."
 
 if [ "$SKIP_SERVICE_START" -eq 0 ] && [ -z "$ROOT_PREFIX" ]; then
-  LAN_IP="$(uci -q get network.lan.ipaddr 2>/dev/null || echo '192.168.1.1')"
+  LAN_IP="$(get_lan_ip)"
   echo ""
   echo "=================================================="
   echo " NMS (Network Management System) installed!"
