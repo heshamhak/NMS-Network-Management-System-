@@ -421,7 +421,7 @@ touch /tmp/noc_p15_stage/leases
 """
 
 if not (LIVE_MODE and GATEWAY):
-    print("[SKIP] Live gateway staging skipped (pass --live with NOC_GATEWAY=user@host to run)")
+    print("[INFO] Offline CI mode: remote live-gateway staging disabled (pass --live with NOC_GATEWAY=user@host to run)")
     print(f"\n=== SUMMARY: {len(passes)} passed, {len(failures)} failed ===")
     sys.exit(1 if failures else 0)
 

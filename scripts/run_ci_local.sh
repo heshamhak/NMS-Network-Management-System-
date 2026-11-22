@@ -9,7 +9,6 @@ cd "$REPO_ROOT"
 run_strict() {
   _label="$1"
   _cmd="$2"
-  _allow_live_skip="${3:-0}"
   echo "=== $_label ==="
   _out="$(sh -c "$_cmd")"
   printf '%s\n' "$_out"
@@ -17,16 +16,16 @@ run_strict() {
     echo "CI ERROR: $_label reported failed tests!" >&2
     exit 1
   fi
-  if [ "$_allow_live_skip" != "1" ] && printf '%s\n' "$_out" | grep -Eq "(\[SKIP\]|[1-9][0-9]* skipped)"; then
+  if printf '%s\n' "$_out" | grep -Eq "(\[SKIP\]|[1-9][0-9]* skipped)"; then
     echo "CI ERROR: $_label reported skipped tests!" >&2
     exit 1
   fi
 }
 
-run_strict "[1/5] Static & Security/WCAG/Schema Suite (verify_noc_p15.py)" "python3 tests/verify_noc_p15.py" 1
-run_strict "[2/5] Local & Integration Suite (verify_nms_local.py)" "python3 tests/verify_nms_local.py" 0
-run_strict "[3/5] OpenWrt 24.10.0 & 25.12.6 Chroot Compatibility Suite (verify_phase3d_compat.py)" "python3 tests/verify_phase3d_compat.py" 0
-run_strict "[4/5] OpenWrt Native Packaging, Signing & Migration Suite (verify_phase5a_pkg.py)" "python3 tests/verify_phase5a_pkg.py" 0
-run_strict "[5/5] Frontend RBAC, Restore Parity & SSE Suite (verify_phase5c_ui.py)" "python3 tests/verify_phase5c_ui.py" 0
+run_strict "[1/5] Static & Security/WCAG/Schema Suite (verify_noc_p15.py)" "python3 tests/verify_noc_p15.py"
+run_strict "[2/5] Local & Integration Suite (verify_nms_local.py)" "python3 tests/verify_nms_local.py"
+run_strict "[3/5] OpenWrt 24.10.0 & 25.12.6 Chroot Compatibility Suite (verify_phase3d_compat.py)" "python3 tests/verify_phase3d_compat.py"
+run_strict "[4/5] OpenWrt Native Packaging, Signing & Migration Suite (verify_phase5a_pkg.py)" "python3 tests/verify_phase5a_pkg.py"
+run_strict "[5/5] Frontend RBAC, Restore Parity & SSE Suite (verify_phase5c_ui.py)" "python3 tests/verify_phase5c_ui.py"
 
 echo "=== ALL NMS CI SUITES PASSED (0 failed, 0 skipped) ==="
