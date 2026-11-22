@@ -190,6 +190,7 @@ function validate_backup_archive(archive_path, cb) {
 			sha256: sha,
 			entries_count: length(chk.entries),
 			entries: length(chk.entries) > 100 ? slice(chk.entries, 0, 100) : chk.entries,
+			entry_meta: chk.entry_meta || [],
 			errors: chk.errors
 		});
 	});
@@ -332,11 +333,11 @@ function audit_append(actor, action_name, target, result, details) {
 		details: redact_secrets(details || '')
 	});
 	let fp = fs.open(ap, 'a');
-	if (fp) {
-		fp.write(entry);
-		fp.close();
-		fs.chmod(ap, 0o600);
-	}
+	if (!fp) return false;
+	let w = fp.write(entry);
+	let cls = fp.close();
+	fs.chmod(ap, 0o600);
+	return (w != null && cls !== false);
 }
 
 function check_storage_budget() {
@@ -3055,56 +3056,7 @@ function handle_rpc(req, reply_cb) {
 		return;
 	}
 
-	if (verb == 'sys_backup_restore') {
-		if (params.configs && type(params.configs) == 'object') {
-			let allowed = { 'network': true, 'wireless': true, 'dhcp': true, 'firewall': true, 'sqm': true };
-			let restored_keys = [];
-			for (let k in keys(params.configs)) {
-				if (!allowed[k]) continue;
-				let cfg = params.configs[k];
-				if (type(cfg) != 'object') continue;
-				let p = '/etc/config/' + k;
-				let bak = p + '.bak.' + time();
-				if (fs.stat(p)) {
-					let raw_cur = fs.readfile(p);
-					if (raw_cur) {
-						let aw_r = atomic_write(bak, raw_cur, 0o644);
-						if (!aw_r || !aw_r.ok) {
-							reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل حفظ نسخة احتياطية محلية' });
-							return;
-						}
-					}
-				}
-				push(restored_keys, k);
-			}
-			audit_append(actor, 'sys_backup_restore', 'json_configs', 'committed', 'sections=' + join(',', restored_keys));
-			reply_cb({ ok: true, restored_sections: restored_keys, message_ar: 'تمت استعادة الإعدادات بنجاح' });
-			return;
-		}
-		let b64 = trim(params.archive_b64 || '');
-		if (b64 == '') {
-			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'بيانات الاستعادة غير متوفرة' });
-			return;
-		}
-		let decoded = b64dec(b64);
-		if (!decoded || length(decoded) == 0 || length(decoded) > BACKUP_MAX_BYTES) {
-			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'حجم الأرشيف غير صالح' });
-			return;
-		}
-		let tmp_tar = RUN_DIR + '/restore-' + now_mono_ms() + '.tar.gz';
-		fs.writefile(tmp_tar, decoded);
-		validate_backup_archive(tmp_tar, function(vr) {
-			if (!vr.valid) {
-				if (fs.stat(tmp_tar)) fs.unlink(tmp_tar);
-				reply_cb({ ok: false, error_code: 'VALIDATION', errors: vr.errors, message_ar: 'الأرشيف غير آمن أو تالف' });
-				return;
-			}
-			if (fs.stat(tmp_tar)) fs.unlink(tmp_tar);
-			audit_append(actor, 'sys_backup_restore', 'archive', 'committed', 'sha256=' + vr.sha256);
-			reply_cb({ ok: true, sha256: vr.sha256, message_ar: 'تم التحقق من الأرشيف واستعادته بنجاح' });
-		});
-		return;
-	}
+	// sys_backup_restore: now handled post-lock in mutating section below
 
 	if (verb == 'sys_sysupgrade_conf_get') {
 		let raw = fs.readfile(SYSUPGRADE_CONF_PATH);
@@ -3422,7 +3374,8 @@ function handle_rpc(req, reply_cb) {
 		'rollback_confirm': true, 'rollback_revert': true,
 		'alerts_set': true, 'alerts_test': true, 'alerts_dispatch': true,
 		'client_quota_set': true, 'schedule_action_set': true, 'schedule_action_delete': true,
-		'freeze_clear': true
+		'freeze_clear': true,
+		'sys_backup_restore': true
 	};
 	if (!mutating_verbs[verb]) {
 		reply_cb({ ok: false, error_code: 'UNSUPPORTED', message_ar: 'الأمر المطلوب غير مدعوم في هذا الإصدار' });
@@ -3430,6 +3383,478 @@ function handle_rpc(req, reply_cb) {
 	}
 
 	if (!enforce_mutation_gate(verb, params, actor, reply_cb)) {
+		return;
+	}
+
+	// ============================================================
+	// Phase 5B: sys_backup_restore — transactional, locked, whitelisted
+	// Lock is now held. All paths must call release_lock() before returning.
+	// ============================================================
+	if (verb == 'sys_backup_restore') {
+		let RESTORE_WHITELIST = nms_archive.RESTORE_WHITELIST;
+
+		// Helper: recursively remove a temporary directory
+		let rm_rf = null;
+		rm_rf = function(dir) {
+			if (!dir || !fs.stat(dir)) return true;
+			let entries = fs.lsdir(dir) || [];
+			for (let e in entries) {
+				if (e == '.' || e == '..') continue;
+				let full = dir + '/' + e;
+				let st = fs.lstat(full);
+				if (!st) continue;
+				if (st.type == 'directory') rm_rf(full);
+				else fs.unlink(full);
+			}
+			return fs.rmdir(dir);
+		};
+
+		// Helper: sequentially reload a list of init.d services and report first failure
+		let reload_services_seq = function(svc_list, done_cb) {
+			let idx = 0;
+			let next = null;
+			next = function() {
+				if (idx >= length(svc_list)) {
+					done_cb({ ok: true });
+					return;
+				}
+				let svc = svc_list[idx++];
+				let init_p = '/etc/init.d/' + svc;
+				if (!fs.stat(init_p)) {
+					next();
+					return;
+				}
+				exec_argv_async(init_p, ['reload'], 10000, CAP_GENERAL, function(r) {
+					if (!r.ok) {
+						done_cb({ ok: false, service: svc, error: r.error || ('reload failed for ' + svc) });
+						return;
+					}
+					next();
+				});
+			};
+			next();
+		};
+
+		// Helper: compute list of services affected by a list of target paths
+		let compute_reload_services = function(targets) {
+			let svcs = [];
+			let seen = {};
+			let add_svc = function(s) { if (!seen[s]) { seen[s] = true; push(svcs, s); } };
+			for (let tgt in targets) {
+				if (tgt == '/etc/config/network' || tgt == '/etc/config/wireless') add_svc('network');
+				if (tgt == '/etc/config/dhcp') { add_svc('network'); add_svc('dnsmasq'); }
+				if (tgt == '/etc/config/firewall') add_svc('firewall');
+				if (tgt == '/etc/config/sqm') add_svc('sqm');
+			}
+			return svcs;
+		};
+
+		// --- UCI JSON configs branch ---
+		if (params.configs != null) {
+			let vr = nms_archive.validate_and_render_uci_configs(params.configs);
+			if (!vr.ok) {
+				release_lock();
+				audit_append(actor, 'sys_backup_restore', 'json_configs', 'rejected', join(';', vr.errors));
+				reply_cb({ ok: false, error_code: 'VALIDATION', errors: vr.errors, message_ar: 'بيانات إعدادات UCI غير صالحة للاستعادة' });
+				return;
+			}
+
+			let rb_uid = urandom_hex(8);
+			let rb_dir = RUN_DIR + '/restore_rollback_' + rb_uid;
+			if (!fs.stat(rb_dir)) fs.mkdir(rb_dir, 0o700);
+			let rb_map = {};
+			let rb_ok = true;
+			let target_list = [];
+
+			for (let k in keys(vr.rendered)) {
+				let target = '/etc/config/' + k;
+				push(target_list, target);
+				let st_t = fs.stat(target);
+				if (st_t) {
+					let orig = fs.readfile(target);
+					if (orig == null) { rb_ok = false; break; }
+					let rb_path = rb_dir + '/' + k;
+					let rb_aw = atomic_write(rb_path, orig, 0o600);
+					if (!rb_aw.ok) { rb_ok = false; break; }
+					rb_map[target] = { existed: true, rb_path: rb_path, mode: st_t.mode || 0o644, uid: st_t.uid, gid: st_t.gid };
+				} else {
+					rb_map[target] = { existed: false, rb_path: null };
+				}
+			}
+
+			if (!rb_ok) {
+				rm_rf(rb_dir);
+				release_lock();
+				audit_append(actor, 'sys_backup_restore', 'json_configs', 'failed', 'rollback_snapshot_failed');
+				reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل إنشاء لقطة التراجع قبل التعديل' });
+				return;
+			}
+
+			let restored_keys = [];
+			let write_errors = [];
+			for (let k in keys(vr.rendered)) {
+				let target = '/etc/config/' + k;
+				let content = vr.rendered[k];
+				let aw = atomic_write(target, content, 0o644);
+				if (!aw.ok || fs.readfile(target) != content) {
+					push(write_errors, 'failed to write/verify ' + target + ': ' + (aw.error || 'content mismatch'));
+					break;
+				}
+				push(restored_keys, k);
+			}
+
+			let do_json_rollback = function() {
+				let rb_failed = false;
+				for (let tgt in keys(rb_map)) {
+					let info = rb_map[tgt];
+					if (info.existed) {
+						let orig_c = fs.readfile(info.rb_path);
+						if (orig_c == null) { rb_failed = true; continue; }
+						let rb_aw = atomic_write(tgt, orig_c, info.mode || 0o644, info.uid, info.gid);
+						if (!rb_aw.ok || fs.readfile(tgt) != orig_c) rb_failed = true;
+					} else {
+						if (fs.stat(tgt)) {
+							if (!fs.unlink(tgt)) rb_failed = true;
+						}
+					}
+				}
+				return !rb_failed;
+			};
+
+			if (length(write_errors) > 0) {
+				let rb_success = do_json_rollback();
+				if (!rb_success) {
+					release_lock();
+					let fr = enter_emergency_freeze('sys_backup_restore configs rollback failed');
+					audit_append(actor, 'sys_backup_restore', 'json_configs', 'rollback_failed', 'write_errors=' + join(';', write_errors) + ' freeze_persisted=' + (fr.freeze_persisted ? '1' : '0'));
+					reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل استعادة الإعدادات وفشل التراجع — تم تجميد التعديلات', errors: write_errors });
+				} else {
+					rm_rf(rb_dir);
+					release_lock();
+					audit_append(actor, 'sys_backup_restore', 'json_configs', 'rolled_back', 'write_errors=' + join(';', write_errors));
+					reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل كتابة ملفات الإعدادات — تم التراجع إلى الحالة السابقة', errors: write_errors });
+				}
+				return;
+			}
+
+			let svcs = compute_reload_services(target_list);
+			reload_services_seq(svcs, function(rel_res) {
+				if (!rel_res.ok) {
+					let rb_success = do_json_rollback();
+					reload_services_seq(svcs, function() {
+						if (!rb_success) {
+							release_lock();
+							let fr = enter_emergency_freeze('sys_backup_restore configs reload+rollback failed');
+							audit_append(actor, 'sys_backup_restore', 'json_configs', 'rollback_failed', 'reload_error=' + rel_res.error + ' freeze_persisted=' + (fr.freeze_persisted ? '1' : '0'));
+							reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل إعادة تحميل الخدمات وفشل التراجع — تم تجميد التعديلات', errors: [rel_res.error] });
+						} else {
+							rm_rf(rb_dir);
+							release_lock();
+							audit_append(actor, 'sys_backup_restore', 'json_configs', 'rolled_back', 'reload_error=' + rel_res.error);
+							reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل إعادة تحميل الخدمات — تم التراجع إلى الحالة السابقة', errors: [rel_res.error] });
+						}
+					});
+					return;
+				}
+
+				if (!audit_append(actor, 'sys_backup_restore', 'json_configs', 'committed', 'sections=' + join(',', restored_keys))) {
+					let rb_success = do_json_rollback();
+					if (!rb_success) {
+						release_lock();
+						enter_emergency_freeze('sys_backup_restore configs audit+rollback failed');
+						reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل تسجيل سجل التدقيق وفشل التراجع — تم تجميد التعديلات' });
+						return;
+					}
+					rm_rf(rb_dir);
+					release_lock();
+					reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل تسجيل سجل التدقيق — تم التراجع عن الاستعادة' });
+					return;
+				}
+				rm_rf(rb_dir);
+				release_lock();
+				reply_cb({ ok: true, restored_sections: restored_keys, reloaded_services: svcs, message_ar: 'تمت استعادة الإعدادات من JSON بنجاح وتم إعادة تحميل الخدمات' });
+			});
+			return;
+		}
+
+		// --- Archive (sysupgrade .tar.gz) branch ---
+		let b64 = trim(params.archive_b64 || '');
+		if (b64 == '') {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'بيانات الأرشيف غير متوفرة' });
+			return;
+		}
+		if (length(b64) > BACKUP_MAX_B64) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'بيانات الأرشيف تتجاوز الحد الأقصى المسموح' });
+			return;
+		}
+		let decoded = b64dec(b64);
+		if (!decoded || length(decoded) == 0 || length(decoded) > BACKUP_MAX_BYTES) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'حجم الأرشيف غير صالح بعد فك الترميز' });
+			return;
+		}
+
+		// Write to staging tmp file (600 perms)
+		let tmp_tar = RUN_DIR + '/restore-' + now_mono_ms() + '-' + urandom_hex(4) + '.tar.gz';
+		let wrote = fs.writefile(tmp_tar, decoded);
+		fs.chmod(tmp_tar, 0o600);
+		if (!wrote) {
+			release_lock();
+			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل حفظ الأرشيف المؤقت للتحقق' });
+			return;
+		}
+
+		// Validate archive structure via nms_archive (checksum, whitelist, no traversals)
+		validate_backup_archive(tmp_tar, function(vr) {
+			if (!vr.ok || !vr.valid) {
+				if (fs.stat(tmp_tar)) fs.unlink(tmp_tar);
+				release_lock();
+				audit_append(actor, 'sys_backup_restore', 'archive_validate', 'rejected', join(';', vr.errors || []));
+				reply_cb({ ok: false, error_code: 'VALIDATION', errors: vr.errors, message_ar: 'الأرشيف غير سليم أو يحتوي مسارات غير مصرح بها' });
+				return;
+			}
+
+			// Strict restore-whitelist, duplicate, and link/special-file check
+			let rvr = nms_archive.validate_restore_archive_entries(vr.entry_meta || []);
+			if (!rvr.ok) {
+				if (fs.stat(tmp_tar)) fs.unlink(tmp_tar);
+				release_lock();
+				audit_append(actor, 'sys_backup_restore', 'archive_validate', 'rejected', join(';', rvr.errors || []));
+				reply_cb({ ok: false, error_code: 'VALIDATION', errors: rvr.errors, message_ar: 'الأرشيف يحتوي على ملفات غير مصرح بها أو مكررة للاستعادة' });
+				return;
+			}
+
+			// Verify expected_sha256 if supplied
+			let exp_sha = lc(trim(params.expected_sha256 || ''));
+			if (exp_sha != '' && lc(vr.sha256 || '') != exp_sha) {
+				if (fs.stat(tmp_tar)) fs.unlink(tmp_tar);
+				release_lock();
+				reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'بصمة SHA-256 لا تطابق القيمة المتوقعة' });
+				return;
+			}
+
+			let archive_sha = vr.sha256;
+
+			// Extract to staging dir
+			let stage_dir = RUN_DIR + '/restore_stage_' + now_mono_ms() + '_' + urandom_hex(4);
+			if (!fs.stat(stage_dir)) fs.mkdir(stage_dir, 0o700);
+
+			let tar_bin = find_exe(['/bin/tar', '/usr/bin/tar']);
+			let gzip_bin = find_exe(['/bin/gzip', '/usr/bin/gzip']);
+			if (tar_bin == '' || gzip_bin == '') {
+				if (fs.stat(tmp_tar)) fs.unlink(tmp_tar);
+				rm_rf(stage_dir);
+				release_lock();
+				reply_cb({ ok: false, error_code: 'UNSUPPORTED', message_ar: 'أدوات tar/gzip غير متوفرة على هذا النظام' });
+				return;
+			}
+
+			exec_argv_async(gzip_bin, ['-dc', tmp_tar], 15000, BACKUP_MAX_BYTES, function(gz_res) {
+				if (fs.stat(tmp_tar)) fs.unlink(tmp_tar);
+				if (!gz_res.ok || gz_res.overflow) {
+					rm_rf(stage_dir);
+					release_lock();
+					reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل فك ضغط الأرشيف أثناء الاستخراج' });
+					return;
+				}
+
+				let tmp_untar = stage_dir + '/archive.tar';
+				let tw = fs.writefile(tmp_untar, gz_res.output);
+				if (!tw) {
+					rm_rf(stage_dir);
+					release_lock();
+					reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل كتابة ملف tar المؤقت في منطقة التجهيز' });
+					return;
+				}
+
+				exec_argv_async(tar_bin, ['-xf', tmp_untar, '-C', stage_dir], 15000, CAP_GENERAL, function(tx_res) {
+					if (fs.stat(tmp_untar)) fs.unlink(tmp_untar);
+					if (!tx_res.ok) {
+						rm_rf(stage_dir);
+						release_lock();
+						reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل استخراج الأرشيف إلى منطقة التجهيز' });
+						return;
+					}
+
+					// Walk extracted staging files and build apply list
+					let apply_list = [];
+					let rejected = [];
+					let walk_stage = null;
+					walk_stage = function(dir, rel_base) {
+						let entries = fs.lsdir(dir) || [];
+						for (let e in entries) {
+							if (e == '.' || e == '..') continue;
+							let full = dir + '/' + e;
+							let rel = rel_base != '' ? rel_base + '/' + e : e;
+							let st = fs.lstat(full);
+							if (!st) continue;
+							if (st.type == 'directory') {
+								walk_stage(full, rel);
+							} else if (st.type == 'file') {
+								let norm = nms_archive.normalize_archive_rel_path(rel);
+								if (norm == null || norm == '.' || !RESTORE_WHITELIST[norm]) {
+									push(rejected, 'مسار غير مصرح به: ' + rel);
+									continue;
+								}
+								// Validate JSON files for noc-console
+								if (norm == 'etc/noc-console/config.json' || norm == 'etc/noc-console/adguard.json') {
+									let raw_j = fs.readfile(full);
+									let parsed_j = null;
+									try { parsed_j = json(raw_j); } catch (je) { parsed_j = null; }
+									if (type(parsed_j) != 'object') {
+										push(rejected, 'ملف JSON غير صالح: ' + norm);
+										continue;
+									}
+								}
+								push(apply_list, { src: full, target: RESTORE_WHITELIST[norm], rel: norm });
+							} else {
+								push(rejected, 'نوع ملف غير مدعوم بعد الاستخراج: ' + rel);
+							}
+						}
+					};
+					walk_stage(stage_dir, '');
+
+					if (length(rejected) > 0 || length(apply_list) == 0) {
+						rm_rf(stage_dir);
+						release_lock();
+						reply_cb({ ok: false, error_code: 'VALIDATION', errors: rejected, message_ar: 'مسارات غير مصرح بها أو فارغة اكتُشفت بعد الاستخراج' });
+						return;
+					}
+
+					// Build rollback snapshot before any mutation
+					let rb_uid = urandom_hex(8);
+					let rb_dir = RUN_DIR + '/restore_rollback_' + rb_uid;
+					if (!fs.stat(rb_dir)) fs.mkdir(rb_dir, 0o700);
+					let rb_map = {};
+					let rb_ok = true;
+					for (let item in apply_list) {
+						let st_t = fs.stat(item.target);
+						if (st_t) {
+							let orig = fs.readfile(item.target);
+							if (orig == null) { rb_ok = false; break; }
+							let rb_path = rb_dir + '/' + replace(item.rel, '/', '__');
+							let rb_aw = atomic_write(rb_path, orig, 0o600);
+							if (!rb_aw.ok) { rb_ok = false; break; }
+							rb_map[item.target] = { existed: true, rb_path: rb_path, mode: st_t.mode || 0o644, uid: st_t.uid, gid: st_t.gid };
+						} else {
+							rb_map[item.target] = { existed: false, rb_path: null };
+						}
+					}
+					if (!rb_ok) {
+						rm_rf(stage_dir);
+						rm_rf(rb_dir);
+						release_lock();
+						audit_append(actor, 'sys_backup_restore', 'archive', 'failed', 'rollback_snapshot_failed sha256=' + archive_sha);
+						reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل إنشاء لقطة التراجع قبل التعديل' });
+						return;
+					}
+
+					// Apply files via atomic_write and verify content
+					let applied = [];
+					let apply_errors = [];
+					for (let item in apply_list) {
+						let content = fs.readfile(item.src);
+						if (content == null) {
+							push(apply_errors, 'قراءة ملف مستخرج فشلت: ' + item.rel);
+							break;
+						}
+						let fmode = (index(item.target, '/etc/noc-console/') == 0) ? 0o600 : 0o644;
+						let tgt_dir = substr(item.target, 0, rindex(item.target, '/'));
+						if (tgt_dir != '' && !fs.stat(tgt_dir)) fs.mkdir(tgt_dir, (index(item.target, '/etc/noc-console/') == 0) ? 0o700 : 0o755);
+						let aw = atomic_write(item.target, content, fmode);
+						if (!aw.ok || fs.readfile(item.target) != content) {
+							push(apply_errors, 'كتابة ذرية أو تحقق فشل: ' + item.target + ': ' + (aw.error || 'mismatch'));
+							break;
+						}
+						push(applied, item.target);
+					}
+
+					let do_rollback = function() {
+						let rb_failed = false;
+						for (let tgt in keys(rb_map)) {
+							let info = rb_map[tgt];
+							if (info.existed) {
+								let orig_c = fs.readfile(info.rb_path);
+								if (orig_c == null) { rb_failed = true; continue; }
+								let rb_aw = atomic_write(tgt, orig_c, info.mode || 0o644, info.uid, info.gid);
+								if (!rb_aw.ok || fs.readfile(tgt) != orig_c) rb_failed = true;
+							} else {
+								if (fs.stat(tgt)) {
+									if (!fs.unlink(tgt)) rb_failed = true;
+								}
+							}
+						}
+						return !rb_failed;
+					};
+
+					if (length(apply_errors) > 0) {
+						let rb_success = do_rollback();
+						rm_rf(stage_dir);
+						if (!rb_success) {
+							release_lock();
+							let fr = enter_emergency_freeze('sys_backup_restore apply rollback failed');
+							audit_append(actor, 'sys_backup_restore', 'archive', 'rollback_failed', 'apply_errors=' + join(';', apply_errors) + ' freeze_persisted=' + (fr.freeze_persisted ? '1' : '0'));
+							reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل تطبيق الاستعادة وفشل التراجع — تم تجميد التعديلات', errors: apply_errors });
+						} else {
+							rm_rf(rb_dir);
+							release_lock();
+							audit_append(actor, 'sys_backup_restore', 'archive', 'rolled_back', 'apply_errors=' + join(';', apply_errors));
+							reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل تطبيق بعض الملفات — تم التراجع إلى الحالة السابقة', errors: apply_errors });
+						}
+						return;
+					}
+
+					let svcs = compute_reload_services(applied);
+					reload_services_seq(svcs, function(rel_res) {
+						rm_rf(stage_dir);
+						if (!rel_res.ok) {
+							let rb_success = do_rollback();
+							reload_services_seq(svcs, function() {
+								if (!rb_success) {
+									release_lock();
+									let fr = enter_emergency_freeze('sys_backup_restore reload+rollback failed');
+									audit_append(actor, 'sys_backup_restore', 'archive', 'rollback_failed', 'reload_error=' + rel_res.error + ' freeze_persisted=' + (fr.freeze_persisted ? '1' : '0'));
+									reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل إعادة تحميل الخدمات وفشل التراجع — تم تجميد التعديلات', errors: [rel_res.error] });
+								} else {
+									rm_rf(rb_dir);
+									release_lock();
+									audit_append(actor, 'sys_backup_restore', 'archive', 'rolled_back', 'reload_error=' + rel_res.error);
+									reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل إعادة تحميل الخدمات — تم التراجع إلى الحالة السابقة', errors: [rel_res.error] });
+								}
+							});
+							return;
+						}
+
+						if (!audit_append(actor, 'sys_backup_restore', 'archive', 'committed',
+							sprintf('sha256=%s applied=%d services=%s', archive_sha, length(applied), join(',', svcs)))) {
+							let rb_success = do_rollback();
+							if (!rb_success) {
+								release_lock();
+								enter_emergency_freeze('sys_backup_restore archive audit+rollback failed');
+								reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل تسجيل سجل التدقيق وفشل التراجع — تم تجميد التعديلات' });
+								return;
+							}
+							rm_rf(rb_dir);
+							release_lock();
+							reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل تسجيل سجل التدقيق — تم التراجع عن الاستعادة' });
+							return;
+						}
+
+						rm_rf(rb_dir);
+						release_lock();
+						reply_cb({
+							ok: true,
+							sha256: archive_sha,
+							applied_count: length(applied),
+							reloaded_services: svcs,
+							message_ar: 'تمت استعادة الأرشيف بنجاح وإعادة تحميل الخدمات المتأثرة'
+						});
+					});
+				});
+			});
+		});
 		return;
 	}
 

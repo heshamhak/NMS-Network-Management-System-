@@ -1569,7 +1569,14 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 			return;
 		}
 		call_helper('sys_backup_restore', { archive_b64: body.archive_b64 || '', expected_sha256: body.expected_sha256 || '', configs: body.configs }, sess.username, remote_ip, function(res) {
-			send_json_env(cli, res.ok ? 200 : 400, 'services', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'services', message_ar: res.message_ar || 'فشلت عملية استعادة النسخة الاحتياطية', request_id: req_id }]);
+			let status = 200;
+			if (!res.ok) {
+				if (res.status == 409 || res.error_code == 'LOCKED' || res.error_code == 'CONFLICT') status = 409;
+				else if (res.error_code == 'UNSUPPORTED') status = 422;
+				else if (res.error_code == 'INTERNAL') status = 500;
+				else status = 400;
+			}
+			send_json_env(cli, status, 'services', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'services', message_ar: res.message_ar || 'فشلت عملية استعادة النسخة الاحتياطية', request_id: req_id }]);
 		});
 		return;
 	}

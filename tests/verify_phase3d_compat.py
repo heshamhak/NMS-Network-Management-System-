@@ -262,6 +262,7 @@ EXPECTED_SUITES = {
     "verify_phase4d_ucode.uc": ("UCODE4D_SUMMARY", 16),
     "verify_phase4e_ucode.uc": ("UCODE4E_SUMMARY", 23),
     "verify_phase4f_ucode.uc": ("UCODE4F_SUMMARY", 21),
+    "verify_phase5b_ucode.uc": ("UCODE5B_SUMMARY", 20),
 }
 
 
@@ -352,6 +353,89 @@ def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_s
                 "};\n"
                 + m_exec.group(1) + "\nexport { exec_argv_async, sched };\n"
             )
+        if script_name == "verify_phase5b_ucode.uc":
+            m_vba = re.search(r"(function validate_backup_archive\(.*?\n\})", h_raw, re.S)
+            m_rst = re.search(r"(\tif \(verb == 'sys_backup_restore'\) \{.*?\n\t\treturn;\n\t\})", h_raw, re.S)
+            if not m_vba or not m_rst:
+                raise RuntimeError("Failed to extract validate_backup_archive/sys_backup_restore from backend/noc-helperd")
+            with open(os.path.join(p3a_dir, "helperd_restore_prod.uc"), "w", encoding="utf-8") as f:
+                f.write(
+                    "import * as raw_fs from 'fs';\n"
+                    "import * as digest from 'digest';\n"
+                    "import * as nms_archive from '/tmp/p3a_test/nms_archive.uc';\n"
+                    "const CAP_GENERAL = 65536;\n"
+                    "const BACKUP_MAX_BYTES = 2 * 1024 * 1024;\n"
+                    "const BACKUP_MAX_B64 = 3 * 1024 * 1024;\n"
+                    "let RUN_DIR = '/tmp/p3a_test/run5b';\n"
+                    "let ROOT_MAP = '/tmp/p3a_test/root5b';\n"
+                    "let cfg = { fail_write_target: null, fail_rollback_target: null, fail_reload_svc: null, lock_held: false, freeze_calls: [], audits: [], reloads: [], in_rollback: false };\n"
+                    "function map_path(p) {\n"
+                    "  if (type(p) == 'string' && (index(p, '/etc/config/') == 0 || index(p, '/etc/noc-console/') == 0 || p == '/etc/config' || p == '/etc/noc-console')) return ROOT_MAP + p;\n"
+                    "  if (type(p) == 'string' && index(p, '/etc/init.d/') == 0) return ROOT_MAP + p;\n"
+                    "  return p;\n"
+                    "}\n"
+                    "let fs = {\n"
+                    "  stat: (p) => raw_fs.stat(map_path(p)),\n"
+                    "  lstat: (p) => raw_fs.lstat(map_path(p)),\n"
+                    "  readfile: (p) => raw_fs.readfile(map_path(p)),\n"
+                    "  writefile: (p, c) => raw_fs.writefile(map_path(p), c),\n"
+                    "  chmod: (p, m) => raw_fs.chmod(map_path(p), m),\n"
+                    "  unlink: (p) => raw_fs.unlink(map_path(p)),\n"
+                    "  mkdir: (p, m) => raw_fs.mkdir(map_path(p), m),\n"
+                    "  rmdir: (p) => raw_fs.rmdir(map_path(p)),\n"
+                    "  lsdir: (p) => raw_fs.lsdir(map_path(p))\n"
+                    "};\n"
+                    "let _seq = 0;\n"
+                    "function now_mono_ms() { return 10000 + (++_seq); }\n"
+                    "function urandom_hex(n) { return sprintf('%08x', ++_seq); }\n"
+                    "function find_exe(list) { for (let p in list) { if (raw_fs.stat(p)) return p; } return ''; }\n"
+                    "function atomic_write(path, content, mode, uid, gid) {\n"
+                    "  if (cfg.fail_write_target && path == cfg.fail_write_target && !cfg.in_rollback) {\n"
+                    "    cfg.in_rollback = true;\n"
+                    "    return { ok: false, error: 'injected_write_fail' };\n"
+                    "  }\n"
+                    "  if (cfg.fail_rollback_target && path == cfg.fail_rollback_target && cfg.in_rollback) {\n"
+                    "    return { ok: false, error: 'injected_rollback_fail' };\n"
+                    "  }\n"
+                    "  let mp = map_path(path);\n"
+                    "  let w = raw_fs.writefile(mp, content);\n"
+                    "  if (w == null) return { ok: false, error: 'write_failed' };\n"
+                    "  if (mode) raw_fs.chmod(mp, mode);\n"
+                    "  return { ok: true };\n"
+                    "}\n"
+                    "function release_lock() { cfg.lock_held = false; }\n"
+                    "function enter_emergency_freeze(reason) { push(cfg.freeze_calls, reason); return { freeze_persisted: true }; }\n"
+                    "function audit_append(actor, verb, target, status, detail) { push(cfg.audits, { actor, verb, target, status, detail }); return true; }\n"
+                    "function exec_argv_async(exe, argv, t, c, cb) {\n"
+                    "  if (index(exe, '/etc/init.d/') == 0) {\n"
+                    "    let svc = substr(exe, 12);\n"
+                    "    push(cfg.reloads, svc);\n"
+                    "    if (cfg.fail_reload_svc && svc == cfg.fail_reload_svc && !cfg.in_rollback) {\n"
+                    "      cfg.in_rollback = true;\n"
+                    "      cb({ ok: false, error: 'injected_reload_fail_' + svc });\n"
+                    "      return;\n"
+                    "    }\n"
+                    "    cb({ ok: true, output: '' });\n"
+                    "    return;\n"
+                    "  }\n"
+                    "  let cmd = [exe]; for (let a in (argv || [])) push(cmd, '' + a);\n"
+                    "  let tmp_out = RUN_DIR + '/exec_out_' + (++_seq);\n"
+                    "  let q = (s) => \"'\" + replace('' + s, /'/g, \"'\\\\''\") + \"'\";\n"
+                    "  let sh_cmd = join(' ', map(cmd, q)) + ' >' + q(tmp_out) + ' 2>&1';\n"
+                    "  let rc = system(['/bin/sh', '-c', sh_cmd]);\n"
+                    "  let out = raw_fs.readfile(tmp_out) || '';\n"
+                    "  if (raw_fs.stat(tmp_out)) raw_fs.unlink(tmp_out);\n"
+                    "  cb({ ok: rc == 0, exit_code: rc, output: out, overflow: false });\n"
+                    "}\n"
+                    + m_vba.group(1) + "\n"
+                    "export function run_restore(actor, params, reply_cb) {\n"
+                    "  if (cfg.lock_held) { reply_cb({ ok: false, status: 409, error_code: 'VALIDATION', message_ar: 'locked' }); return; }\n"
+                    "  cfg.lock_held = true;\n"
+                    "  let verb = 'sys_backup_restore';\n"
+                    + m_rst.group(1) + "\n"
+                    "};\n"
+                    "export { cfg, RUN_DIR, ROOT_MAP };\n"
+                )
         shutil.copy2(os.path.join(REPO_ROOT, "tests", script_name), os.path.join(p3a_dir, script_name))
 
         vec_dir = os.path.join(p3a_dir, "vec")
@@ -873,7 +957,7 @@ def main():
     prod_slice = build_helperd_prod_slice()
     print("=== Phase 3D: OpenWrt 24.10.0 (opkg) & 25.12.6 (apk) Chroot Suites & Lifecycle ===")
     for rootfs, ver in [(ROOTFS_2410, "24.10.0-opkg"), (ROOTFS_2512, "25.12.6-apk")]:
-        for sc in ("verify_phase3a_ucode.uc", "verify_phase3b_ucode.uc", "verify_phase3c_ucode.uc", "verify_phase4a_ucode.uc", "verify_phase4b_ucode.uc", "verify_phase4c_ucode.uc", "verify_phase4d_ucode.uc", "verify_phase4e_ucode.uc", "verify_phase4f_ucode.uc"):
+        for sc in ("verify_phase3a_ucode.uc", "verify_phase3b_ucode.uc", "verify_phase3c_ucode.uc", "verify_phase4a_ucode.uc", "verify_phase4b_ucode.uc", "verify_phase4c_ucode.uc", "verify_phase4d_ucode.uc", "verify_phase4e_ucode.uc", "verify_phase4f_ucode.uc", "verify_phase5b_ucode.uc"):
             run_ucode_suite_in_chroot(rootfs, ver, sc, prod_slice)
         test_in_chroot_lifecycle(rootfs, ver)
 

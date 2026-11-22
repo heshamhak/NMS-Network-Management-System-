@@ -116,6 +116,7 @@ function parse_pax_records(pax_data) {
 
 export function validate_tar_stream(tar_bytes) {
 	let entries = [];
+	let entry_meta = [];
 	let errors = [];
 	if (type(tar_bytes) != 'string' || length(tar_bytes) < 1024 || (length(tar_bytes) % 512) != 0) {
 		push(errors, 'أرشيف tar غير صالح أو مقطوع (الطول ليس من مضاعفات 512)');
@@ -283,6 +284,7 @@ export function validate_tar_stream(tar_bytes) {
 		}
 
 		push(entries, norm_path);
+		push(entry_meta, { path: norm_path, type: tflag });
 	}
 
 	if (length(keys(pax_next)) > 0 || gnu_longname != null || gnu_longlink != null) {
@@ -294,7 +296,7 @@ export function validate_tar_stream(tar_bytes) {
 	if (length(entries) == 0 && length(errors) == 0) {
 		push(errors, 'الأرشيف فارغ ولا يحتوي على ملفات صالحة');
 	}
-	return { valid: length(errors) == 0 && length(entries) > 0, entries: entries, errors: errors };
+	return { valid: length(errors) == 0 && length(entries) > 0, entries: entries, entry_meta: entry_meta, errors: errors };
 };
 
 export function is_safe_sysupgrade_path(p) {
@@ -367,4 +369,143 @@ export function atomic_write_checked(path, content, mode, uid, gid, ops) {
 		return fail_with('rename_failed');
 	}
 	return { ok: true, error: '', cleanup_failed: false, tmp_path: tmp };
+};
+
+export const RESTORE_WHITELIST = {
+	'etc/config/network':          '/etc/config/network',
+	'etc/config/wireless':         '/etc/config/wireless',
+	'etc/config/dhcp':             '/etc/config/dhcp',
+	'etc/config/firewall':         '/etc/config/firewall',
+	'etc/config/sqm':              '/etc/config/sqm',
+	'etc/noc-console/config.json': '/etc/noc-console/config.json',
+	'etc/noc-console/adguard.json':'/etc/noc-console/adguard.json'
+};
+
+export function validate_restore_archive_entries(entries) {
+	let errors = [];
+	if (type(entries) != 'array' || length(entries) == 0) {
+		return { ok: false, errors: ['الأرشيف فارغ ولا يحتوي على إدخالات'], files: [] };
+	}
+	let seen_files = {};
+	let files = [];
+	for (let ent in entries) {
+		let p = ent.path || '';
+		let t = ent.type || '0';
+		if (t == '5') continue; // directory entry is allowed
+		if (t == '1' || t == '2') {
+			push(errors, 'روابط غير مسموحة في أرشيف الاستعادة: ' + p);
+			continue;
+		}
+		if (t != '0' && t != '') {
+			push(errors, 'نوع ملف غير مدعوم في أرشيف الاستعادة: ' + p + ' (type=' + t + ')');
+			continue;
+		}
+		let norm = normalize_archive_rel_path(p);
+		if (norm == null || norm == '.') {
+			push(errors, 'مسار غير آمن في الأرشيف: ' + p);
+			continue;
+		}
+		if (!RESTORE_WHITELIST[norm]) {
+			push(errors, 'مسار خارج القائمة البيضاء للاستعادة: ' + norm);
+			continue;
+		}
+		if (seen_files[norm]) {
+			push(errors, 'إدخال مكرر أو متعارض في الأرشيف: ' + norm);
+			continue;
+		}
+		seen_files[norm] = true;
+		push(files, norm);
+	}
+	if (length(files) == 0 && length(errors) == 0) {
+		push(errors, 'الأرشيف لا يحتوي على أي ملفات ضمن القائمة البيضاء للاستعادة');
+	}
+	return { ok: length(errors) == 0, errors: errors, files: files };
+};
+
+function is_safe_uci_ident(s) {
+	return type(s) == 'string' && length(s) > 0 && length(s) <= 64 && match(s, /^[a-zA-Z0-9_]+$/);
+}
+
+function is_safe_uci_scalar(v) {
+	if (type(v) == 'string') {
+		return index(v, '\0') < 0 && index(v, '\n') < 0 && index(v, '\r') < 0;
+	}
+	return type(v) == 'int' || type(v) == 'double' || type(v) == 'bool';
+}
+
+function uci_quote(v) {
+	let s = type(v) == 'bool' ? (v ? '1' : '0') : ('' + v);
+	return "'" + replace(s, /'/g, "'\\''") + "'";
+}
+
+export function validate_and_render_uci_configs(configs_obj) {
+	let allowed_cfg = { 'network': true, 'wireless': true, 'dhcp': true, 'firewall': true, 'sqm': true };
+	let errors = [];
+	let rendered = {};
+	if (type(configs_obj) != 'object') {
+		return { ok: false, errors: ['configs يجب أن يكون كائن JSON صالحاً'], rendered: {} };
+	}
+	let klist = keys(configs_obj);
+	if (length(klist) == 0) {
+		return { ok: false, errors: ['كائن configs فارغ'], rendered: {} };
+	}
+	for (let k in klist) {
+		if (!allowed_cfg[k]) {
+			push(errors, 'حزمة إعدادات غير مصرح بها في الاستعادة: ' + k);
+			continue;
+		}
+		let cfg_obj = configs_obj[k];
+		if (type(cfg_obj) != 'object') {
+			push(errors, 'إعدادات ' + k + ' يجب أن تكون كائناً');
+			continue;
+		}
+		let uci_lines = [];
+		for (let sid in keys(cfg_obj)) {
+			let sec = cfg_obj[sid];
+			if (type(sec) != 'object') {
+				push(errors, 'القسم ' + k + '.' + sid + ' يجب أن يكون كائناً');
+				continue;
+			}
+			let stype = sec['.type'] != null ? sec['.type'] : sec['type'];
+			if (!is_safe_uci_ident(stype)) {
+				push(errors, 'نوع قسم UCI غير صالح في ' + k + '.' + sid);
+				continue;
+			}
+			let sname = sec['.name'] != null ? sec['.name'] : (sec['name'] != null ? sec['name'] : sid);
+			let is_anon = (sec['.anonymous'] === true) || (type(sname) == 'string' && substr(sname, 0, 1) == '@');
+			if (is_anon) {
+				push(uci_lines, 'config ' + stype);
+			} else {
+				if (!is_safe_uci_ident(sname)) {
+					push(errors, 'اسم قسم UCI غير صالح في ' + k + '.' + sid);
+					continue;
+				}
+				push(uci_lines, 'config ' + stype + ' ' + uci_quote(sname));
+			}
+			for (let opt in keys(sec)) {
+				if (substr(opt, 0, 1) == '.' || opt == 'type' || opt == 'name') continue;
+				if (!is_safe_uci_ident(opt)) {
+					push(errors, 'اسم خيار UCI غير صالح: ' + k + '.' + sid + '.' + opt);
+					continue;
+				}
+				let v = sec[opt];
+				if (type(v) == 'array') {
+					for (let item in v) {
+						if (!is_safe_uci_scalar(item)) {
+							push(errors, 'قيمة قائمة UCI غير صالحة في ' + k + '.' + sid + '.' + opt);
+							continue;
+						}
+						push(uci_lines, '\tlist ' + opt + ' ' + uci_quote(item));
+					}
+				} else if (is_safe_uci_scalar(v)) {
+					push(uci_lines, '\toption ' + opt + ' ' + uci_quote(v));
+				} else {
+					push(errors, 'نوع قيمة UCI غير مدعوم في ' + k + '.' + sid + '.' + opt);
+				}
+			}
+			push(uci_lines, '');
+		}
+		rendered[k] = join('\n', uci_lines);
+	}
+	return { ok: length(errors) == 0, errors: errors, rendered: rendered };
 };
