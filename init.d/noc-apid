@@ -151,7 +151,36 @@ child_owns_socket_inode() {
 	return 1
 }
 
+get_pid_stime() {
+	sed 's/^.*)[[:space:]]*//' "/proc/\$1/stat" 2>/dev/null | awk '{print \$20}' || true
+}
+
+get_uptime_ds() {
+	awk '{ printf "%d\n", int(\$1 * 10) }' /proc/uptime 2>/dev/null || echo 0
+}
+
+write_verified_marker() {
+	_now_ds="\$(get_uptime_ds)"
+	cat > "\${MARKER}.tmp.\$\$" <<MKEOF
+verified=1
+engine=\${ENGINE}
+pid=\${_child}
+starttime=\${_matched_stime}
+sup_pid=\$\$
+sup_starttime=\${_sup_stime}
+verified_ds=\${_now_ds}
+inode=\${_matched_inode}
+lan_ip=\${LAN_IP}
+https_port=\${HTTPS_P}
+fingerprint=\${FP_VAL}
+MKEOF
+	chown 0:0 "\${MARKER}.tmp.\$\$" 2>/dev/null || true
+	chmod 0644 "\${MARKER}.tmp.\$\$"
+	mv -f "\${MARKER}.tmp.\$\$" "\$MARKER"
+}
+
 rm -f "\$MARKER" "\${MARKER}.tmp."* 2>/dev/null || true
+_sup_stime="\$(get_pid_stime "\$\$")"
 "\$@" &
 _child=\$!
 
@@ -168,7 +197,7 @@ while [ "\$_i" -lt 50 ]; do
 	for _ino in \$_inodes; do
 		if [ -n "\$_ino" ] && [ "\$_ino" != "0" ] && child_owns_socket_inode "\$_child" "\$_ino"; then
 			_matched_inode="\$_ino"
-			_matched_stime="\$(sed 's/^.*)[[:space:]]*//' "/proc/\${_child}/stat" 2>/dev/null | awk '{print \$20}' || true)"
+			_matched_stime="\$(get_pid_stime "\$_child")"
 			_ready=1
 			break
 		fi
@@ -178,23 +207,11 @@ while [ "\$_i" -lt 50 ]; do
 	_i=\$((_i + 1))
 done
 
-if [ "\$_ready" -ne 1 ] || [ -z "\$_matched_inode" ] || [ -z "\$_matched_stime" ]; then
+if [ "\$_ready" -ne 1 ] || [ -z "\$_matched_inode" ] || [ -z "\$_matched_stime" ] || [ -z "\$_sup_stime" ]; then
 	exit 1
 fi
 
-cat > "\${MARKER}.tmp.\$\$" <<MKEOF
-verified=1
-engine=\${ENGINE}
-pid=\${_child}
-starttime=\${_matched_stime}
-inode=\${_matched_inode}
-lan_ip=\${LAN_IP}
-https_port=\${HTTPS_P}
-fingerprint=\${FP_VAL}
-MKEOF
-chown 0:0 "\${MARKER}.tmp.\$\$" 2>/dev/null || true
-chmod 0644 "\${MARKER}.tmp.\$\$"
-mv -f "\${MARKER}.tmp.\$\$" "\$MARKER"
+write_verified_marker
 
 while kill -0 "\$_child" 2>/dev/null; do
 	if ! child_owns_socket_inode "\$_child" "\$_matched_inode"; then
@@ -202,7 +219,8 @@ while kill -0 "\$_child" 2>/dev/null; do
 		kill -TERM "\$_child" 2>/dev/null || true
 		break
 	fi
-	sleep 1
+	write_verified_marker
+	sleep 0.5
 done
 wait "\$_child" 2>/dev/null || true
 _rc=\$?

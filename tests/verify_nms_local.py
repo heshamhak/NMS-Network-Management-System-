@@ -1891,6 +1891,84 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
                 ok("SEC-01-TLS-LIFECYCLE[stunnel_restart_restores_tls_active_without_private_key]")
             else:
                 fail(f"SEC-01-TLS-LIFECYCLE[stunnel_restart_restores_tls_active_without_private_key]: pid1={child_pid1} pid2={child_pid2} rc={r_recover.returncode}")
+
+            # Test 8: SIGKILL supervisor (run_tls_proxy.sh) so cleanup trap cannot run and marker remains on disk,
+            # while recorded TLS child stays alive but loses ownership of socket:[inode] (held open by a forked keeper process),
+            # tested under EACCES on /proc/<pid>/fd (NOC_TEST_FORCE_FD_EACCES=1).
+            sup_proc.terminate()
+            sup_proc.wait(timeout=5)
+            sup_proc = None
+            handoff_py = os.path.join(st_td, "handoff_tls_child.py")
+            handoff_drop_flag = os.path.join(st_td, "drop_fd.flag")
+            if os.path.exists(handoff_drop_flag):
+                os.unlink(handoff_drop_flag)
+            open(handoff_py, "w", encoding="utf-8").write(
+                "import os, socket, subprocess, sys, time\n"
+                "port = int(sys.argv[1])\n"
+                "flag_p = sys.argv[2]\n"
+                "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                "s.bind(('127.0.0.1', port))\n"
+                "s.listen(8)\n"
+                "os.set_inheritable(s.fileno(), True)\n"
+                "keeper = subprocess.Popen([sys.executable, '-c', 'import time\\nwhile True: time.sleep(0.5)\\n'], close_fds=False)\n"
+                "try:\n"
+                "    while True:\n"
+                "        if os.path.exists(flag_p) and s is not None:\n"
+                "            s.close()\n"
+                "            s = None\n"
+                "        time.sleep(0.05)\n"
+                "finally:\n"
+                "    keeper.terminate()\n"
+            )
+            sup_proc = subprocess.Popen([st_runner, sys.executable, handoff_py, str(https_live_p), handoff_drop_flag], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(40):
+                if os.path.isfile(st_marker):
+                    break
+                time.sleep(0.05)
+            assert os.path.isfile(st_marker), "run_tls_proxy.sh did not create marker for handoff test"
+            m_hpid = re.search(r"^pid=([0-9]+)$", open(st_marker).read(), re.M)
+            handoff_child_pid = int(m_hpid.group(1))
+            shutil.copy2(st_marker, os.path.join(mk_ok_dir, "tls.verified"))
+            os.chmod(os.path.join(mk_ok_dir, "tls.verified"), 0o644)
+
+            # Kill the supervisor with SIGKILL so its trap cannot remove the marker!
+            os.kill(sup_proc.pid, 9)
+            sup_proc.wait(timeout=5)
+            sup_proc = None
+            # Instruct handoff_child_pid to close its socket fd while staying alive (keeper keeps socket:[inode] listening in /proc/net/tcp!)
+            open(handoff_drop_flag, "w").write("1\n")
+            time.sleep(0.15)
+            assert os.path.exists(f"/proc/{handoff_child_pid}"), "handoff child should still be alive"
+
+            uc_sigkill_sup = (
+                uc_driver.split("// Test 1:")[0]
+                + f"let HP = '{https_live_p}';\n"
+                "let inst_eacces_stale = eval_instance({\n"
+                "  NOC_BIND_HOST: '127.0.0.1', NOC_HTTP_PORT: '8780', NOC_HTTPS_PORT: HP,\n"
+                "  NOC_LAN_IP: '192.168.1.1', NOC_TLS_VERIFIED: '1', NOC_TEST_FORCE_FD_EACCES: '1',\n"
+                "  NOC_TLS_MARKER: '/tmp/tls_active_test/marker_ok/tls.verified',\n"
+                "  NOC_TLS_CERT: '/etc/noc-console-noaccess/tls.crt', NOC_TLS_KEY: '/etc/noc-console-noaccess/tls.key'\n"
+                "});\n"
+                "let st_k = inst_eacces_stale.dispatch('auth_status', 'GET', {}, {});\n"
+                "let lg_k_https = inst_eacces_stale.dispatch('auth_login', 'POST', { origin: 'https://192.168.1.1:' + HP }, { username: 'admin', password: 'pw' });\n"
+                "let lg_k_http = inst_eacces_stale.dispatch('auth_login', 'POST', { origin: 'http://192.168.1.1:8780' }, { username: 'admin', password: 'pw' });\n"
+                "let ck_k = lg_k_http.hdrs['Set-Cookie'] || '';\n"
+                "if (inst_eacces_stale.is_tls_active() || st_k.data.tls_active !== false || lg_k_https.status != 403 || index(ck_k, 'Secure') >= 0) exit(31);\n"
+                "print('PASS_SIGKILL_SUP_EACCES_CLOSED\\n');\n"
+            )
+            open(os.path.join(uc_stage, "run_sigkill_sup.uc"), "w", encoding="utf-8").write(uc_sigkill_sup)
+            r_sk = subprocess.run(
+                ["unshare", "-rm", "sh", "-c", f"mount --rbind /proc {rfs_25}/proc && exec /usr/sbin/chroot {rfs_25} /usr/bin/ucode /tmp/tls_active_test/run_sigkill_sup.uc"],
+                capture_output=True, text=True, timeout=15,
+            )
+            # Clean up handoff_child_pid and its keeper child
+            subprocess.run(["pkill", "-9", "-P", str(handoff_child_pid)], capture_output=True)
+            kill_pid(handoff_child_pid)
+            if r_sk.returncode == 0 and "PASS_SIGKILL_SUP_EACCES_CLOSED" in r_sk.stdout:
+                ok("SEC-01-TLS-LIFECYCLE[sigkill_supervisor_and_child_loses_inode_under_eacces_deactivates_tls]")
+            else:
+                fail(f"SEC-01-TLS-LIFECYCLE[sigkill_supervisor_and_child_loses_inode_under_eacces_deactivates_tls]: rc={r_sk.returncode} out={r_sk.stdout} err={r_sk.stderr}")
         finally:
             if sup_proc is not None and sup_proc.poll() is None:
                 sup_proc.terminate()

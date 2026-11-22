@@ -55,10 +55,17 @@ function get_pid_starttime(pid_str) {
 	return (length(cols) >= 20) ? cols[19] : '';
 }
 
+function get_uptime_ds() {
+	let raw = fs.readfile('/proc/uptime');
+	if (!raw) return -1;
+	let f = +(split(trim(raw), /[[:space:]]+/)[0] || -1);
+	return (f >= 0) ? int(f * 10) : -1;
+}
+
 function pid_owns_socket_inode(pid_str, expected_inode, mtxt) {
 	if (!pid_str || !expected_inode) return false;
 	let fd_dir = '/proc/' + pid_str + '/fd';
-	let entries = fs.lsdir(fd_dir);
+	let entries = (getenv('NOC_TEST_FORCE_FD_EACCES') == '1') ? null : fs.lsdir(fd_dir);
 	let target = 'socket:[' + expected_inode + ']';
 	let readable_links = 0;
 	if (type(entries) == 'array') {
@@ -71,10 +78,20 @@ function pid_owns_socket_inode(pid_str, expected_inode, mtxt) {
 		}
 		if (readable_links > 0) return false;
 	}
+	// When kernel blocks direct readlink on root's /proc/<pid>/fd (EACCES from noc-api),
+	// never accept child starttime alone: require an active, non-zombie root supervisor
+	// with matching starttime AND a fresh (<2.5s) monotonic ownership lease from child_owns_socket_inode.
 	let sm = match(mtxt || '', /(^|\n)starttime=([0-9]+)(\n|$)/);
-	if (!sm) return false;
-	let cur_st = get_pid_starttime(pid_str);
-	return (cur_st != '' && cur_st == sm[2]);
+	let spm = match(mtxt || '', /(^|\n)sup_pid=([0-9]+)(\n|$)/);
+	let ssm = match(mtxt || '', /(^|\n)sup_starttime=([0-9]+)(\n|$)/);
+	let vdm = match(mtxt || '', /(^|\n)verified_ds=([0-9]+)(\n|$)/);
+	if (!sm || !spm || !ssm || !vdm) return false;
+	if (get_pid_starttime(pid_str) != sm[2]) return false;
+	if (!is_pid_alive_non_zombie(spm[2]) || get_pid_starttime(spm[2]) != ssm[2]) return false;
+	let now_ds = get_uptime_ds();
+	let ver_ds = +vdm[2];
+	if (now_ds < 0 || ver_ds <= 0 || (now_ds - ver_ds) > 25 || (ver_ds - now_ds) > 5) return false;
+	return true;
 }
 
 // SEC-01: Never enable TLS_ACTIVE / Secure cookies from a flag alone; require loopback bind + live verified TLS terminator process owning active listener inode + root marker
