@@ -39,6 +39,7 @@ let reconciler_gaps = [];
 let reconciler_tick_count = 0;
 let last_effective_rules_sig = '';
 let cached_usage_by_mac = {};
+let topology_inflight_cbs = null;
 
 function now_hhmm_local() {
 	let lt = localtime();
@@ -548,22 +549,31 @@ function release_lock() {
 	if (fs.stat(lp)) fs.unlink(lp);
 }
 
-// --- Non-shell async command capture with byte cap, timeout & process-tree termination ---
-function kill_pid_tree(tpid) {
-	if (!tpid || tpid <= 0) return [];
-	let killed = [];
-	let ch_raw = fs.readfile('/proc/' + tpid + '/task/' + tpid + '/children');
-	if (ch_raw) {
-		for (let p in filter(split(trim(ch_raw), ' '), (x) => match(x, /^[0-9]+$/))) {
-			push(killed, +p);
-			system(['/bin/kill', '-TERM', p]);
-			system(['/bin/kill', '-9', p]);
+// --- Non-shell async command capture with byte cap, timeout & recursive process-tree termination ---
+function collect_descendant_pids(root_pid, out_list, seen) {
+	if (!root_pid || root_pid <= 0) return;
+	let sp = '' + root_pid;
+	if (seen[sp]) return;
+	seen[sp] = true;
+	let tids = fs.lsdir('/proc/' + sp + '/task') || [];
+	for (let tid in tids) {
+		if (tid == '.' || tid == '..') continue;
+		let ch_raw = fs.readfile('/proc/' + sp + '/task/' + tid + '/children');
+		if (!ch_raw) continue;
+		for (let cp in filter(split(trim(ch_raw), ' '), (x) => match(x, /^[0-9]+$/))) {
+			collect_descendant_pids(+cp, out_list, seen);
 		}
 	}
-	push(killed, tpid);
-	system(['/bin/kill', '-TERM', '' + tpid]);
-	system(['/bin/kill', '-9', '' + tpid]);
-	return killed;
+	push(out_list, root_pid);
+}
+
+function kill_pid_tree(tpid) {
+	if (!tpid || tpid <= 0) return [];
+	let pids = [];
+	collect_descendant_pids(tpid, pids, {});
+	for (let p in pids) system(['/bin/kill', '-TERM', '' + p]);
+	for (let p in pids) system(['/bin/kill', '-9', '' + p]);
+	return pids;
 }
 
 function exec_argv_async(abs_exe, argv, timeout_ms, max_bytes, cb) {
@@ -602,8 +612,10 @@ function exec_argv_async(abs_exe, argv, timeout_ms, max_bytes, cb) {
 		}
 		pp[0].close();
 		let wfd = pp[1].fileno();
-		if (wfd != 1) fs.dup2(wfd, 1);
-		if (wfd != 2) fs.dup2(wfd, 2);
+		if (fs.dup2) {
+			if (wfd != 1) fs.dup2(wfd, 1);
+			if (wfd != 2) fs.dup2(wfd, 2);
+		}
 		if (wfd > 2) pp[1].close();
 		let full_argv = [abs_exe];
 		for (let a in (argv || [])) push(full_argv, '' + a);
@@ -2123,8 +2135,6 @@ function handle_rpc(req, reply_cb) {
 		});
 		return;
 	}
-
-let topology_inflight_cbs = null;
 
 	if (verb == 'topology_read') {
 		if (topology_inflight_cbs != null) {

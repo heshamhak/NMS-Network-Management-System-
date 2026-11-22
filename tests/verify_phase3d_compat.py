@@ -336,9 +336,9 @@ def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_s
         with open(os.path.join(p3a_dir, "helperd_aw_prod.uc"), "w", encoding="utf-8") as f:
             f.write(helperd_prod_src)
         h_raw = open(os.path.join(REPO_ROOT, "backend", "noc-helperd"), "r", encoding="utf-8").read()
-        m_exec = re.search(r"(function kill_pid_tree\(.*?\n\}\n\nfunction exec_argv_async\(.*?\n\})", h_raw, re.S)
+        m_exec = re.search(r"(function collect_descendant_pids\(.*?\n\}\n\nfunction kill_pid_tree\(.*?\n\}\n\nfunction exec_argv_async\(.*?\n\})", h_raw, re.S)
         if not m_exec:
-            raise RuntimeError("Failed to extract kill_pid_tree/exec_argv_async from backend/noc-helperd")
+            raise RuntimeError("Failed to extract collect_descendant_pids/kill_pid_tree/exec_argv_async from backend/noc-helperd")
         with open(os.path.join(p3a_dir, "helperd_exec_prod.uc"), "w", encoding="utf-8") as f:
             f.write("import * as fs from 'fs';\nimport * as uloop from 'uloop';\nconst CAP_GENERAL = 65536;\n" + m_exec.group(1) + "\nexport { exec_argv_async };\n")
         shutil.copy2(os.path.join(REPO_ROOT, "tests", script_name), os.path.join(p3a_dir, script_name))

@@ -1243,131 +1243,118 @@ if r_dom.returncode == 0 and "DOM_TOPO_PASS" in r_dom.stdout:
 else:
     fail(f"P4F-DOM: failed rc={r_dom.returncode}: {r_dom.stderr} {r_dom.stdout}")
 
-# 7b. Real API/RBAC/Cache/IPC integration test via noc-apid topology handler + UNIX helper socket in OpenWrt chroot
-if os.path.isdir("/tmp/openwrt-x86-64-rootfs") and os.path.isfile("/tmp/openwrt-x86-64-rootfs/usr/bin/ucode"):
-    apid_src = open(os.path.join(ROOT, "backend/noc-apid"), "r", encoding="utf-8").read()
-    # Extract action == 'topology' block and verify RBAC + per-role cache isolation + IPC + stale fallback in real ucode
-    p4f_api_uc = r"""
-import * as digest from 'digest';
-import * as nms_discovery from '/tmp/p3a_test/nms_discovery.uc';
-import * as nms_access_dhcp from '/tmp/p3a_test/nms_access_dhcp.uc';
-import * as nms_topology from '/tmp/p3a_test/nms_topology.uc';
-
-let BOOT_ID = 'boot-test-4f';
-let cache_map = {};
-let last_valid_topology = null;
-let prev_client_rates = {};
-let helper_calls = 0;
-let helper_fail_mode = false;
-function now_mono_ms() { return 50000; }
-
-function call_helper(verb, params, user, rip, cb) {
-	helper_calls++;
-	if (helper_fail_mode) { cb(null); return; }
-	if (verb == 'clients_read') {
-		cb({
-			ok: true, flow_offloading: false, discovery_status: { nlbw: true },
-			leases_raw: '1700000000 aa:bb:cc:dd:ee:01 192.168.1.20 phone *\n',
-			neigh4: '192.168.1.20 dev br-lan lladdr aa:bb:cc:dd:ee:01 REACHABLE\n',
-			neigh6: '', fdb_raw: '', bridges: [{ name: 'br-lan', ports: ['eth1'] }],
-			local_macs: {}, wifi_stations: { 'aa:bb:cc:dd:ee:01': { ifname: 'wlan1', signal: -50 } },
-			rules: { blocked_macs: {}, blocked_ips: {}, nicknames: {}, rate_limits: {} },
-			static_leases: {}, nlbw_by_mac: {}, nlbw_by_ip: {}
-		});
-	} else if (verb == 'topology_read') {
-		cb({
-			ok: true,
-			ip_link_raw: sprintf('%J', [
-				{ ifname: 'pppoe-wan', operstate: 'UP', flags: ['UP'], address: '' },
-				{ ifname: 'wlan1', operstate: 'UP', flags: ['UP'], address: '60:be:b4:1e:d3:5e', master: 'br-lan' }
-			]),
-			ip_addr_raw: '[]', ip_route_raw: '[]', bridge_vlan_raw: '[]', fdb_raw: '',
-			carrier_map: { 'pppoe-wan': true, 'wlan1': true },
-			bridges: [{ name: 'br-lan', ports: ['wlan1'] }],
-			uci_wireless: [{ ifname: 'wlan1', device: 'radio0', ssid: 'HomeAP', mode: 'ap', disabled: false }],
-			runtime_ap_ifs: { wlan1: { up: true, radio: 'radio0', mode: 'ap', ssid: 'HomeAP' } },
-			wifi_stations: { 'aa:bb:cc:dd:ee:01': { ifname: 'wlan1', signal: -50 } },
-			wan_topology: { wan_ifaces: { 'pppoe-wan': true }, lan_ifaces: { 'br-lan': true } },
-			collector_status: { ubus_network: true, wireless: true }
-		});
-	}
-}
-
-function handle_topo_req(sess) {
-	let rbac = nms_access_dhcp.check_rbac_access(sess, 'topology', 'GET');
-	if (!rbac.ok) return { status: rbac.status, data: {} };
-	let cache_k = 'topology_' + sess.role;
-	let now_m = now_mono_ms();
-	let c = cache_map[cache_k];
-	if (c && (now_m - c.ts) < 3500) return { status: 200, data: c.data };
-	let out = null;
-	call_helper('clients_read', {}, sess.username, '127.0.0.1', function(cres) {
-		let cl_list = [];
-		let cl_ok = !!(cres && cres.ok);
-		if (cl_ok) cl_list = nms_discovery.merge_discovered_clients(cres);
-		call_helper('topology_read', {}, sess.username, '127.0.0.1', function(tres) {
-			let cstat = (tres && tres.collector_status) ? tres.collector_status : {};
-			cstat.clients = cl_ok;
-			let built = nms_topology.build_live_topology({
-				sampled_ms: now_mono_ms(),
-				ip_link_raw: tres ? tres.ip_link_raw : null,
-				ip_addr_raw: tres ? tres.ip_addr_raw : null,
-				ip_route_raw: tres ? tres.ip_route_raw : null,
-				bridge_vlan_raw: tres ? tres.bridge_vlan_raw : null,
-				fdb_raw: tres ? tres.fdb_raw : '',
-				carrier_map: tres ? tres.carrier_map : null,
-				bridges: tres ? tres.bridges : [],
-				uci_wireless: tres ? tres.uci_wireless : [],
-				runtime_ap_ifs: tres ? tres.runtime_ap_ifs : {},
-				wifi_stations: tres ? tres.wifi_stations : {},
-				wan_topology: tres ? tres.wan_topology : {},
-				clients: cl_list,
-				collector_status: cstat
-			});
-			let selected = nms_topology.select_topology_snapshot(built, last_valid_topology, now_mono_ms(), 120000);
-			if (selected.completeness != 'unavailable' && !selected.stale) last_valid_topology = selected;
-			let shaped = nms_topology.redact_topology_for_role(selected, sess.role, BOOT_ID, digest.sha256);
-			cache_map[cache_k] = { ts: now_mono_ms(), data: shaped };
-			out = { status: shaped.ok ? 200 : 503, data: shaped };
-		});
-	});
-	return out;
-}
-
-// 1. Unauthenticated -> 401
-let r_unauth = handle_topo_req(null);
-if (r_unauth.status != 401) exit(1);
-// 2. Readonly -> redacted MAC/IP, cached under topology_readonly
-let r_ro = handle_topo_req({ username: 'viewer', role: 'readonly' });
-if (r_ro.status != 200 || r_ro.data.clients[0].mac != 'HIDDEN') exit(2);
-// 3. Admin immediately after readonly -> MUST NOT receive readonly cache!
-let r_ad = handle_topo_req({ username: 'admin', role: 'admin' });
-if (r_ad.status != 200 || r_ad.data.clients[0].mac != 'aa:bb:cc:dd:ee:01') exit(3);
-// 4. Failed refresh after cache clear -> preserves last_valid_topology as stale
-cache_map = {};
-helper_fail_mode = true;
-let r_fail = handle_topo_req({ username: 'admin', role: 'admin' });
-if (r_fail.status != 200 || !r_fail.data.stale || !r_fail.data.refresh_failed || r_fail.data.clients[0].mac != 'aa:bb:cc:dd:ee:01') exit(4);
-print('API_TOPO_PASS\n');
-"""
-    stage_4f = tempfile.mkdtemp(prefix="p4f_api_")
-    try:
-        for fn in ("nms_discovery.uc", "nms_access_dhcp.uc", "nms_topology.uc"):
-            shutil.copy2(os.path.join(ROOT, "backend", fn), os.path.join(stage_4f, fn))
-        with open(os.path.join(stage_4f, "api_test.uc"), "w", encoding="utf-8") as f:
-            f.write(p4f_api_uc)
-        dst_stage = "/tmp/openwrt-x86-64-rootfs/tmp/p3a_test"
-        if os.path.exists(dst_stage):
-            shutil.rmtree(dst_stage, ignore_errors=True)
-        shutil.copytree(stage_4f, dst_stage)
-        r_api = subprocess.run(["unshare", "-r", "/usr/sbin/chroot", "/tmp/openwrt-x86-64-rootfs", "/usr/bin/ucode", "/tmp/p3a_test/api_test.uc"], capture_output=True, text=True)
-        shutil.rmtree(dst_stage, ignore_errors=True)
-        if r_api.returncode == 0 and "API_TOPO_PASS" in r_api.stdout:
-            ok("P4F-API: topology RBAC, per-role cache isolation, redaction & stale fallback verified")
-        else:
-            fail(f"P4F-API: failed rc={r_api.returncode}: {r_api.stderr} {r_api.stdout}")
-    finally:
-        shutil.rmtree(stage_4f, ignore_errors=True)
+# 7b. Real production noc-apid action=='topology' + noc-helperd global single-flight integration test on BOTH OpenWrt 24.10.0 & 25.12.6
+apid_src = open(os.path.join(ROOT, "backend/noc-apid"), "r", encoding="utf-8").read()
+helperd_src = open(os.path.join(ROOT, "backend/noc-helperd"), "r", encoding="utf-8").read()
+m_topo_handler = re.search(r"(\tif \(action == 'topology'\) \{.*?\n\t\treturn;\n\t\})", apid_src, re.S)
+m_rbac_block = re.search(r"(let rbac = nms_access_dhcp\.check_rbac_access\(sess, action, method\);.*?\n\t\})", apid_src, re.S)
+m_sf_global = re.search(r"^let topology_inflight_cbs = null;", helperd_src, re.M)
+if not m_topo_handler or not m_rbac_block or not m_sf_global:
+    fail("P4F-API: failed to extract production topology handler / RBAC / global topology_inflight_cbs")
+else:
+    p4f_api_uc = (
+        "import * as digest from 'digest';\n"
+        "import * as nms_discovery from '/tmp/p3a_test/nms_discovery.uc';\n"
+        "import * as nms_access_dhcp from '/tmp/p3a_test/nms_access_dhcp.uc';\n"
+        "import * as nms_topology from '/tmp/p3a_test/nms_topology.uc';\n"
+        "let BOOT_ID = 'boot-test-4f';\n"
+        "let cache_map = {};\n"
+        "let last_valid_topology = null;\n"
+        "let prev_client_rates = {};\n"
+        "let helper_fail_mode = false;\n"
+        "let topology_inflight_cbs = null;\n"
+        "let topo_collector_runs = 0;\n"
+        "function now_mono_ms() { return 50000; }\n"
+        "function send_json_env(cli, status, res_name, data, errs) { cli.status = status; cli.data = data; }\n"
+        "function call_helper(verb, params, user, rip, cb) {\n"
+        "  if (helper_fail_mode) { cb(null); return; }\n"
+        "  if (verb == 'clients_read') {\n"
+        "    cb({\n"
+        "      ok: true, flow_offloading: false, discovery_status: { nlbw: true },\n"
+        "      leases_raw: '1700000000 aa:bb:cc:dd:ee:01 192.168.1.20 phone *\\n',\n"
+        "      neigh4: '192.168.1.20 dev br-lan lladdr aa:bb:cc:dd:ee:01 REACHABLE\\n',\n"
+        "      neigh6: '', fdb_raw: '', bridges: [{ name: 'br-lan', ports: ['eth1'] }],\n"
+        "      local_macs: {}, wifi_stations: { 'aa:bb:cc:dd:ee:01': { ifname: 'wlan1', signal: -50 } },\n"
+        "      rules: { blocked_macs: {}, blocked_ips: {}, nicknames: {}, rate_limits: {} },\n"
+        "      static_leases: {}, nlbw_by_mac: {}, nlbw_by_ip: {}\n"
+        "    });\n"
+        "  } else if (verb == 'topology_read') {\n"
+        "    if (topology_inflight_cbs != null) { push(topology_inflight_cbs, cb); return; }\n"
+        "    topology_inflight_cbs = [cb];\n"
+        "    topo_collector_runs++;\n"
+        "    let payload = {\n"
+        "      ok: true,\n"
+        "      ip_link_raw: sprintf('%J', [\n"
+        "        { ifname: 'pppoe-wan', operstate: 'UP', flags: ['UP'], address: '' },\n"
+        "        { ifname: 'wlan1', operstate: 'UP', flags: ['UP'], address: '60:be:b4:1e:d3:5e', master: 'br-lan' }\n"
+        "      ]),\n"
+        "      ip_addr_raw: '[]', ip_route_raw: '[]', bridge_vlan_raw: '[]', fdb_raw: '',\n"
+        "      carrier_map: { 'pppoe-wan': true, 'wlan1': true },\n"
+        "      bridges: [{ name: 'br-lan', ports: ['wlan1'] }],\n"
+        "      uci_wireless: [{ ifname: 'wlan1', device: 'radio0', ssid: 'HomeAP', mode: 'ap', disabled: false }],\n"
+        "      runtime_ap_ifs: { wlan1: { up: true, radio: 'radio0', mode: 'ap', ssid: 'HomeAP' } },\n"
+        "      wifi_stations: { 'aa:bb:cc:dd:ee:01': { ifname: 'wlan1', signal: -50 } },\n"
+        "      wan_topology: { wan_ifaces: { 'pppoe-wan': true }, lan_ifaces: { 'br-lan': true } },\n"
+        "      collector_status: { ubus_network: true, wireless: true }\n"
+        "    };\n"
+        "    if (params && params.defer) return;\n"
+        "    let cbs = topology_inflight_cbs; topology_inflight_cbs = null;\n"
+        "    for (let fcb in cbs) fcb(payload);\n"
+        "  }\n"
+        "}\n"
+        "function prod_dispatch(sess, action, method, remote_ip) {\n"
+        "  let cli = { status: 0, data: null };\n"
+        "  let req_id = 'req-1';\n"
+        "  (function() {\n"
+        + m_rbac_block.group(1) + "\n"
+        + m_topo_handler.group(1) + "\n"
+        "  })();\n"
+        "  return cli;\n"
+        "}\n"
+        "// 1. Unauthenticated -> 401\n"
+        "let r1 = prod_dispatch(null, 'topology', 'GET', '127.0.0.1');\n"
+        "if (r1.status != 401) exit(1);\n"
+        "// 2. Readonly -> redacted MAC/IP, cached under topology_readonly\n"
+        "let r2 = prod_dispatch({ username: 'viewer', role: 'readonly' }, 'topology', 'GET', '127.0.0.1');\n"
+        "if (r2.status != 200 || r2.data.clients[0].mac != 'HIDDEN') exit(2);\n"
+        "// 3. Admin immediately after readonly -> MUST NOT receive readonly cache!\n"
+        "let r3 = prod_dispatch({ username: 'admin', role: 'admin' }, 'topology', 'GET', '127.0.0.1');\n"
+        "if (r3.status != 200 || r3.data.clients[0].mac != 'aa:bb:cc:dd:ee:01') exit(3);\n"
+        "// 4. Failed refresh after cache clear -> preserves last_valid_topology as stale\n"
+        "cache_map = {};\n"
+        "helper_fail_mode = true;\n"
+        "let r4 = prod_dispatch({ username: 'admin', role: 'admin' }, 'topology', 'GET', '127.0.0.1');\n"
+        "if (r4.status != 200 || !r4.data.stale || !r4.data.refresh_failed || r4.data.clients[0].mac != 'aa:bb:cc:dd:ee:01') exit(4);\n"
+        "// 5. Global single-flight topology_read coalesces concurrent callers into 1 collector run\n"
+        "helper_fail_mode = false; topo_collector_runs = 0; topology_inflight_cbs = null;\n"
+        "let sf_res = [];\n"
+        "call_helper('topology_read', { defer: true }, 'a', '127.0.0.1', (x) => push(sf_res, x));\n"
+        "call_helper('topology_read', { defer: true }, 'b', '127.0.0.1', (x) => push(sf_res, x));\n"
+        "let cbs_sf = topology_inflight_cbs; topology_inflight_cbs = null;\n"
+        "for (let fcb in cbs_sf) fcb({ ok: true });\n"
+        "if (topo_collector_runs != 1 || length(sf_res) != 2) exit(5);\n"
+        "print('API_TOPO_PASS\\n');\n"
+    )
+    for ver_label, rfs in (("24.10.0-opkg", "/tmp/openwrt-24.10-x86-64-rootfs"), ("25.12.6-apk", "/tmp/openwrt-x86-64-rootfs")):
+        if os.path.isdir(rfs) and os.path.isfile(os.path.join(rfs, "usr/bin/ucode")):
+            stage_4f = tempfile.mkdtemp(prefix="p4f_api_")
+            try:
+                for fn in ("nms_discovery.uc", "nms_access_dhcp.uc", "nms_topology.uc"):
+                    shutil.copy2(os.path.join(ROOT, "backend", fn), os.path.join(stage_4f, fn))
+                with open(os.path.join(stage_4f, "api_test.uc"), "w", encoding="utf-8") as f:
+                    f.write(p4f_api_uc)
+                dst_stage = os.path.join(rfs, "tmp", "p3a_test")
+                if os.path.exists(dst_stage):
+                    shutil.rmtree(dst_stage, ignore_errors=True)
+                shutil.copytree(stage_4f, dst_stage)
+                r_api = subprocess.run(["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/ucode", "/tmp/p3a_test/api_test.uc"], capture_output=True, text=True)
+                shutil.rmtree(dst_stage, ignore_errors=True)
+                if r_api.returncode == 0 and "API_TOPO_PASS" in r_api.stdout:
+                    ok(f"P4F-API[{ver_label}]: production noc-apid topology RBAC, cache isolation, stale fallback & global single-flight verified")
+                else:
+                    fail(f"P4F-API[{ver_label}]: failed rc={r_api.returncode}: {r_api.stderr} {r_api.stdout}")
+            finally:
+                shutil.rmtree(stage_4f, ignore_errors=True)
 
 print(f"\n=== SUMMARY: {len(passes)} passed, {len(failures)} failed ===")
 sys.exit(1 if failures else 0)

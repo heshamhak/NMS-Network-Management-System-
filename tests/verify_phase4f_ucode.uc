@@ -194,14 +194,14 @@ s_wandown.ip_link_raw = sprintf('%J', [{ ifname: 'pppoe-wan', operstate: 'DOWN',
 let t_wd = nms_topo.build_live_topology(s_wandown);
 check(t_wd.wan_links[0].admin_up === true && t_wd.wan_links[0].observed_up === false && t_wd.wan_links[0].connectivity_state == 'down', 'P4F-WAN[admin_up_operstate_down_not_connected]');
 
-// 19. P1-3: exec_argv_async terminates timed-out child process, executes callback once, leaves no background process
+// 19. P1-3: exec_argv_async recursively terminates timed-out process tree (including grandchild), executes callback once
 uloop.init();
 let exec_cb_count = 0;
 let exec_res = null;
-h_exec.exec_argv_async('/bin/sleep', ['5'], 150, 65536, function(r) {
+h_exec.exec_argv_async('/bin/sh', ['-c', '/bin/sleep 5'], 150, 65536, function(r) {
 	exec_cb_count++;
 	exec_res = r;
-	uloop.end();
+	uloop.timer(50, function() { uloop.end(); });
 });
 uloop.run();
 let all_pids_dead = true;
@@ -210,8 +210,8 @@ for (let kp in (exec_res && exec_res.killed_pids ? exec_res.killed_pids : [])) {
 }
 check(
 	exec_cb_count == 1 && exec_res && exec_res.ok === false && exec_res.error_code == 'TIMEOUT' &&
-	exec_res.killed === true && length(exec_res.killed_pids || []) >= 1 && all_pids_dead,
-	'P4F-EXEC[timeout_kills_process_tree_and_single_callback]',
+	exec_res.killed === true && length(exec_res.killed_pids || []) >= 2 && all_pids_dead,
+	'P4F-EXEC[timeout_kills_recursive_process_tree_and_single_callback]',
 	sprintf('%J', exec_res)
 );
 
