@@ -2037,9 +2037,9 @@ for (const [host, hname, port, exp] of [
   ['[fd7a:115c:a1e0::1]', '[fd7a:115c:a1e0::1]', '', 'https://[fd7a:115c:a1e0::1]:8743/'],
   ['[fe80::1]', '[fe80::1]', '', 'https://[fe80::1]:8743/'],
   ['router.lan:80', 'router.lan', '80', 'https://router.lan:8743/'],
-  ['openwrt.local', 'openwrt.local', '', 'https://openwrt.local:8743/'],
+  ['nms.local', 'nms.local', '', 'https://nms.local:8743/'],
   ['gateway.home.arpa', 'gateway.home.arpa', '', 'https://gateway.home.arpa:8743/'],
-  ['openwrt', 'openwrt', '', 'https://openwrt:8743/'],
+  ['router', 'router', '', 'https://router:8743/'],
 ]) {{
   const c = runCase('http:', host, hname, port);
   if (c.replaced !== exp || c.linkHref !== exp) {{
@@ -2053,7 +2053,8 @@ if (cHttps.replaced !== 'https://192.168.1.1:8743/') process.exit(2);
 // Loop prevention: already on https://192.168.1.1:8743/ -> replaced must remain null
 const cLoop = runCase('https:', '192.168.1.1:8743', '192.168.1.1', '8743');
 if (cLoop.replaced !== null || cLoop.linkHref !== 'https://192.168.1.1:8743/') process.exit(4);
-// Untrusted valid-looking external domains, public IPs, and malformed authorities MUST be rejected
+// Untrusted valid-looking external domains, public IPs, out-of-range ports (0, 65536, 99999),
+// malformed IPv6, and unapproved local hostnames MUST be rejected
 for (const [host, hname, port] of [
   ['evil.com', 'evil.com', ''],
   ['attacker.org:8080', 'attacker.org', '8080'],
@@ -2063,6 +2064,18 @@ for (const [host, hname, port] of [
   ['172.32.0.1', '172.32.0.1', ''],
   ['192.168.1.999', '192.168.1.999', ''],
   ['[2001:4860:4860::8888]', '[2001:4860:4860::8888]', ''],
+  ['[::1::1]', '[::1::1]', ''],
+  ['[fe80:::1]', '[fe80:::1]', ''],
+  ['[fe80:12345::1]', '[fe80:12345::1]', ''],
+  ['[fe80::1:2:3:4:5:6:7:8]', '[fe80::1:2:3:4:5:6:7:8]', ''],
+  ['[fd00:1:2:3]', '[fd00:1:2:3]', ''],
+  ['untrustedbox', 'untrustedbox', ''],
+  ['evil.lan', 'evil.lan', ''],
+  ['phish.local', 'phish.local', ''],
+  ['rogue.home.arpa', 'rogue.home.arpa', ''],
+  ['192.168.1.1:0', '192.168.1.1', '0'],
+  ['192.168.1.1:65536', '192.168.1.1', '65536'],
+  ['192.168.1.1:99999', '192.168.1.1', '99999'],
   ['evil.com/path', 'evil.com/path', ''],
   ['evil.com@192.168.1.1', 'evil.com@192.168.1.1', ''],
   ['192.168.1.1:bad', '192.168.1.1', 'bad'],
@@ -2092,12 +2105,14 @@ for ver_label, rfs in (("24.10.0-opkg", "/tmp/openwrt-24.10-x86-64-rootfs"), ("2
                 ("10.0.0.1:80", "https://10.0.0.1:8743/"),
                 ("172.16.0.1", "https://172.16.0.1:8743/"),
                 ("100.99.45.10:443", "https://100.99.45.10:8743/"),
+                ("192.168.1.1:1", "https://192.168.1.1:8743/"),
+                ("192.168.1.1:65535", "https://192.168.1.1:8743/"),
                 ("[::1]:80", "https://[::1]:8743/"),
                 ("[fd7a:115c:a1e0::1]:443", "https://[fd7a:115c:a1e0::1]:8743/"),
-                ("myrouter.lan:443", "https://myrouter.lan:8743/"),
-                ("openwrt.local", "https://openwrt.local:8743/"),
+                ("router.lan:443", "https://router.lan:8743/"),
+                ("nms.local", "https://nms.local:8743/"),
                 ("gateway.home.arpa", "https://gateway.home.arpa:8743/"),
-                ("openwrt", "https://openwrt:8743/"),
+                ("router", "https://router:8743/"),
             ]
             untrusted_cases = [
                 "evil.com",
@@ -2107,6 +2122,21 @@ for ver_label, rfs in (("24.10.0-opkg", "/tmp/openwrt-24.10-x86-64-rootfs"), ("2
                 "172.32.0.1",
                 "192.168.1.999",
                 "[2001:4860:4860::8888]",
+                "[::1::1]",
+                "[fe80:::1]",
+                "[fe80:12345::1]",
+                "[fe80::1:2:3:4:5:6:7:8]",
+                "[fd00:1:2:3]",
+                "untrustedbox",
+                "evil.lan",
+                "phish.local",
+                "rogue.home.arpa",
+                "192.168.1.1:0",
+                "192.168.1.1:65536",
+                "192.168.1.1:99999",
+                "[::1]:0",
+                "[::1]:65536",
+                "[::1]:99999",
                 "evil.example.com/attack@192.168.1.1",
                 "192.168.1.1:badport",
                 "[::1]:badport",
@@ -2327,6 +2357,12 @@ with tempfile.TemporaryDirectory(prefix="nms_root_redirect_lifecycle_") as rr_td
     # Blocker 3 (B4): Complete two-file rollback across ALL commit boundaries (before_commit, after_index_move, after_cgi_move, during_final_verify)
     pre_idx_bytes = open(idx_p, "rb").read()
     pre_cgi_bytes = open(cgi_p, "rb").read()
+    pre_idx_sha = hashlib.sha256(pre_idx_bytes).hexdigest()
+    pre_cgi_sha = hashlib.sha256(pre_cgi_bytes).hexdigest()
+    pre_idx_mode = os.stat(idx_p).st_mode & 0o7777
+    pre_cgi_mode = os.stat(cgi_p).st_mode & 0o7777
+    pre_idx_uid_gid = (os.stat(idx_p).st_uid, os.stat(idx_p).st_gid)
+    pre_cgi_uid_gid = (os.stat(cgi_p).st_uid, os.stat(cgi_p).st_gid)
     rollback_all_ok = True
     for fp in ("before_commit", "after_index_move", "after_cgi_move", "during_final_verify"):
         env_res_fail = env_rr.copy()
@@ -2334,10 +2370,15 @@ with tempfile.TemporaryDirectory(prefix="nms_root_redirect_lifecycle_") as rr_td
         r_rf = subprocess.run(["sh", restore_sh_p], env=env_res_fail, capture_output=True, text=True)
         if (
             r_rf.returncode == 0
-            or open(idx_p, "rb").read() != pre_idx_bytes
-            or open(cgi_p, "rb").read() != pre_cgi_bytes
+            or hashlib.sha256(open(idx_p, "rb").read()).hexdigest() != pre_idx_sha
+            or hashlib.sha256(open(cgi_p, "rb").read()).hexdigest() != pre_cgi_sha
+            or (os.stat(idx_p).st_mode & 0o7777) != pre_idx_mode
+            or (os.stat(cgi_p).st_mode & 0o7777) != pre_cgi_mode
+            or (os.stat(idx_p).st_uid, os.stat(idx_p).st_gid) != pre_idx_uid_gid
+            or (os.stat(cgi_p).st_uid, os.stat(cgi_p).st_gid) != pre_cgi_uid_gid
             or hashlib.sha256(open(idx_bak_p, "rb").read()).hexdigest() != orig_idx_sha
             or hashlib.sha256(open(cgi_bak_p, "rb").read()).hexdigest() != orig_cgi_sha
+            or not os.path.isfile(manifest_p)
         ):
             rollback_all_ok = False
             break
@@ -2345,6 +2386,49 @@ with tempfile.TemporaryDirectory(prefix="nms_root_redirect_lifecycle_") as rr_td
         ok("ROOT-REDIRECT-B[restore_luci_two_file_rollback_across_all_commit_boundaries]")
     else:
         fail(f"ROOT-REDIRECT-B[restore_luci_two_file_rollback_across_all_commit_boundaries]: failed at {fp}")
+
+    # Rollback failure handling: fault-injection during rollback copy, chmod, chown, rename, and final verification
+    # MUST report rollback failure distinctly (rc == 99, "RESTORE-LUCI ROLLBACK ERROR" & "RESTORE-LUCI CRITICAL")
+    # and MUST preserve recovery artifacts (.prev.tmp.*, luci_backup.manifest, and original backups)
+    rb_fault_ok = True
+    for rbf in ("rb_copy", "rb_chmod", "rb_chown", "rb_rename", "rb_verify"):
+        # Reset destinations to pre-restore state before each rollback fault injection
+        open(idx_p, "wb").write(pre_idx_bytes)
+        os.chmod(idx_p, pre_idx_mode)
+        open(cgi_p, "wb").write(pre_cgi_bytes)
+        os.chmod(cgi_p, pre_cgi_mode)
+        env_rbf = env_rr.copy()
+        env_rbf["NMS_TEST_RESTORE_LUCI_FAIL_POINT"] = "after_cgi_move"
+        env_rbf["NMS_TEST_RESTORE_LUCI_ROLLBACK_FAIL_POINT"] = rbf
+        r_rbf = subprocess.run(["sh", restore_sh_p], env=env_rbf, capture_output=True, text=True)
+        prev_idx_files = [f for f in os.listdir(os.path.join(rr_td, "www")) if f.startswith("index.html.prev.tmp.")]
+        prev_cgi_files = [f for f in os.listdir(os.path.join(rr_td, "www", "cgi-bin")) if f.startswith("luci.prev.tmp.")]
+        if (
+            r_rbf.returncode != 99
+            or "RESTORE-LUCI ROLLBACK ERROR" not in r_rbf.stderr
+            or "RESTORE-LUCI CRITICAL" not in r_rbf.stderr
+            or not prev_idx_files
+            or not prev_cgi_files
+            or not os.path.isfile(manifest_p)
+            or hashlib.sha256(open(idx_bak_p, "rb").read()).hexdigest() != orig_idx_sha
+            or hashlib.sha256(open(cgi_bak_p, "rb").read()).hexdigest() != orig_cgi_sha
+        ):
+            rb_fault_ok = False
+            break
+        # Clean up preserved .prev.tmp.* artifacts before next iteration
+        for f in prev_idx_files:
+            os.unlink(os.path.join(rr_td, "www", f))
+        for f in prev_cgi_files:
+            os.unlink(os.path.join(rr_td, "www", "cgi-bin", f))
+    # Restore destinations to pre-restore state after rollback fault injection tests
+    open(idx_p, "wb").write(pre_idx_bytes)
+    os.chmod(idx_p, pre_idx_mode)
+    open(cgi_p, "wb").write(pre_cgi_bytes)
+    os.chmod(cgi_p, pre_cgi_mode)
+    if rb_fault_ok:
+        ok("ROOT-REDIRECT-B[restore_luci_rollback_failure_reported_distinctly_and_artifacts_preserved]")
+    else:
+        fail(f"ROOT-REDIRECT-B[restore_luci_rollback_failure_reported_distinctly_and_artifacts_preserved]: failed at {rbf}")
 
     # B2, B3 & D5: Standalone restore-luci (even when NMS daemons are completely down/absent) restores original LuCI byte-for-byte, and repeated execution is idempotent
     r_res1 = subprocess.run(["sh", restore_sh_p], env=env_rr, capture_output=True, text=True)

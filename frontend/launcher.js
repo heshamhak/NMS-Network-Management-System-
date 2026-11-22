@@ -13,12 +13,48 @@
     return false;
   }
 
+  function isValidIpv6Groups(addr) {
+    if (!addr || /:::/.test(addr) || /^:[^:]/.test(addr) || /[^:]:$/.test(addr)) return false;
+    var dbl = addr.split('::');
+    if (dbl.length > 2) return false;
+    if (dbl.length === 2) {
+      var left = dbl[0] ? dbl[0].split(':') : [];
+      var right = dbl[1] ? dbl[1].split(':') : [];
+      if (left.length + right.length >= 8) return false;
+      var all = left.concat(right);
+      for (var i = 0; i < all.length; i++) {
+        if (!/^[0-9a-f]{1,4}$/.test(all[i])) return false;
+      }
+      return true;
+    }
+    var groups = addr.split(':');
+    if (groups.length !== 8) return false;
+    for (var j = 0; j < 8; j++) {
+      if (!/^[0-9a-f]{1,4}$/.test(groups[j])) return false;
+    }
+    return true;
+  }
+
   function isLocalIpv6(h) {
     if (!/^\[[0-9a-fA-F:]+\]$/.test(h)) return false;
     var inner = h.slice(1, -1).toLowerCase();
+    if (!isValidIpv6Groups(inner)) return false;
     if (inner === '::1') return true;
     if (/^fe[89ab][0-9a-f]:/.test(inner)) return true;
     if (/^f[cd][0-9a-f]{2}:/.test(inner)) return true;
+    return false;
+  }
+
+  var APPROVED_BASE_NAMES = ['localhost', 'router', 'gateway', 'nms'];
+
+  function isApprovedLocalHostname(lower) {
+    for (var i = 0; i < APPROVED_BASE_NAMES.length; i++) {
+      var b = APPROVED_BASE_NAMES[i];
+      if (lower === b) return true;
+      if (b !== 'localhost' && (lower === b + '.lan' || lower === b + '.local' || lower === b + '.home.arpa')) {
+        return true;
+      }
+    }
     return false;
   }
 
@@ -28,9 +64,7 @@
     if (isLocalIpv6(h)) return true;
     if (/^[0-9.]+$/.test(h)) return isPrivateIpv4(h);
     var lower = h.toLowerCase();
-    if (/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(lower)) return true;
-    if (/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.(?:lan|local|home\.arpa)$/.test(lower)) return true;
-    return false;
+    return isApprovedLocalHostname(lower);
   }
 
   var loc = window.location;

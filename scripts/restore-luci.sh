@@ -5,7 +5,8 @@ set -eu
 # Usage: restore-luci [--cleanup-nms-owned-backups]
 # Strictly requires a valid /etc/noc-console/luci_backup.manifest with both expected records,
 # verifies SHA-256 of /www/index.luci.bak.html and /www/cgi-bin/luci.orig.bak before any mutation,
-# preserves both previous destination files, and rolls back both on any failure.
+# preserves both previous destination files, and rolls back both on any failure while verifying
+# SHA-256, mode, and ownership of the rolled-back files and reporting rollback errors distinctly.
 
 CLEANUP_OWNED=0
 if [ "${1:-}" = "--cleanup-nms-owned-backups" ]; then
@@ -14,6 +15,7 @@ fi
 
 ROOT_PREFIX="${NMS_ROOT_PREFIX:-}"
 FAIL_POINT="${NMS_TEST_RESTORE_LUCI_FAIL_POINT:-}"
+RB_FAIL_POINT="${NMS_TEST_RESTORE_LUCI_ROLLBACK_FAIL_POINT:-}"
 
 if [ -z "$ROOT_PREFIX" ] && [ "$(id -u)" -ne 0 ]; then
   echo "ERROR: Please run restore-luci as root." >&2
@@ -132,38 +134,87 @@ PREV_INDEX="${WEB_INDEX}.prev.tmp.$$"
 PREV_CGI="${LUCI_CGI}.prev.tmp.$$"
 HAD_PREV_INDEX=0
 HAD_PREV_CGI=0
+PREV_INDEX_SHA=""
+PREV_CGI_SHA=""
 PREV_INDEX_MODE="644"
 PREV_CGI_MODE="755"
 PREV_INDEX_OWNER="0:0"
 PREV_CGI_OWNER="0:0"
 COMMITTED=0
 
+rollback_one_file() {
+  _src="$1"
+  _dst="$2"
+  _exp_sha="$3"
+  _exp_mode="$4"
+  _exp_owner="$5"
+  _stage="${_dst}.rb.$$"
+
+  if [ "$RB_FAIL_POINT" = "rb_copy" ] || ! cp -p "$_src" "$_stage"; then
+    echo "RESTORE-LUCI ROLLBACK ERROR: failed to copy $_src to $_stage" >&2
+    return 1
+  fi
+  if [ "$RB_FAIL_POINT" = "rb_chmod" ] || ! chmod "$_exp_mode" "$_stage"; then
+    echo "RESTORE-LUCI ROLLBACK ERROR: failed to chmod $_exp_mode on $_stage" >&2
+    return 1
+  fi
+  if [ "$RB_FAIL_POINT" = "rb_chown" ] || ! chown "$_exp_owner" "$_stage"; then
+    echo "RESTORE-LUCI ROLLBACK ERROR: failed to chown $_exp_owner on $_stage" >&2
+    return 1
+  fi
+  if [ "$RB_FAIL_POINT" = "rb_rename" ] || ! mv -f "$_stage" "$_dst"; then
+    echo "RESTORE-LUCI ROLLBACK ERROR: failed to move $_stage to $_dst" >&2
+    return 1
+  fi
+  if [ "$RB_FAIL_POINT" = "rb_verify" ]; then
+    printf 'RB_CORRUPT' >> "$_dst"
+  fi
+  _cur_sha="$(file_sha256 "$_dst")"
+  _cur_mode="$(get_mode "$_dst")"
+  _cur_owner="$(get_owner "$_dst")"
+  if [ "$_cur_sha" != "$_exp_sha" ] || [ "$_cur_mode" != "$_exp_mode" ] || [ "$_cur_owner" != "$_exp_owner" ]; then
+    echo "RESTORE-LUCI ROLLBACK ERROR: post-rollback verification failed for $_dst (sha=$_cur_sha/$_exp_sha mode=$_cur_mode/$_exp_mode owner=$_cur_owner/$_exp_owner)" >&2
+    return 1
+  fi
+  return 0
+}
+
 cleanup_restore() {
   _rc=$?
   trap - EXIT INT TERM
+  _rb_err=0
   if [ "$COMMITTED" -eq 0 ]; then
-    if [ "$HAD_PREV_INDEX" -eq 1 ] && [ -f "$PREV_INDEX" ]; then
-      cp -p "$PREV_INDEX" "${WEB_INDEX}.rb.$$" 2>/dev/null && chmod "$PREV_INDEX_MODE" "${WEB_INDEX}.rb.$$" 2>/dev/null && chown "$PREV_INDEX_OWNER" "${WEB_INDEX}.rb.$$" 2>/dev/null || true
-      mv -f "${WEB_INDEX}.rb.$$" "$WEB_INDEX" 2>/dev/null || true
+    if [ "$HAD_PREV_INDEX" -eq 1 ]; then
+      if [ ! -f "$PREV_INDEX" ] || ! rollback_one_file "$PREV_INDEX" "$WEB_INDEX" "$PREV_INDEX_SHA" "$PREV_INDEX_MODE" "$PREV_INDEX_OWNER"; then
+        _rb_err=1
+      fi
     fi
-    if [ "$HAD_PREV_CGI" -eq 1 ] && [ -f "$PREV_CGI" ]; then
-      cp -p "$PREV_CGI" "${LUCI_CGI}.rb.$$" 2>/dev/null && chmod "$PREV_CGI_MODE" "${LUCI_CGI}.rb.$$" 2>/dev/null && chown "$PREV_CGI_OWNER" "${LUCI_CGI}.rb.$$" 2>/dev/null || true
-      mv -f "${LUCI_CGI}.rb.$$" "$LUCI_CGI" 2>/dev/null || true
+    if [ "$HAD_PREV_CGI" -eq 1 ]; then
+      if [ ! -f "$PREV_CGI" ] || ! rollback_one_file "$PREV_CGI" "$LUCI_CGI" "$PREV_CGI_SHA" "$PREV_CGI_MODE" "$PREV_CGI_OWNER"; then
+        _rb_err=1
+      fi
     fi
   fi
-  rm -f "$TMP_INDEX" "$TMP_CGI" "$PREV_INDEX" "$PREV_CGI" "${WEB_INDEX}.rb.$$" "${LUCI_CGI}.rb.$$" 2>/dev/null || true
+  rm -f "$TMP_INDEX" "$TMP_CGI" "${WEB_INDEX}.rb.$$" "${LUCI_CGI}.rb.$$" 2>/dev/null || true
+  if [ "$_rb_err" -ne 0 ]; then
+    echo "RESTORE-LUCI CRITICAL: Rollback verification failed; preserving recovery artifacts ($PREV_INDEX, $PREV_CGI, $LUCI_META)." >&2
+    exit 99
+  fi
+  rm -f "$PREV_INDEX" "$PREV_CGI" 2>/dev/null || true
   exit "$_rc"
 }
 trap 'cleanup_restore' EXIT INT TERM
 
-# 3. Preserve both previous destination files before any modification
+# 3. Preserve both previous destination files and their exact SHA-256, mode, and owner before any modification
 if [ -f "$WEB_INDEX" ]; then
+  PREV_INDEX_SHA="$(file_sha256 "$WEB_INDEX")"
   PREV_INDEX_MODE="$(get_mode "$WEB_INDEX")"
   PREV_INDEX_OWNER="$(get_owner "$WEB_INDEX")"
   cp -p "$WEB_INDEX" "$PREV_INDEX"
   HAD_PREV_INDEX=1
 fi
 if [ -f "$LUCI_CGI" ]; then
+  PREV_CGI_SHA="$(file_sha256 "$LUCI_CGI")"
   PREV_CGI_MODE="$(get_mode "$LUCI_CGI")"
   PREV_CGI_OWNER="$(get_owner "$LUCI_CGI")"
   cp -p "$LUCI_CGI" "$PREV_CGI"
@@ -173,11 +224,11 @@ fi
 # 4. Stage both files completely and verify SHA-256 before moving either file into place
 cp -p "$WEB_INDEX_BAK" "$TMP_INDEX"
 chmod "$INDEX_MODE" "$TMP_INDEX"
-chown "$INDEX_OWNER" "$TMP_INDEX" 2>/dev/null || true
+chown "$INDEX_OWNER" "$TMP_INDEX"
 
 cp -p "$LUCI_CGI_BAK" "$TMP_CGI"
 chmod "$CGI_MODE" "$TMP_CGI"
-chown "$CGI_OWNER" "$TMP_CGI" 2>/dev/null || true
+chown "$CGI_OWNER" "$TMP_CGI"
 
 if [ "$(file_sha256 "$TMP_INDEX")" != "$INDEX_BAK_SHA" ] || [ "$(file_sha256 "$TMP_CGI")" != "$CGI_BAK_SHA" ]; then
   echo "RESTORE-LUCI ERROR: Staged files failed SHA-256 verification." >&2
@@ -196,9 +247,17 @@ if [ "$FAIL_POINT" = "during_final_verify" ]; then
   printf 'CORRUPT' >> "$LUCI_CGI"
 fi
 
-# 5. Post-move byte-for-byte SHA-256 verification of both files
+# 5. Post-move byte-for-byte SHA-256, mode, and ownership verification of both files
 if [ "$(file_sha256 "$WEB_INDEX")" != "$INDEX_BAK_SHA" ] || [ "$(file_sha256 "$LUCI_CGI")" != "$CGI_BAK_SHA" ]; then
   echo "RESTORE-LUCI ERROR: Post-restore SHA-256 verification failed." >&2
+  exit 1
+fi
+if [ "$(get_mode "$WEB_INDEX")" != "$INDEX_MODE" ] || [ "$(get_mode "$LUCI_CGI")" != "$CGI_MODE" ]; then
+  echo "RESTORE-LUCI ERROR: Post-restore mode verification failed." >&2
+  exit 1
+fi
+if [ "$(get_owner "$WEB_INDEX")" != "$INDEX_OWNER" ] || [ "$(get_owner "$LUCI_CGI")" != "$CGI_OWNER" ]; then
+  echo "RESTORE-LUCI ERROR: Post-restore ownership verification failed." >&2
   exit 1
 fi
 
