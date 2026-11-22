@@ -3067,7 +3067,13 @@ function handle_rpc(req, reply_cb) {
 				let bak = p + '.bak.' + time();
 				if (fs.stat(p)) {
 					let raw_cur = fs.readfile(p);
-					if (raw_cur) atomic_write(bak, raw_cur, 0o644);
+					if (raw_cur) {
+						let aw_r = atomic_write(bak, raw_cur, 0o644);
+						if (!aw_r || !aw_r.ok) {
+							reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل حفظ نسخة احتياطية محلية' });
+							return;
+						}
+					}
 				}
 				push(restored_keys, k);
 			}
