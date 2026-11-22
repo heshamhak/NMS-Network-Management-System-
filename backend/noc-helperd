@@ -2091,6 +2091,108 @@ function handle_rpc(req, reply_cb) {
 		return;
 	}
 
+	if (verb == 'topology_read') {
+		let br_entries = fs.lsdir('/sys/class/net/br-lan/brif') || [];
+		let bridges = nms_discovery.discover_bridges_from_sysfs('/sys/class/net');
+		let cur0 = null;
+		try { cur0 = uci.cursor(); } catch (e) {}
+		let uci_wireless = [];
+		if (cur0) {
+			try {
+				cur0.foreach('wireless', 'wifi-iface', function(s) {
+					push(uci_wireless, {
+						ifname: s.ifname || '',
+						device: s.device || '',
+						ssid: s.ssid || '',
+						mode: s.mode || 'ap',
+						disabled: (s.disabled == '1')
+					});
+				});
+			} catch (e) {}
+		}
+		let dump = null;
+		let ws = null;
+		let ubus_net_ok = false;
+		let wifi_ok = false;
+		let runtime_ap_ifs = {};
+		let wifi_stations = {};
+		try {
+			let uctx = ubus.connect();
+			if (uctx) {
+				dump = uctx.call('network.interface', 'dump', {});
+				if (dump && type(dump.interface) == 'array') ubus_net_ok = true;
+				ws = uctx.call('network.wireless', 'status', {});
+				if (type(ws) == 'object') {
+					let hc_map = {};
+					for (let rad in keys(ws)) {
+						let rinfo = ws[rad];
+						if (!rinfo || type(rinfo.interfaces) != 'array') continue;
+						for (let itf in rinfo.interfaces) {
+							if (itf && itf.ifname) {
+								runtime_ap_ifs[itf.ifname] = {
+									up: !!rinfo.up,
+									radio: rad,
+									ssid: (itf.config && itf.config.ssid) ? itf.config.ssid : ''
+								};
+								let hc = uctx.call('hostapd.' + itf.ifname, 'get_clients');
+								if (type(hc) == 'object') {
+									hc_map[itf.ifname] = hc;
+									wifi_ok = true;
+								}
+							}
+						}
+					}
+					wifi_stations = nms_discovery.parse_wifi_stations(ws, hc_map);
+				}
+				try { uctx.disconnect(); } catch (e) {}
+			}
+		} catch (e) {}
+		let wan_topo = nms_sqm.build_sqm_topology(cur0, dump, br_entries, function(iface) {
+			return !!fs.stat('/sys/class/net/' + iface);
+		});
+		let bridge_exe = find_exe(['/sbin/bridge', '/usr/sbin/bridge']);
+		exec_argv_async('/sbin/ip', ['-j', 'link', 'show'], 3500, CAP_GENERAL, function(r_link) {
+			exec_argv_async('/sbin/ip', ['-j', 'addr', 'show'], 3500, CAP_GENERAL, function(r_addr) {
+				exec_argv_async('/sbin/ip', ['-j', 'route', 'show'], 3500, CAP_GENERAL, function(r_route) {
+					let finish_topo = function(vlan_raw, vlan_ok, fdb_raw, fdb_ok) {
+						reply_cb({
+							ok: true,
+							ip_link_raw: r_link.ok ? r_link.output : null,
+							ip_addr_raw: r_addr.ok ? r_addr.output : null,
+							ip_route_raw: r_route.ok ? r_route.output : null,
+							bridge_vlan_raw: vlan_ok ? vlan_raw : null,
+							fdb_raw: fdb_ok ? fdb_raw : '',
+							bridges: bridges,
+							uci_wireless: uci_wireless,
+							runtime_ap_ifs: runtime_ap_ifs,
+							wifi_stations: wifi_stations,
+							wan_topology: { wan_ifaces: wan_topo.wan_ifaces, lan_ifaces: wan_topo.lan_ifaces },
+							collector_status: {
+								ubus_network: ubus_net_ok,
+								wireless: wifi_ok,
+								ip_link: !!r_link.ok,
+								ip_addr: !!r_addr.ok,
+								ip_route: !!r_route.ok,
+								bridge_vlan: !!vlan_ok,
+								fdb: !!fdb_ok
+							}
+						});
+					};
+					if (bridge_exe) {
+						exec_argv_async(bridge_exe, ['-j', 'vlan', 'show'], 3500, CAP_GENERAL, function(r_vlan) {
+							exec_argv_async(bridge_exe, ['fdb', 'show'], 3500, CAP_GENERAL, function(r_fdb) {
+								finish_topo(r_vlan.ok ? r_vlan.output : null, !!r_vlan.ok, r_fdb.ok ? r_fdb.output : '', !!r_fdb.ok);
+							});
+						});
+					} else {
+						finish_topo(null, false, '', false);
+					}
+				});
+			});
+		});
+		return;
+	}
+
 	if (verb == 'network_read') {
 		let cur = uci.cursor();
 		let dm_sid = '@dnsmasq[0]';

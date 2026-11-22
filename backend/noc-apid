@@ -8,6 +8,9 @@ import * as ubus from 'ubus';
 import * as uci from 'uci';
 import * as nms_discovery from '/usr/libexec/nms_discovery.uc';
 import * as nms_access_dhcp from '/usr/libexec/nms_access_dhcp.uc';
+import * as nms_topology from '/usr/libexec/nms_topology.uc';
+
+let last_valid_topology = null;
 
 const HELPER_SOCK = getenv('NOC_HELPER_SOCK') || '/tmp/noc-console/helper.sock';
 const RUN_DIR = getenv('NOC_RUN_DIR') || '/tmp/noc-console';
@@ -1424,6 +1427,52 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 				local_domains: sess.role == 'admin' ? (res.local_domains || []) : []
 			};
 		}, cli);
+		return;
+	}
+
+	if (action == 'topology') {
+		let cache_k = 'topology_' + sess.role;
+		let now_m = now_mono_ms();
+		let c = cache_map[cache_k];
+		if (c && (now_m - c.ts) < 3500) {
+			send_json_env(cli, c.data.ok ? 200 : 503, 'clients', c.data, []);
+			return;
+		}
+		call_helper('clients_read', {}, sess.username, remote_ip, function(cres) {
+			let cl_list = [];
+			let cl_ok = !!(cres && cres.ok);
+			if (cl_ok) {
+				cl_list = nms_discovery.merge_discovered_clients(cres);
+				let nlbw_ok = !!(cres.discovery_status && cres.discovery_status.nlbw);
+				nms_discovery.compute_client_rates(cl_list, prev_client_rates, now_mono_ms(), !!cres.flow_offloading, nlbw_ok);
+			}
+			call_helper('topology_read', {}, sess.username, remote_ip, function(tres) {
+				let cstat = (tres && tres.collector_status) ? tres.collector_status : {};
+				cstat.clients = cl_ok;
+				let built = nms_topology.build_live_topology({
+					sampled_ms: now_mono_ms(),
+					ip_link_raw: tres ? tres.ip_link_raw : null,
+					ip_addr_raw: tres ? tres.ip_addr_raw : null,
+					ip_route_raw: tres ? tres.ip_route_raw : null,
+					bridge_vlan_raw: tres ? tres.bridge_vlan_raw : null,
+					fdb_raw: tres ? tres.fdb_raw : '',
+					bridges: tres ? tres.bridges : [],
+					uci_wireless: tres ? tres.uci_wireless : [],
+					runtime_ap_ifs: tres ? tres.runtime_ap_ifs : {},
+					wifi_stations: tres ? tres.wifi_stations : {},
+					wan_topology: tres ? tres.wan_topology : {},
+					clients: cl_list,
+					collector_status: cstat
+				});
+				let selected = nms_topology.select_topology_snapshot(built, last_valid_topology, now_mono_ms(), 120000);
+				if (selected.completeness != 'unavailable' && !selected.stale) {
+					last_valid_topology = selected;
+				}
+				let shaped = nms_topology.redact_topology_for_role(selected, sess.role, BOOT_ID, digest.sha256);
+				cache_map[cache_k] = { ts: now_mono_ms(), data: shaped };
+				send_json_env(cli, shaped.ok ? 200 : 503, 'clients', shaped, []);
+			});
+		});
 		return;
 	}
 

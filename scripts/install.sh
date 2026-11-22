@@ -453,6 +453,7 @@ install_managed_file "${REPO_ROOT}/backend/nms_discovery.uc" "/usr/libexec/nms_d
 install_managed_file "${REPO_ROOT}/backend/nms_clients.uc" "/usr/libexec/nms_clients.uc" 0644
 install_managed_file "${REPO_ROOT}/backend/nms_access_dhcp.uc" "/usr/libexec/nms_access_dhcp.uc" 0644
 install_managed_file "${REPO_ROOT}/backend/nms_sqm.uc" "/usr/libexec/nms_sqm.uc" 0644
+install_managed_file "${REPO_ROOT}/backend/nms_topology.uc" "/usr/libexec/nms_topology.uc" 0644
 install_managed_file "${REPO_ROOT}/backend/noc-apid" "/usr/libexec/noc-apid" 0755
 [ "$FAIL_POINT" = "after_backend" ] && { echo "ERROR: Injected failure after_backend" >&2; exit 1; }
 

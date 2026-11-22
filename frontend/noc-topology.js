@@ -9,6 +9,8 @@
   var hasFitted = false;
   var selectedNodeId = null;
   var pollTimer = null;
+  var pollInFlight = false;
+  var topologyRefreshFailed = false;
   var currentConnections = [];
   var nodeRegistry = {};
   var prevClientBytes = {};
@@ -405,75 +407,137 @@
     var st = (window.NOC && window.NOC.state) ? window.NOC.state : {};
     var ov = st.lastOverview;
     var cl = st.lastClients;
-    var isLive = (mode === 'live' && ov && ov.system);
+    var topo = st.lastTopology;
+    var isLive = (mode === 'live' && (ov && ov.system || topo));
 
-    var wanUp = isLive ? !!(ov.wan && ov.wan.up) : simState.wan;
-    var sqmUp = isLive ? (ov.dependencies && ov.dependencies.sqm === 'ready') : (simState.sqm && wanUp);
+    var wanUp = isLive ? !!(ov && ov.wan && ov.wan.up) : simState.wan;
+    var sqmUp = isLive ? !!(ov && ov.dependencies && ov.dependencies.sqm === 'ready') : (simState.sqm && wanUp);
     var routerUp = isLive ? true : (simState.router && wanUp);
-    var aghUp = isLive ? (ov.dependencies && ov.dependencies.adguard === 'ready') : (simState.adguard && routerUp);
-    var vpnUp = isLive ? (ov.dependencies && ov.dependencies.tailscale === 'ready') : (simState.vpn && routerUp);
-    var lanUp = isLive ? !!(ov.lan && ov.lan.up) : routerUp;
+    var aghUp = isLive ? !!(ov && ov.dependencies && ov.dependencies.adguard === 'ready') : (simState.adguard && routerUp);
+    var vpnUp = isLive ? !!(ov && ov.dependencies && ov.dependencies.tailscale === 'ready') : (simState.vpn && routerUp);
+    var lanUp = isLive ? !!(ov && ov.lan && ov.lan.up) : routerUp;
     var apUp = isLive ? lanUp : (simState.ap && lanUp);
     var haUp = isLive ? lanUp : (simState.ha && lanUp);
     var srvUp = isLive ? lanUp : (simState.srv && lanUp);
 
-    var activeDevName = (isLive && ov.wan && ov.wan.active_device) ? ov.wan.active_device : 'wlan0';
-    var ifaces = (isLive && ov.interfaces) ? ov.interfaces : {};
-    var wanIf = ifaces[activeDevName] || {};
+    var activeDevName = (isLive && ov && ov.wan && ov.wan.active_device) ? ov.wan.active_device : '';
+    var ifaces = (isLive && ov && ov.interfaces) ? ov.interfaces : {};
+    var wanIf = (activeDevName && ifaces[activeDevName]) ? ifaces[activeDevName] : {};
     var wanSpeed = (Number(wanIf.rx_bps) || 0) + (Number(wanIf.tx_bps) || 0);
-    var eth0Speed = ifaces.eth0 ? ((Number(ifaces.eth0.rx_bps) || 0) + (Number(ifaces.eth0.tx_bps) || 0)) : wanSpeed;
     var eth1Speed = ifaces.eth1 ? ((Number(ifaces.eth1.rx_bps) || 0) + (Number(ifaces.eth1.tx_bps) || 0)) : 0;
     var eth3Speed = ifaces.eth3 ? ((Number(ifaces.eth3.rx_bps) || 0) + (Number(ifaces.eth3.tx_bps) || 0)) : 0;
 
-    colWan.appendChild(makeNode({
-      id: 'topo-wan',
-      type: 'wan',
-      simKey: 'wan',
-      title: 'مدخل الإنترنت النشط (' + activeDevName + ')',
-      badge: wanUp ? 'متصل' : 'منقطع',
-      stateClass: wanUp ? 'active' : 'broken',
-      lines: [
-        { text: 'منفذ الاتصال الخارجي | ' + ((isLive && ov.wan && ov.wan.ipv4) ? ov.wan.ipv4 : '203.0.113.10'), mono: true },
-        { text: 'التدفق: ' + fmtBps(wanSpeed), mono: true }
-      ],
-      footLabel: 'المسار النشط',
-      footVal: 'WWAN نشط',
-      details: [
-        ['الواجهة النشطة', activeDevName],
-        ['العنوان', (isLive && ov.wan && ov.wan.ipv4) ? ov.wan.ipv4 : '203.0.113.10'],
-        ['تنزيل فوري', fmtBps(wanIf.rx_bps || 0)],
-        ['رفع فوري', fmtBps(wanIf.tx_bps || 0)]
-      ]
-    }));
+    if (isLive && topo) {
+      var isStale = !!(topo.stale || topologyRefreshFailed);
+      var isPartial = !!topo.partial;
+      var isUnavail = (topo.completeness === 'unavailable' && !isStale);
+      if (qs('topoModeBadge')) {
+        if (isUnavail) {
+          qs('topoModeBadge').textContent = 'غير متاح (فشل الجمع)';
+          qs('topoModeBadge').className = 'status-pill pill-danger';
+        } else if (isStale) {
+          qs('topoModeBadge').textContent = 'بيانات قديمة (' + Math.round((topo.stale_age_ms || 0) / 1000) + 'ث)';
+          qs('topoModeBadge').className = 'status-pill pill-warning';
+        } else if (isPartial) {
+          qs('topoModeBadge').textContent = 'طوبولوجيا جزئية';
+          qs('topoModeBadge').className = 'status-pill pill-warning';
+        } else {
+          qs('topoModeBadge').textContent = 'وضع المراقبة الحية';
+          qs('topoModeBadge').className = 'status-pill pill-success';
+        }
+      }
+    }
 
-    colWan.appendChild(makeNode({
-      id: 'topo-wan-pppoe',
-      type: 'wan',
-      title: 'مدخل احتياطي: PPPoE',
-      badge: 'متوقف',
-      stateClass: 'disabled',
-      lines: [{ text: 'اشتراك المزود الرئيسي' }, { text: 'متوقف حالياً (احتياطي)' }],
-      footLabel: 'الحالة',
-      footVal: 'غير نشط',
-      details: [['الحالة', 'متوقف حالياً (الإنترنت يعمل عبر wlan0)']]
-    }));
+    if (isLive && topo && Array.isArray(topo.wan_links)) {
+      if (topo.wan_links.length === 0) {
+        colWan.appendChild(makeNode({
+          id: 'topo-wan-none',
+          type: 'wan',
+          title: 'لا توجد واجهة WAN مؤكدة',
+          badge: topo.completeness === 'unavailable' ? 'غير متاح' : 'غير متصل',
+          stateClass: 'disabled',
+          lines: [{ text: 'لم يثبت ubus وجود واجهة WAN نشطة' }],
+          footLabel: 'الحالة',
+          footVal: 'غير مؤكد',
+          details: [['الحالة', 'لا توجد أدلة WAN صالحة']]
+        }));
+      } else {
+        topo.wan_links.forEach(function (w, idx) {
+          var wid = 'topo-wan-' + idx;
+          var wIfStat = ifaces[w.device] || {};
+          var wBps = (Number(wIfStat.rx_bps) || 0) + (Number(wIfStat.tx_bps) || 0);
+          colWan.appendChild(makeNode({
+            id: wid,
+            type: 'wan',
+            title: 'مدخل WAN (' + w.device + ')',
+            badge: w.observed_up ? 'متصل' : 'متوقف',
+            stateClass: w.observed_up ? 'active' : 'disabled',
+            lines: [
+              { text: (w.ipv4 || 'بدون IPv4') + ' | ' + w.operstate, mono: true },
+              { text: w.is_default_route ? ('مسار افتراضي ' + (w.gateway || '')) : 'غير افتراضي', mono: true }
+            ],
+            footLabel: 'المصدر',
+            footVal: w.evidence_source || 'ubus+ip_link',
+            details: [
+              ['الواجهة', w.device],
+              ['الحالة الفعلية', w.observed_up ? 'نشطة' : 'متوقفة'],
+              ['IPv4', w.ipv4 || '--'],
+              ['المسار الافتراضي', w.is_default_route ? 'نعم' : 'لا'],
+              ['الدليل', w.evidence_source || '--']
+            ]
+          }));
+          currentConnections.push({ from: wid, to: 'topo-router', type: 'primary', bps: w.observed_up ? wBps : 0 });
+        });
+      }
+    } else if (!isLive) {
+      colWan.appendChild(makeNode({
+        id: 'topo-wan',
+        type: 'wan',
+        simKey: 'wan',
+        title: 'مدخل الإنترنت النشط (محاكاة)',
+        badge: wanUp ? 'متصل' : 'منقطع',
+        stateClass: wanUp ? 'active' : 'broken',
+        lines: [
+          { text: 'منفذ الاتصال الخارجي | 203.0.113.10', mono: true },
+          { text: 'التدفق: ' + fmtBps(wanSpeed), mono: true }
+        ],
+        footLabel: 'المسار النشط',
+        footVal: 'محاكاة',
+        details: [['الحالة', wanUp ? 'متصل (محاكاة)' : 'منقطع']]
+      }));
+      currentConnections.push({ from: 'topo-wan', to: 'topo-router', type: 'primary', bps: wanSpeed });
+    } else {
+      colWan.appendChild(makeNode({
+        id: 'topo-wan-pending',
+        type: 'wan',
+        title: 'واجهة WAN (بانتظار القياس)',
+        badge: wanUp ? 'متصل' : 'غير متاح',
+        stateClass: wanUp ? 'active' : 'disabled',
+        lines: [{ text: activeDevName || 'غير محدد', mono: true }],
+        footLabel: 'الحالة',
+        footVal: 'قيد التحقق',
+        details: [['الواجهة', activeDevName || 'غير محدد']]
+      }));
+      currentConnections.push({ from: 'topo-wan-pending', to: 'topo-router', type: 'primary', bps: wanSpeed });
+    }
 
-    var cpuPct = isLive && ov.cpu ? Math.round(ov.cpu.total_pct || 0) : 12;
-    var memPct = isLive && ov.memory ? Math.round(ov.memory.used_pct || 0) : 28;
-    var conns = (isLive && ov.conntrack && ov.conntrack.active) || 0;
+    var cpuPct = isLive && ov && ov.cpu ? Math.round(ov.cpu.total_pct || 0) : 12;
+    var memPct = isLive && ov && ov.memory ? Math.round(ov.memory.used_pct || 0) : 28;
+    var conns = (isLive && ov && ov.conntrack && ov.conntrack.active) || 0;
+    var lanIpTxt = (isLive && ov && ov.lan && ov.lan.ipv4) ? ov.lan.ipv4 : '192.168.1.1';
     colRouter.appendChild(makeRouterChassis({
       id: 'topo-router',
-      title: ((isLive && ov.system.hostname) ? ov.system.hostname : 'الراوتر الرئيسي') + ' (192.168.1.1) — نواة التوجيه والجدار fw4',
+      title: ((isLive && ov && ov.system && ov.system.hostname) ? ov.system.hostname : 'الراوتر الرئيسي') + ' (' + lanIpTxt + ') — نواة التوجيه والجدار fw4',
       badge: routerUp ? 'نشط' : 'متوقف',
       stateClass: routerUp ? 'active' : 'disabled',
       coreItems: [
-        'LAN: ' + ((isLive && ov.lan && ov.lan.ipv4) ? ov.lan.ipv4 : '192.168.1.1') + '/24',
+        'LAN: ' + lanIpTxt + '/24',
         'CPU: ' + cpuPct + '%',
         'RAM: ' + memPct + '%',
         'الاتصالات: ' + conns
       ],
       modules: [
-        { key: 'sqm', simKey: 'sqm', title: '1. SQM / CAKE (عند المدخل)', on: sqmUp, sub: activeDevName + ' | 2000/4000 Kbps' },
+        { key: 'sqm', simKey: 'sqm', title: '1. SQM / CAKE', on: sqmUp, sub: activeDevName ? (activeDevName + ' | SQM') : 'غير مفعّل' },
         { key: 'adguard', simKey: 'adguard', title: '2. AdGuard DNS (:53)', on: aghUp, sub: 'تصفية الإعلانات والنطاقات' },
         { key: 'vpn', simKey: 'vpn', title: '3. Tailscale VPN', on: vpnUp, sub: 'tailscale0 | وصول مشفّر' }
       ],
@@ -486,32 +550,89 @@
         ['Tailscale VPN', vpnUp ? 'متصل' : 'مغلق']
       ]
     }));
-    currentConnections.push({ from: 'topo-wan', to: 'topo-router', type: 'primary', bps: wanSpeed });
-    currentConnections.push({ from: 'topo-wan-pppoe', to: 'topo-router', type: 'primary' });
 
-    colPorts.appendChild(makeNode({
-      id: 'topo-ap',
-      type: 'router',
-      role: 'ap',
-      icon: 'ap',
-      simKey: 'ap',
-      deviceIp: isLive ? '' : '192.168.1.10',
-      title: 'منفذ eth0: نقطة الوصول (AP)',
-      badge: apUp ? fmtBps(eth0Speed) : 'مغلق',
-      stateClass: apUp ? 'active' : 'disabled',
-      lines: [
-        { text: isLive ? ('LAN Bridge | ' + ((ov.lan && ov.lan.device) || 'br-lan')) : 'Access-Point | 192.168.1.10', mono: true },
-        { text: 'الموزع الرئيسي لأجهزة الشبكة اللاسلكية' }
-      ],
-      footLabel: 'التدفق',
-      footVal: fmtBps(eth0Speed),
-      details: isLive
-        ? [['الواجهة', (ov.lan && ov.lan.device) || 'br-lan'], ['التدفق على المنفذ', fmtBps(eth0Speed)]]
-        : [['الجهاز', 'Access Point (Demo)'], ['IP', '192.168.1.10'], ['MAC', '02:00:00:00:00:10'], ['التدفق على المنفذ', fmtBps(eth0Speed)]]
-    }));
-    currentConnections.push({ from: 'topo-router', to: 'topo-ap', type: 'success', bps: eth0Speed });
-
-    if (!isLive) {
+    var validParentIds = {};
+    if (isLive && topo) {
+      (topo.bridges || []).forEach(function (br) {
+        var bid = 'bridge:' + br.name;
+        validParentIds[bid] = true;
+        colPorts.appendChild(makeNode({
+          id: bid,
+          type: 'router',
+          title: 'جسر ' + br.name,
+          badge: br.observed_up ? 'نشط' : 'متوقف',
+          stateClass: br.observed_up ? 'active' : 'disabled',
+          lines: [
+            { text: 'منافذ: ' + ((br.ports || []).map(function (p) { return p.ifname; }).join(', ') || 'بدون'), mono: true },
+            { text: 'المصدر: ' + (br.evidence_source || 'sysfs'), mono: true }
+          ],
+          footLabel: 'الحالة',
+          footVal: br.operstate || 'unknown',
+          details: [['الجسر', br.name], ['الحالة', br.operstate || 'unknown'], ['الدليل', br.evidence_source || '--']]
+        }));
+        currentConnections.push({ from: 'topo-router', to: bid, type: 'success', bps: 0 });
+        (br.ports || []).forEach(function (pt) {
+          var pid = 'port:' + pt.ifname;
+          validParentIds[pid] = true;
+          colPorts.appendChild(makeNode({
+            id: pid,
+            type: 'router',
+            title: 'منفذ ' + pt.ifname,
+            badge: pt.observed_up ? 'نشط' : 'متوقف',
+            stateClass: pt.observed_up ? 'active' : 'disabled',
+            lines: [
+              { text: 'جسر: ' + br.name + (pt.vlans && pt.vlans.length ? (' | VLAN ' + pt.vlans.map(function (v) { return v.vlan; }).join(',')) : ''), mono: true },
+              { text: 'المصدر: ' + (pt.evidence_source || 'sysfs'), mono: true }
+            ],
+            footLabel: 'الحالة',
+            footVal: pt.operstate || 'unknown',
+            details: [['المنفذ', pt.ifname], ['الجسر', br.name], ['الدليل', pt.evidence_source || '--']]
+          }));
+          currentConnections.push({ from: bid, to: pid, type: 'success', bps: 0 });
+        });
+      });
+      (topo.aps || []).forEach(function (ap) {
+        var aid = 'ap:' + ap.ifname;
+        validParentIds[aid] = true;
+        colPorts.appendChild(makeNode({
+          id: aid,
+          type: 'router',
+          role: 'ap',
+          icon: 'ap',
+          title: 'نقطة وصول ' + (ap.ssid || ap.ifname),
+          badge: ap.observed_up ? 'نشط' : (ap.configured_disabled ? 'معطّل' : 'غير نشط'),
+          stateClass: ap.observed_up ? 'active' : 'disabled',
+          lines: [
+            { text: ap.ifname + (ap.radio ? (' | ' + ap.radio) : ''), mono: true },
+            { text: 'المصدر: ' + (ap.evidence_source || 'uci_only'), mono: true }
+          ],
+          footLabel: 'البث',
+          footVal: ap.observed_up ? 'مفعّل فعلياً' : 'غير نشط فعلياً',
+          details: [['الواجهة', ap.ifname], ['SSID', ap.ssid || '--'], ['الدليل', ap.evidence_source || '--']]
+        }));
+        currentConnections.push({ from: 'topo-router', to: aid, type: 'success', bps: 0 });
+      });
+    } else if (!isLive) {
+      validParentIds['topo-ap'] = true;
+      colPorts.appendChild(makeNode({
+        id: 'topo-ap',
+        type: 'router',
+        role: 'ap',
+        icon: 'ap',
+        simKey: 'ap',
+        deviceIp: '192.168.1.10',
+        title: 'نقطة الوصول (محاكاة)',
+        badge: apUp ? fmtBps(simState.ap ? 15000000 : 0) : 'مغلق',
+        stateClass: apUp ? 'active' : 'disabled',
+        lines: [
+          { text: 'Access-Point | 192.168.1.10', mono: true },
+          { text: 'الموزع الرئيسي لأجهزة الشبكة اللاسلكية' }
+        ],
+        footLabel: 'التدفق',
+        footVal: fmtBps(apUp ? 15000000 : 0),
+        details: [['الجهاز', 'Access Point (Demo)'], ['IP', '192.168.1.10']]
+      }));
+      currentConnections.push({ from: 'topo-router', to: 'topo-ap', type: 'success', bps: apUp ? 15000000 : 0 });
       colPorts.appendChild(makeNode({
         id: 'topo-ha',
         type: 'device',
@@ -556,13 +677,15 @@
     var search = (qs('topoDeviceSearch') ? qs('topoDeviceSearch').value : '').toLowerCase().trim();
     var filter = qs('topoDeviceFilter') ? qs('topoDeviceFilter').value : 'online';
     var rawClients = [];
-    if (isLive && cl && cl.clients) {
+    if (isLive && topo && Array.isArray(topo.clients)) {
+      rawClients = topo.clients.slice();
+    } else if (isLive && cl && cl.clients) {
       rawClients = cl.clients.slice();
-    } else {
+    } else if (!isLive) {
       rawClients = [
-        { display_name: 'Workstation-01', ip: '192.168.1.50', mac: '02:00:00:00:00:50', online: true, blocked: false, rate_limit_kbps: 0, total_rx_bytes: 250000000, total_tx_bytes: 40000000 },
-        { display_name: 'Mobile-Device', ip: '192.168.1.51', mac: '02:00:00:00:00:51', online: true, blocked: false, rate_limit_kbps: 0, total_rx_bytes: 95000000, total_tx_bytes: 15000000 },
-        { display_name: 'IoT-Sensor', ip: '192.168.1.52', mac: '02:00:00:00:00:52', online: true, blocked: false, rate_limit_kbps: 0, total_rx_bytes: 2200000, total_tx_bytes: 800000 }
+        { display_name: 'Workstation-01', ip: '192.168.1.50', mac: '02:00:00:00:00:50', online: true, blocked: false, rate_limit_kbps: 0, total_rx_bytes: 250000000, total_tx_bytes: 40000000, parent_id: 'topo-ap', attachment_type: 'wireless', evidence_source: 'sim' },
+        { display_name: 'Mobile-Device', ip: '192.168.1.51', mac: '02:00:00:00:00:51', online: true, blocked: false, rate_limit_kbps: 0, total_rx_bytes: 95000000, total_tx_bytes: 15000000, parent_id: 'topo-ap', attachment_type: 'wireless', evidence_source: 'sim' },
+        { display_name: 'IoT-Sensor', ip: '192.168.1.52', mac: '02:00:00:00:00:52', online: true, blocked: false, rate_limit_kbps: 0, total_rx_bytes: 2200000, total_tx_bytes: 800000, parent_id: 'topo-ap', attachment_type: 'wireless', evidence_source: 'sim' }
       ];
     }
 
@@ -578,11 +701,11 @@
     var onlineTotal = 0;
     var simTotalBps = 0;
     filtered.forEach(function (c, idx) {
-      var devUp = apUp && c.online && !c.blocked;
+      var devUp = (!isLive ? apUp : true) && c.online && !c.blocked && !c.stale;
       if (devUp) onlineTotal++;
       var nid = 'topo-dev-' + idx;
-      var stCls = c.blocked ? 'broken' : (devUp ? 'active' : 'disabled');
-      var badge = c.blocked ? 'محجوب' : (devUp ? 'متصل' : 'غير متصل');
+      var stCls = c.blocked ? 'broken' : (c.stale ? 'disabled' : (devUp ? 'active' : 'disabled'));
+      var badge = c.blocked ? 'محجوب' : (c.stale ? 'بيانات قديمة' : (devUp ? 'متصل' : 'غير متصل'));
       var backendBps = (c.rate_supported && c.rx_bps != null && c.tx_bps != null) ? (Number(c.rx_bps) + Number(c.tx_bps)) : null;
       var instBps = devUp ? (isLive ? backendBps : (simSpeeds[c.ip] || 0)) : 0;
       var rateText = devUp
@@ -607,19 +730,23 @@
           { text: (c.ip || '--') + ' | ' + (c.mac || '--'), mono: true },
           { text: fmtBytes(c.total_rx_bytes || 0) + ' / ' + fmtBytes(c.total_tx_bytes || 0), mono: true }
         ],
-        footLabel: c.rate_limit_kbps > 0 ? ('محدود ' + c.rate_limit_kbps + ' Kbps') : 'السرعة اللحظية',
+        footLabel: c.rate_limit_kbps > 0 ? ('محدود ' + c.rate_limit_kbps + ' Kbps') : ('الدليل: ' + (c.evidence_source || 'none')),
         footVal: rateText,
         details: [
           ['الاسم', c.display_name || '--'],
           ['IP', c.ip || '--'],
           ['MAC', c.mac || '--'],
+          ['الارتباط', c.attachment_type || 'unknown'],
+          ['مصدر الدليل', c.evidence_source || 'none'],
           ['السرعة اللحظية', rateText],
           ['التنزيل الكلي', fmtBytes(c.total_rx_bytes || 0)],
           ['الرفع الكلي', fmtBytes(c.total_tx_bytes || 0)],
           ['الحد', c.rate_limit_kbps > 0 ? (c.rate_limit_kbps + ' Kbps') : 'غير مقيد']
         ]
       }));
-      currentConnections.push({ from: 'topo-ap', to: nid, type: c.rate_limit_kbps > 0 ? 'warn' : 'success', bps: instBps });
+      if (c.parent_id && validParentIds[c.parent_id]) {
+        currentConnections.push({ from: c.parent_id, to: nid, type: c.rate_limit_kbps > 0 ? 'warn' : 'success', bps: instBps });
+      }
     });
 
     if (filtered.length === 0) {
@@ -652,17 +779,36 @@
   }
 
   async function pollTopologyClients() {
-    if (mode !== 'live' || document.hidden) return;
+    if (mode !== 'live' || document.hidden || pollInFlight) return;
     if (!window.NOC || !window.NOC.state || window.NOC.state.activeTab !== 'topology') return;
     if (!window.NOC.state.authenticated || !window.NOC.apiCall) return;
+    pollInFlight = true;
     try {
-      var r = await window.NOC.apiCall('clients', { skipSeqCheck: true, keepInFlight: true });
-      if (r && r.ok && r.data) {
-        window.NOC.state.lastClients = r.data;
-        updateClientSpeeds(r.data);
-        renderTree();
+      var r = await window.NOC.apiCall('topology', { skipSeqCheck: true, keepInFlight: true });
+      if (r && r.ok && r.data && r.data.completeness !== 'unavailable') {
+        topologyRefreshFailed = false;
+        window.NOC.state.lastTopology = r.data;
+        window.NOC.state.lastClients = { clients: r.data.clients || [] };
+      } else {
+        topologyRefreshFailed = true;
+        if (window.NOC.state.lastTopology) {
+          window.NOC.state.lastTopology.stale = true;
+          window.NOC.state.lastTopology.refresh_failed = true;
+        } else if (r && r.data) {
+          window.NOC.state.lastTopology = r.data;
+        }
       }
-    } catch (e) {}
+      renderTree();
+    } catch (e) {
+      topologyRefreshFailed = true;
+      if (window.NOC.state.lastTopology) {
+        window.NOC.state.lastTopology.stale = true;
+        window.NOC.state.lastTopology.refresh_failed = true;
+      }
+      renderTree();
+    } finally {
+      pollInFlight = false;
+    }
   }
 
   function setMode(next) {
