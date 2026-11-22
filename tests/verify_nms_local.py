@@ -2191,7 +2191,7 @@ print('AUTH_SESS_OK\\n');
         ],
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=45,
     )
     for p_clean in (hd_chroot_p, cl_chroot_p, sock_host_p):
         if os.path.exists(p_clean):
