@@ -272,7 +272,7 @@ def main():
                 open(luci_s, "w").write("LUCI_MIG_2410\n")
 
                 shutil.copytree(REPO_ROOT, os.path.join(sb_mig, "tmp/nms_src"), ignore=shutil.ignore_patterns(".git", "__pycache__"))
-                r_leg = chroot_run(sb_mig, "NMS_SKIP_PKG_INSTALL=1 NMS_SKIP_SERVICE_START=1 /tmp/nms_src/scripts/install.sh --allow-insecure-lan-http")
+                r_leg = chroot_run(sb_mig, "NMS_SKIP_PKG_INSTALL=1 NMS_SKIP_CHOWN=1 NMS_SKIP_SERVICE_START=1 /tmp/nms_src/scripts/install.sh --allow-insecure-lan-http")
                 etc_m = os.path.join(sb_mig, "etc/noc-console")
                 open(os.path.join(etc_m, "tls.crt"), "w").write("LEGACY_CERT_2410\n")
                 open(os.path.join(etc_m, "tls.key"), "w").write("LEGACY_KEY_2410\n")
@@ -394,7 +394,7 @@ def main():
                 os.makedirs(os.path.dirname(luci_s), exist_ok=True)
                 open(luci_s, "w").write("LUCI_MIG_2512\n")
                 shutil.copytree(REPO_ROOT, os.path.join(sb_mig, "tmp/nms_src"), ignore=shutil.ignore_patterns(".git", "__pycache__"))
-                r_leg = chroot_run(sb_mig, "NMS_SKIP_PKG_INSTALL=1 NMS_SKIP_SERVICE_START=1 /tmp/nms_src/scripts/install.sh --allow-insecure-lan-http")
+                r_leg = chroot_run(sb_mig, "NMS_SKIP_PKG_INSTALL=1 NMS_SKIP_CHOWN=1 NMS_SKIP_SERVICE_START=1 /tmp/nms_src/scripts/install.sh --allow-insecure-lan-http")
                 etc_m = os.path.join(sb_mig, "etc/noc-console")
                 open(os.path.join(etc_m, "tls.crt"), "w").write("LEGACY_CERT_2512\n")
                 open(os.path.join(etc_m, "tls.key"), "w").write("LEGACY_KEY_2512\n")

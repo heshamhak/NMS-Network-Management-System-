@@ -529,7 +529,7 @@ def test_in_chroot_lifecycle(rootfs_dir, ver_label):
         os.chmod(runner_in, 0o755)
 
         def run_in_openwrt(cmd_args, extra_env=None):
-            env_prefix = "NMS_SKIP_PKG_INSTALL=1 NMS_SKIP_SERVICE_START=1 NMS_SERVICE_RUNNER=/tmp/svc_runner.sh"
+            env_prefix = "NMS_SKIP_PKG_INSTALL=1 NMS_SKIP_CHOWN=1 NMS_SKIP_SERVICE_START=1 NMS_SERVICE_RUNNER=/tmp/svc_runner.sh"
             if extra_env:
                 for k, v in extra_env.items():
                     env_prefix += f" {k}={v}"

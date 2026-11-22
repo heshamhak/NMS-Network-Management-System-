@@ -17,6 +17,7 @@ done
 ROOT_PREFIX="${NMS_ROOT_PREFIX:-}"
 SKIP_SERVICE_START="${NMS_SKIP_SERVICE_START:-0}"
 SKIP_PKG_INSTALL="${NMS_SKIP_PKG_INSTALL:-0}"
+SKIP_CHOWN="${NMS_SKIP_CHOWN:-0}"
 FAIL_POINT="${NMS_TEST_FAIL_POINT:-}"
 SERVICE_RUNNER="${NMS_SERVICE_RUNNER:-}"
 
@@ -362,7 +363,7 @@ if ! grep -q '^noc-api:' "$PASSWD_FILE" 2>/dev/null; then
   echo "noc-api:x:${UID_NUM}:${NOC_GID:-65001}:NMS API Daemon:/tmp/noc-console:/bin/false" >> "$PASSWD_FILE"
 fi
 
-if [ -z "$ROOT_PREFIX" ] && [ "$SKIP_PKG_INSTALL" -ne 1 ]; then
+if [ -z "$ROOT_PREFIX" ] && [ "$SKIP_CHOWN" -ne 1 ]; then
   chown -R noc-api:noc-api "$RUN_DIR"
 fi
 
