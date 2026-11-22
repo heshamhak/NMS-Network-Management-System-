@@ -14,9 +14,9 @@
 ---
 
 ## الأنظمة والمتطلبات المدعومة (Supported Systems & Requirements)
-* **النظام المستهدف:** أنظمة التوجيه المبنية على Linux التي تعتمد على `procd` و`ubus` و`uci` وجدار الحماية `nftables` (`fw4`).
-* **المعماريات المدعومة:** `x86_64` و`ARM64` و`ARMv7` (ومختلف المعماريات التي يتوفر لها `ucode`).
-* **الحزم المطلوبة:** `ucode` مع الوحدات (`fs`, `ubus`, `uci`, `socket`, `math`, `struct`) — ويقوم `install.sh` بتثبيتها تلقائياً عبر `apk` أو `opkg`.
+* **النظام المستهدف:** أنظمة OpenWrt (`24.10.0` بمدير الحزم `opkg` و`25.12.6` بمدير الحزم `apk`) المبنية على `procd` و`ubus` و`uci` و`nftables` (`fw4`).
+* **المعماريات المدعومة:** `noarch` / `all` (خالي تماماً من الملفات التنفيذية الثنائية ELF — يعمل على `x86_64` و`ARM64` و`ARMv7` وأي معمارية تدعم `ucode`).
+* **الحزم المطلوبة:** `ucode` مع الوحدات (`fs`, `ubus`, `uci`, `socket`, `math`, `struct`, `uloop`, `digest`) — وتُعرّف كتبعيات رسمية في حزمة OpenWrt أو تُثبّت عبر `scripts/install.sh`.
 * **التكاملات الاختيارية:** `AdGuard Home`، `SQM / CAKE`، `Tailscale VPN`، `banIP`، `Docker`.
 
 ---
@@ -67,39 +67,68 @@ sh scripts/uninstall.sh --purge  # إزالة كاملة شاملة للإعدا
 ```text
 nms-opensource/
 ├── backend/
-│   ├── noc-apid          # خادم HTTP/API/SSE وإدارة الجلسات (ucode)
-│   └── noc-helperd       # محرك التنفيذ النظامي المعزول (ucode)
+│   ├── noc-apid             # خادم HTTP/API/SSE وإدارة الجلسات (ucode)
+│   ├── noc-helperd          # محرك التنفيذ النظامي المعزول (ucode)
+│   ├── nms_archive.uc       # تدقيق الأرشيف والاستعادة الآمنة (Whitelist & UCI)
+│   ├── nms_network.uc       # إدارة الشبكة وVLAN وDSA وIPv6
+│   ├── nms_fw_wifi.uc       # جدار الحماية fw4 واللاسلكي iw/hostapd
+│   ├── nms_discovery.uc     # اكتشاف الأجهزة المتصلة الموحد
+│   ├── nms_clients.uc       # الحصص والجداول الزمنية وحظر العملاء
+│   ├── nms_access_dhcp.uc   # صلاحيات RBAC وتشديد DHCP
+│   ├── nms_sqm.uc           # تشكيل الحركة SQM / CAKE والتحقق من tc
+│   └── nms_topology.uc      # محرك بناء شجرة الشبكة الحية
 ├── frontend/
-│   ├── index.html        # الهيكل الرئيسي للواجهة (RTL + CSP strict)
-│   ├── styles.css        # نظام الألوان والتصميم (Soft Light-Black + Blue)
-│   ├── app.js            # وحدة التحكم الرئيسية وتحديث DOM
-│   ├── noc-topology.js   # محرك شجرة المسارات الحية التفاعلية
-│   ├── noc-search.js     # البحث الشامل ولوحة الأوامر (Ctrl+K)
-│   ├── noc-tools.js      # أدوات الفرز والتصفية والبحث في الجداول
-│   ├── netchart.js       # محرك الرسوم البيانية المخصصة
-│   ├── nms-i18n.js       # محرك الترجمة الثنائي (العربية / الإنجليزية)
-│   ├── manifest.json     # بيانات تطبيق الويب التقدمي (PWA)
-│   └── sw.js             # Service Worker للتخزين المؤقت
+│   ├── index.html           # الهيكل الرئيسي للواجهة (RTL + CSP strict)
+│   ├── styles.css           # نظام الألوان والتصميم (Soft Light-Black + Blue)
+│   ├── app.js               # وحدة التحكم الرئيسية وتحديث DOM
+│   ├── noc-topology.js      # محرك شجرة المسارات الحية التفاعلية
+│   ├── noc-search.js        # البحث الشامل ولوحة الأوامر (Ctrl+K)
+│   ├── noc-tools.js         # أدوات الفرز والتصفية والبحث في الجداول
+│   ├── netchart.js          # محرك الرسوم البيانية المخصصة
+│   ├── nms-i18n.js          # محرك الترجمة الثنائي (العربية / الإنجليزية)
+│   ├── manifest.json        # بيانات تطبيق الويب التقدمي (PWA)
+│   └── sw.js                # Service Worker للتخزين المؤقت
+├── packaging/openwrt/
+│   └── Makefile             # تعريف حزمة OpenWrt الرسمية (opkg / apk)
 ├── init.d/
-│   ├── noc-helperd       # سكربت تشغيل الخدمة المساعدة
-│   └── noc-apid          # سكربت تشغيل خادم الواجهة
+│   ├── noc-helperd          # سكربت تشغيل الخدمة المساعدة
+│   └── noc-apid             # سكربت تشغيل خادم الواجهة
 ├── schemas/
-│   └── noc_schemas.json  # عقود التحقق من البيانات والـ API
+│   └── noc_schemas.json     # عقود التحقق من البيانات والـ API
 ├── scripts/
-│   ├── install.sh        # المثبّت التلقائي
-│   └── uninstall.sh      # أداة الإزالة النظيفة
+│   ├── install.sh           # المثبّت التلقائي مع التراجع التلقائي
+│   ├── uninstall.sh         # أداة الإزالة النظيفة
+│   ├── build_packages.py    # أداة بناء حزم .ipk و .apk الأصلية
+│   └── run_ci_local.sh      # مشغّل منظومة الاختبارات الكاملة (بدون تخطي)
+├── ci/
+│   └── github-actions-ci.yml # قالب مسار GitHub Actions CI
 ├── tests/
-│   └── verify_noc_p15.py # اختبارات التحقق والأمان والتباين
-└── LICENSE               # رخصة MIT
+│   ├── verify_noc_p15.py        # اختبارات CSP وتباين WCAG والمخطط
+│   ├── verify_nms_local.py      # الاختبارات المحلية وتكامل DOM وAPI
+│   ├── verify_phase3d_compat.py # اختبارات التوافق في chroot (24.10 & 25.12.6)
+│   ├── verify_phase5a_pkg.py    # اختبارات تغليف وتوقيع وترحيل ipk/apk
+│   ├── verify_phase5c_ui.py     # اختبارات RBAC وفصل التحقق/الاستعادة وSSE
+│   └── verify_phase*_ucode.uc   # اختبارات وحدات ucode الإنتاجية (3A–5B)
+└── LICENSE                  # رخصة MIT
 ```
 
 ---
 
 ## التطوير والاختبار (Development & Testing)
-لتشغيل اختبارات التحقق والأمان وتباين الألوان محلياً:
+لتشغيل منظومة الاختبارات الكاملة (المحلية + التوافق على OpenWrt `24.10.0` و`25.12.6` + التغليف + الواجهة):
+
+```sh
+sh scripts/run_ci_local.sh
+```
+
+أو تشغيل كل مجموعة اختبارية على حدة:
 
 ```sh
 python3 tests/verify_noc_p15.py
+python3 tests/verify_nms_local.py
+python3 tests/verify_phase3d_compat.py
+python3 tests/verify_phase5a_pkg.py
+python3 tests/verify_phase5c_ui.py
 ```
 
 ---

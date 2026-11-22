@@ -148,6 +148,54 @@
           "items": { "$ref": "#/$defs/ErrorItem" }
         }
       }
+    },
+    "BackupValidateResponse": {
+      "type": "object",
+      "required": ["ok", "valid", "sha256", "entries_count", "errors"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "valid": { "type": "boolean" },
+        "sha256": { "type": "string" },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "entries_count": { "type": "integer", "minimum": 0 },
+        "entries": { "type": "array", "items": { "type": "string" } },
+        "errors": { "type": "array", "items": { "type": "string" } },
+        "message_ar": { "type": "string" }
+      }
+    },
+    "BackupRestoreRequest": {
+      "type": "object",
+      "properties": {
+        "archive_b64": { "type": "string" },
+        "expected_sha256": { "type": "string", "pattern": "^([a-fA-F0-9]{64})?$" },
+        "configs": { "type": "object" }
+      }
+    },
+    "BackupRestoreResponse": {
+      "type": "object",
+      "required": ["ok", "message_ar"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "sha256": { "type": "string" },
+        "applied_count": { "type": "integer", "minimum": 0 },
+        "restored_sections": { "type": "array", "items": { "type": "string" } },
+        "reloaded_services": { "type": "array", "items": { "type": "string" } },
+        "error_code": { "type": "string" },
+        "errors": { "type": "array", "items": { "type": "string" } },
+        "message_ar": { "type": "string" }
+      }
+    },
+    "TopologyResponse": {
+      "type": "object",
+      "required": ["status", "stale", "wan_links", "bridges", "clients"],
+      "properties": {
+        "status": { "type": "string", "enum": ["complete", "partial", "stale", "unavailable"] },
+        "stale": { "type": "boolean" },
+        "refresh_failed": { "type": "boolean" },
+        "wan_links": { "type": "array", "items": { "type": "object" } },
+        "bridges": { "type": "array", "items": { "type": "object" } },
+        "clients": { "type": "array", "items": { "type": "object" } }
+      }
     }
   }
 }

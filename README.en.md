@@ -14,9 +14,9 @@
 ---
 
 ## Supported Systems & Requirements
-* **Target OS:** Linux-based routing systems using `procd`, `ubus`, `uci`, and `nftables` (`fw4`).
-* **Supported Architectures:** `x86_64`, `ARM64`, `ARMv7` (any architecture supported by `ucode`).
-* **Required Packages:** `ucode` with modules (`fs`, `ubus`, `uci`, `socket`, `math`, `struct`) — automatically installed by `scripts/install.sh` via `apk` or `opkg`.
+* **Target OS:** OpenWrt (`24.10.0` with `opkg` and `25.12.6` with `apk`) using `procd`, `ubus`, `uci`, and `nftables` (`fw4`).
+* **Supported Architectures:** `noarch` / `all` (zero ELF binaries — portable across `x86_64`, `ARM64`, `ARMv7`, and any `ucode`-capable target).
+* **Required Packages:** `ucode` with modules (`fs`, `ubus`, `uci`, `socket`, `math`, `struct`, `uloop`, `digest`) — declared as package dependencies or installed via `scripts/install.sh`.
 * **Optional Integrations:** `AdGuard Home`, `SQM / CAKE`, `Tailscale VPN`, `banIP`, `Docker`.
 
 ---
@@ -67,39 +67,68 @@ sh scripts/uninstall.sh --purge  # Full removal including config and credentials
 ```text
 NMS-Network-Management-System-/
 ├── backend/
-│   ├── noc-apid          # HTTP/API/SSE server & session manager (ucode)
-│   └── noc-helperd       # Privilege-separated system executor (ucode)
+│   ├── noc-apid             # HTTP/API/SSE server & session manager (ucode)
+│   ├── noc-helperd          # Privilege-separated system executor (ucode)
+│   ├── nms_archive.uc       # Archive validation & transactional backup restore
+│   ├── nms_network.uc       # Network, VLAN, DSA & IPv6 management
+│   ├── nms_fw_wifi.uc       # Firewall fw4 & wireless iw/hostapd validation
+│   ├── nms_discovery.uc     # Unified client & bridge discovery
+│   ├── nms_clients.uc       # Per-client quotas, schedules & nftables rules
+│   ├── nms_access_dhcp.uc   # RBAC enforcement & transactional DHCP hardening
+│   ├── nms_sqm.uc           # SQM / CAKE shaping & tc verification
+│   └── nms_topology.uc      # Evidence-driven live topology engine
 ├── frontend/
-│   ├── index.html        # Main UI shell (strict CSP)
-│   ├── styles.css        # Design tokens & RTL/LTR layout
-│   ├── app.js            # Core frontend controller & DOM patching
-│   ├── noc-topology.js   # Interactive live topology tree engine
-│   ├── noc-search.js     # Global search & command palette (Ctrl+K)
-│   ├── noc-tools.js      # Table sorting, filtering & section collapsers
-│   ├── netchart.js       # Custom lightweight throughput charts
-│   ├── nms-i18n.js       # Bilingual translation engine (EN / AR)
-│   ├── manifest.json     # PWA manifest
-│   └── sw.js             # Service Worker cache controller
+│   ├── index.html           # Main UI shell (strict CSP)
+│   ├── styles.css           # Design tokens & RTL/LTR layout
+│   ├── app.js               # Core frontend controller & DOM patching
+│   ├── noc-topology.js      # Interactive live topology tree engine
+│   ├── noc-search.js        # Global search & command palette (Ctrl+K)
+│   ├── noc-tools.js         # Table sorting, filtering & section collapsers
+│   ├── netchart.js          # Custom lightweight throughput charts
+│   ├── nms-i18n.js          # Bilingual translation engine (EN / AR)
+│   ├── manifest.json        # PWA manifest
+│   └── sw.js                # Service Worker cache controller
+├── packaging/openwrt/
+│   └── Makefile             # Official OpenWrt package definition (opkg / apk)
 ├── init.d/
-│   ├── noc-helperd       # Helper daemon init script
-│   └── noc-apid          # API daemon init script
+│   ├── noc-helperd          # Helper daemon init script
+│   └── noc-apid             # API daemon init script
 ├── schemas/
-│   └── noc_schemas.json  # API & telemetry schema contracts
+│   └── noc_schemas.json     # API, backup/restore & telemetry schema contracts
 ├── scripts/
-│   ├── install.sh        # One-command installer
-│   └── uninstall.sh      # Clean uninstaller
+│   ├── install.sh           # Transactional installer with automatic rollback
+│   ├── uninstall.sh         # Clean uninstaller
+│   ├── build_packages.py    # Native .ipk & .apk package builder
+│   └── run_ci_local.sh      # Full CI verification runner (fails on any skip/failure)
+├── ci/
+│   └── github-actions-ci.yml # GitHub Actions CI workflow template
 ├── tests/
-│   └── verify_noc_p15.py # Security, schema & WCAG contrast verification suite
-└── LICENSE               # MIT License
+│   ├── verify_noc_p15.py        # Security, CSP, schema & WCAG contrast checks
+│   ├── verify_nms_local.py      # Local verification, DOM & API integration tests
+│   ├── verify_phase3d_compat.py # Isolated OpenWrt 24.10.0 & 25.12.6 chroot suites
+│   ├── verify_phase5a_pkg.py    # Signed .ipk/.apk lifecycle & migration tests
+│   ├── verify_phase5c_ui.py     # Frontend RBAC, validate/restore separation & SSE tests
+│   └── verify_phase*_ucode.uc   # Production ucode module suites (Phases 3A–5B)
+└── LICENSE                  # MIT License
 ```
 
 ---
 
 ## Development & Testing
-Run the verification suite locally:
+Run the complete verification pipeline (local + dual OpenWrt chroots + packaging + UI):
+
+```sh
+sh scripts/run_ci_local.sh
+```
+
+Or run individual suites:
 
 ```sh
 python3 tests/verify_noc_p15.py
+python3 tests/verify_nms_local.py
+python3 tests/verify_phase3d_compat.py
+python3 tests/verify_phase5a_pkg.py
+python3 tests/verify_phase5c_ui.py
 ```
 
 ---
