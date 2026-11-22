@@ -40,7 +40,15 @@
 
         <div class="form-group">
           <label for="authPassInput" id="authPassLabel">كلمة المرور</label>
-          <input id="authPassInput" type="password" class="form-input" placeholder="12 حرفاً على الأقل" autocomplete="current-password" required />
+          <div class="password-input-wrap">
+            <input id="authPassInput" type="password" class="form-input" placeholder="12 حرفاً على الأقل" autocomplete="current-password" required />
+            <button type="button" id="authPassToggle" class="btn-pass-toggle" aria-label="إظهار كلمة المرور" aria-pressed="false" title="إظهار / إخفاء كلمة المرور">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                <circle cx="12" cy="12" r="3"></circle>
+              </svg>
+            </button>
+          </div>
         </div>
 
         <div id="authTotpGroup" class="form-group hidden">

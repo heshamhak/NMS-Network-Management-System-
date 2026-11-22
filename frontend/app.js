@@ -417,6 +417,12 @@
     const errBox = qs('authErrorBox');
     errBox.classList.add('hidden');
     const pw = qs('authPassInput').value || '';
+    if (qs('authPassInput').type === 'text') {
+      qs('authPassInput').type = 'password';
+      if (qs('authPassToggle')) {
+        qs('authPassToggle').setAttribute('aria-pressed', 'false');
+      }
+    }
 
     if (!state.initialized) {
       const tok = (qs('bootstrapTokenInput').value || '').trim();
@@ -2424,6 +2430,16 @@
 
   // --- Event Listener Wiring (Zero Inline Attributes) ---
   function initListeners() {
+    if (qs('authPassToggle') && qs('authPassInput')) {
+      qs('authPassToggle').addEventListener('click', function () {
+        const inp = qs('authPassInput');
+        const btn = qs('authPassToggle');
+        const show = inp.type === 'password';
+        inp.type = show ? 'text' : 'password';
+        btn.setAttribute('aria-pressed', show ? 'true' : 'false');
+        btn.setAttribute('aria-label', show ? 'إخفاء كلمة المرور' : 'إظهار كلمة المرور');
+      });
+    }
     qs('authForm').addEventListener('submit', handleAuthSubmit);
 
     qs('btnLogout').addEventListener('click', async () => {
