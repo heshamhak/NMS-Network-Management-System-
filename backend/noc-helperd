@@ -4963,16 +4963,12 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 		let eff = compute_current_effective_rules(null, quotas, null);
 		apply_bridge_block_rules(eff, function(ar) {
 			if (!ar.ok) {
-				let rb_aw = atomic_write(qpath, snap_raw, 0o600);
-				if (!rb_aw.ok) {
-					let fr = enter_emergency_freeze('client_quota_set rollback failed');
+				let prev_eff = compute_current_effective_rules(null, prev_quotas, null);
+				let rb_deps = { atomic_write: atomic_write, lstat: fs.lstat, readfile: fs.readfile, apply_rules: apply_bridge_block_rules, enter_emergency_freeze: enter_emergency_freeze, audit_append: audit_append };
+				nms_clients.rollback_client_policy_file(qpath, snap_raw, prev_eff, actor, 'client_quota_set', v.mac, rb_deps, function(res) {
+					if (res.rolled_back) last_effective_rules_sig = prev_eff.signature;
 					release_lock();
-					reply_cb({ ok: false, error_code: 'INTERNAL', rollback_failed: true, freeze_persisted: fr.freeze_persisted, message_ar: 'فشل حرج: تعذر التراجع عن الحصة — تم تجميد التعديلات' });
-					return;
-				}
-				apply_bridge_block_rules(compute_current_effective_rules(null, prev_quotas, null), function() {
-					release_lock();
-					reply_cb({ ok: false, error_code: 'INTERNAL', rolled_back: true, message_ar: 'تعذر تطبيق سياسة الحصة وتم التراجع تلقائياً' });
+					reply_cb(res);
 				});
 				return;
 			}
@@ -5005,16 +5001,12 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 		let eff = compute_current_effective_rules(null, null, scheds);
 		apply_bridge_block_rules(eff, function(ar) {
 			if (!ar.ok) {
-				let rb_aw = atomic_write(spath, snap_raw, 0o600);
-				if (!rb_aw.ok) {
-					let fr = enter_emergency_freeze('schedule_action_set rollback failed');
+				let prev_eff = compute_current_effective_rules(null, null, prev_scheds);
+				let rb_deps = { atomic_write: atomic_write, lstat: fs.lstat, readfile: fs.readfile, apply_rules: apply_bridge_block_rules, enter_emergency_freeze: enter_emergency_freeze, audit_append: audit_append };
+				nms_clients.rollback_client_policy_file(spath, snap_raw, prev_eff, actor, 'schedule_action_set', v.mac, rb_deps, function(res) {
+					if (res.rolled_back) last_effective_rules_sig = prev_eff.signature;
 					release_lock();
-					reply_cb({ ok: false, error_code: 'INTERNAL', rollback_failed: true, freeze_persisted: fr.freeze_persisted, message_ar: 'فشل حرج: تعذر التراجع عن الجدولة — تم تجميد التعديلات' });
-					return;
-				}
-				apply_bridge_block_rules(compute_current_effective_rules(null, null, prev_scheds), function() {
-					release_lock();
-					reply_cb({ ok: false, error_code: 'INTERNAL', rolled_back: true, message_ar: 'تعذر تطبيق الجدولة وتم التراجع تلقائياً' });
+					reply_cb(res);
 				});
 				return;
 			}
@@ -5050,16 +5042,12 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 		let eff = compute_current_effective_rules(null, null, next_scheds);
 		apply_bridge_block_rules(eff, function(ar) {
 			if (!ar.ok) {
-				let rb_aw = atomic_write(spath, snap_raw, 0o600);
-				if (!rb_aw.ok) {
-					let fr = enter_emergency_freeze('schedule_action_delete rollback failed');
+				let prev_eff = compute_current_effective_rules(null, null, prev_scheds);
+				let rb_deps = { atomic_write: atomic_write, lstat: fs.lstat, readfile: fs.readfile, apply_rules: apply_bridge_block_rules, enter_emergency_freeze: enter_emergency_freeze, audit_append: audit_append };
+				nms_clients.rollback_client_policy_file(spath, snap_raw, prev_eff, actor, 'schedule_action_delete', sid != '' ? sid : mac, rb_deps, function(res) {
+					if (res.rolled_back) last_effective_rules_sig = prev_eff.signature;
 					release_lock();
-					reply_cb({ ok: false, error_code: 'INTERNAL', rollback_failed: true, freeze_persisted: fr.freeze_persisted, message_ar: 'فشل حرج: تعذر التراجع عن حذف الجدولة — تم تجميد التعديلات' });
-					return;
-				}
-				apply_bridge_block_rules(compute_current_effective_rules(null, null, prev_scheds), function() {
-					release_lock();
-					reply_cb({ ok: false, error_code: 'INTERNAL', rolled_back: true, message_ar: 'تعذر تحديث قواعد الجدولة وتم التراجع تلقائياً' });
+					reply_cb(res);
 				});
 				return;
 			}

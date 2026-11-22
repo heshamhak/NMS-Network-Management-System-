@@ -228,3 +228,32 @@ export function compute_effective_client_rules(manual_rules, quotas, schedules, 
 		signature: join('|', sig_parts)
 	};
 };
+
+export function rollback_client_policy_file(file_path, snap_raw, prev_eff, actor, verb, target_id, deps, cb) {
+	let rb_aw = deps.atomic_write(file_path, snap_raw, 0o600);
+	let st_r = deps.lstat(file_path);
+	let cur_r = deps.readfile(file_path);
+	let file_ok = !!(rb_aw && rb_aw.ok && st_r && st_r.type == 'file' && (st_r.mode & 0o7777) == 0o600 && cur_r == snap_raw);
+	deps.apply_rules(prev_eff, function(rb) {
+		let apply_ok = !!(rb && rb.ok);
+		let all_ok = file_ok && apply_ok;
+		let fr = null;
+		if (!all_ok) {
+			fr = deps.enter_emergency_freeze(verb + ' rollback failed');
+			deps.audit_append(actor, verb, target_id, 'rollback_failed', sprintf('file_ok=%s apply_ok=%s err=%s freeze_persisted=%s', file_ok ? '1' : '0', apply_ok ? '1' : '0', (rb_aw && rb_aw.error) || '', (fr && fr.freeze_persisted) ? '1' : '0'));
+		} else {
+			deps.audit_append(actor, verb, target_id, 'rolled_back', 'Persisted policy file and applied firewall state verified');
+		}
+		cb({
+			ok: false,
+			error_code: 'INTERNAL',
+			rolled_back: all_ok,
+			rollback_failed: !all_ok,
+			file_ok: file_ok,
+			apply_ok: apply_ok,
+			freeze_persisted: fr ? !!fr.freeze_persisted : false,
+			freeze_persist_failed: fr ? !!fr.freeze_persist_failed : false,
+			message_ar: all_ok ? 'تعذر تطبيق السياسة وتم التراجع تلقائياً والتحقق منه' : 'فشل حرج: تعذر التراجع عن السياسة — تم تجميد التعديلات'
+		});
+	});
+};

@@ -130,5 +130,41 @@ let tampered_m = { blocked_macs: { '60:be:b4:1e:d3:5d': true }, blocked_ips: { '
 let eff_gw = nms_clients.compute_effective_client_rules(tampered_m, {}, [], {}, ip_map, '12:00', gw_macs, gw_ips);
 check(!eff_gw.blocked_macs['60:be:b4:1e:d3:5d'] && !eff_gw.blocked_ips['192.168.1.1'] && eff_gw.rate_limits['192.168.1.1'] == null, 'P4C-EFF[gateway_never_blocked_or_throttled]');
 
+// 15-17. Rollback verification: firewall restore failure must NOT report rolled_back=true and must freeze & audit rollback_failed across all 3 verbs
+function run_rb_case(verb_name, file_ok_sim, fw_ok_sim) {
+	let store = {};
+	let freezes = [];
+	let audits = [];
+	let res_out = null;
+	let deps = {
+		atomic_write: function(p, data, mode) { store[p] = file_ok_sim ? data : 'CORRUPT'; return { ok: true }; },
+		lstat: function(p) { return { type: 'file', mode: 0o600 }; },
+		readfile: function(p) { return store[p]; },
+		apply_rules: function(eff, cb) { cb({ ok: fw_ok_sim }); },
+		enter_emergency_freeze: function(why) { push(freezes, why); return { freeze_persisted: true, freeze_persist_failed: false }; },
+		audit_append: function(a, v, t, st, det) { push(audits, { actor: a, verb: v, status: st, detail: det }); }
+	};
+	nms_clients.rollback_client_policy_file('/tmp/test.json', '{}\n', { signature: 'sig0' }, 'admin', verb_name, 'aa:bb:cc:dd:ee:01', deps, function(r) {
+		res_out = r;
+	});
+	return { res: res_out, freezes: freezes, audits: audits };
+}
+
+let q_fw_fail = run_rb_case('client_quota_set', true, false);
+let s_fw_fail = run_rb_case('schedule_action_set', true, false);
+let d_fw_fail = run_rb_case('schedule_action_delete', true, false);
+check(
+	q_fw_fail.res.rolled_back === false && q_fw_fail.res.rollback_failed === true && q_fw_fail.res.freeze_persisted === true && length(q_fw_fail.freezes) == 1 && q_fw_fail.audits[0].status == 'rollback_failed' &&
+	s_fw_fail.res.rolled_back === false && s_fw_fail.res.rollback_failed === true && s_fw_fail.res.freeze_persisted === true && length(s_fw_fail.freezes) == 1 && s_fw_fail.audits[0].status == 'rollback_failed' &&
+	d_fw_fail.res.rolled_back === false && d_fw_fail.res.rollback_failed === true && d_fw_fail.res.freeze_persisted === true && length(d_fw_fail.freezes) == 1 && d_fw_fail.audits[0].status == 'rollback_failed',
+	'P4C-RB[fw_restore_fail_triggers_freeze_across_all_3_verbs]'
+);
+
+let f_fail = run_rb_case('client_quota_set', false, true);
+check(f_fail.res.rolled_back === false && f_fail.res.rollback_failed === true && f_fail.res.file_ok === false && length(f_fail.freezes) == 1 && f_fail.audits[0].status == 'rollback_failed', 'P4C-RB[file_verify_fail_triggers_freeze]');
+
+let ok_rb = run_rb_case('schedule_action_set', true, true);
+check(ok_rb.res.rolled_back === true && ok_rb.res.rollback_failed === false && ok_rb.res.freeze_persisted === false && length(ok_rb.freezes) == 0 && ok_rb.audits[0].status == 'rolled_back', 'P4C-RB[verified_file_and_fw_succeeds]');
+
 printf('UCODE4C_SUMMARY: %d passed, %d failed\n', passed, failed);
 exit(failed == 0 ? 0 : 1);
