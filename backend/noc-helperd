@@ -11,6 +11,7 @@ import * as nms_network from '/usr/libexec/nms_network.uc';
 import * as nms_fw_wifi from '/usr/libexec/nms_fw_wifi.uc';
 import * as nms_discovery from '/usr/libexec/nms_discovery.uc';
 import * as nms_clients from '/usr/libexec/nms_clients.uc';
+import * as nms_access_dhcp from '/usr/libexec/nms_access_dhcp.uc';
 
 const ETC_DIR = getenv('NOC_ETC_DIR') || '/etc/noc-console';
 const RUN_DIR = getenv('NOC_RUN_DIR') || '/tmp/noc-console';
@@ -3585,8 +3586,14 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 			return;
 		}
 		let sid = 'noc_' + replace(v.mac, /:/g, '');
-		try {
-			let cur = uci.cursor();
+		let deps = {
+			uci_cursor: function() { return uci.cursor(); },
+			reload_dnsmasq: function(cb2) { exec_argv_async('/etc/init.d/dnsmasq', ['reload'], 8000, CAP_GENERAL, cb2); },
+			enter_emergency_freeze: enter_emergency_freeze,
+			audit_append: audit_append,
+			actor: actor, verb: 'client_static_lease', target_id: v.mac + '->' + v.ip, commit_detail: 'enable=' + enable
+		};
+		nms_access_dhcp.apply_dhcp_tx([{ cfg: 'dhcp', sid: sid }], function(cur) {
 			if (enable) {
 				cur.set('dhcp', sid, 'host');
 				cur.set('dhcp', sid, 'mac', v.mac);
@@ -3595,16 +3602,13 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 			} else {
 				cur.delete('dhcp', sid);
 			}
-			cur.commit('dhcp');
-		} catch (e) {
+		}, function(vcur) {
+			if (enable) return (vcur.get('dhcp', sid) == 'host' && lc(vcur.get('dhcp', sid, 'mac') || '') == v.mac && vcur.get('dhcp', sid, 'ip') == v.ip);
+			return !vcur.get('dhcp', sid);
+		}, deps, function(txr) {
 			release_lock();
-			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل تحديث إعدادات DHCP في النظام' });
-			return;
-		}
-		exec_argv_async('/etc/init.d/dnsmasq', ['reload'], 8000, CAP_GENERAL, function(r) {
-			release_lock();
-			audit_append(actor, 'client_static_lease', v.mac + '->' + v.ip, r.ok ? 'committed' : 'failed', 'enable=' + enable);
-			reply_cb({ ok: r.ok, message_ar: enable ? 'تم تثبيت عنوان IP الثابت للجهاز' : 'تم إلغاء تثبيت العنوان الثابت' });
+			if (txr.ok) reply_cb({ ok: true, message_ar: enable ? 'تم تثبيت عنوان IP الثابت للجهاز' : 'تم إلغاء تثبيت العنوان الثابت' });
+			else reply_cb(txr);
 		});
 		return;
 	}
@@ -4040,37 +4044,51 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 	}
 
 	if (verb == 'client_domain_add' || verb == 'client_domain_delete') {
+		let make_deps = function(vname, tid, detail) {
+			return {
+				uci_cursor: function() { return uci.cursor(); },
+				reload_dnsmasq: function(cb2) { exec_argv_async('/etc/init.d/dnsmasq', ['reload'], 8000, CAP_GENERAL, cb2); },
+				enter_emergency_freeze: enter_emergency_freeze,
+				audit_append: audit_append,
+				actor: actor, verb: vname, target_id: tid, commit_detail: detail
+			};
+		};
 		if (verb == 'client_domain_delete') {
 			let sid = trim(params.id || '');
 			if (!match(sid, /^[a-zA-Z0-9_-]+$/)) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معرف النطاق غير صالح' }); return; }
-			let cur = uci.cursor();
-			if (cur.get('dhcp', sid) != 'domain') { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'سجل النطاق غير موجود' }); return; }
-			cur.delete('dhcp', sid);
-			cur.commit('dhcp');
-			exec_argv_async('/etc/init.d/dnsmasq', ['reload'], 8000, CAP_GENERAL, function(r) {
+			let cur0 = uci.cursor();
+			if (cur0.get('dhcp', sid) != 'domain') { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'سجل النطاق غير موجود' }); return; }
+			nms_access_dhcp.apply_dhcp_tx([{ cfg: 'dhcp', sid: sid }], function(cur) {
+				cur.delete('dhcp', sid);
+			}, function(vcur) {
+				return !vcur.get('dhcp', sid);
+			}, make_deps('client_domain_delete', sid, 'Removed local domain'), function(txr) {
 				release_lock();
-				audit_append(actor, 'client_domain_delete', sid, r.ok ? 'committed' : 'failed', 'Removed local domain');
-				reply_cb({ ok: r.ok, message_ar: 'تم حذف النطاق المحلي بنجاح' });
+				reply_cb(txr.ok ? { ok: true, message_ar: 'تم حذف النطاق المحلي بنجاح' } : txr);
 			});
 			return;
 		}
-		let dname = trim(params.name || '');
-		let dip = trim(params.ip || '');
-		if (!is_valid_fqdn(dname) || is_blocked_rewrite_domain(dname) || !is_valid_ipv4(dip)) {
+		let existing_doms = [];
+		try {
+			let cur0 = uci.cursor();
+			cur0.foreach('dhcp', 'domain', function(s) { push(existing_doms, { name: s.name || '', ip: s.ip || '' }); });
+		} catch (e) {}
+		let vd = nms_access_dhcp.validate_local_domain_input(params.name, params.ip, existing_doms, is_valid_fqdn, is_blocked_rewrite_domain, is_valid_ipv4);
+		if (!vd.ok) {
 			release_lock();
-			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'اسم النطاق أو عنوان IP غير صالح' });
+			reply_cb({ ok: false, error_code: vd.error_code || 'VALIDATION', message_ar: vd.message_ar });
 			return;
 		}
 		let sid = 'noc_dom_' + urandom_hex(4);
-		let cur = uci.cursor();
-		cur.set('dhcp', sid, 'domain');
-		cur.set('dhcp', sid, 'name', dname);
-		cur.set('dhcp', sid, 'ip', dip);
-		cur.commit('dhcp');
-		exec_argv_async('/etc/init.d/dnsmasq', ['reload'], 8000, CAP_GENERAL, function(r) {
+		nms_access_dhcp.apply_dhcp_tx([{ cfg: 'dhcp', sid: sid }], function(cur) {
+			cur.set('dhcp', sid, 'domain');
+			cur.set('dhcp', sid, 'name', vd.name);
+			cur.set('dhcp', sid, 'ip', vd.ip);
+		}, function(vcur) {
+			return (vcur.get('dhcp', sid) == 'domain' && vcur.get('dhcp', sid, 'name') == vd.name && vcur.get('dhcp', sid, 'ip') == vd.ip);
+		}, make_deps('client_domain_add', vd.name + '->' + vd.ip, 'Added local domain'), function(txr) {
 			release_lock();
-			audit_append(actor, 'client_domain_add', dname + '->' + dip, r.ok ? 'committed' : 'failed', 'Added local domain');
-			reply_cb({ ok: r.ok, message_ar: 'تمت إضافة النطاق المحلي بنجاح' });
+			reply_cb(txr.ok ? { ok: true, message_ar: 'تمت إضافة النطاق المحلي بنجاح' } : txr);
 		});
 		return;
 	}
@@ -4078,48 +4096,57 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 	if (verb == 'client_lease_delete') {
 		let sid = trim(params.id || '');
 		if (!match(sid, /^[a-zA-Z0-9_-]+$/)) { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'معرف الحجز غير صالح' }); return; }
-		let cur = uci.cursor();
-		if (cur.get('dhcp', sid) != 'host') { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'حجز DHCP غير موجود' }); return; }
-		cur.delete('dhcp', sid);
-		cur.commit('dhcp');
-		exec_argv_async('/etc/init.d/dnsmasq', ['reload'], 8000, CAP_GENERAL, function(r) {
+		let cur0 = uci.cursor();
+		if (cur0.get('dhcp', sid) != 'host') { release_lock(); reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'حجز DHCP غير موجود' }); return; }
+		let deps = {
+			uci_cursor: function() { return uci.cursor(); },
+			reload_dnsmasq: function(cb2) { exec_argv_async('/etc/init.d/dnsmasq', ['reload'], 8000, CAP_GENERAL, cb2); },
+			enter_emergency_freeze: enter_emergency_freeze,
+			audit_append: audit_append,
+			actor: actor, verb: 'client_lease_delete', target_id: sid, commit_detail: 'Removed static DHCP lease'
+		};
+		nms_access_dhcp.apply_dhcp_tx([{ cfg: 'dhcp', sid: sid }], function(cur) {
+			cur.delete('dhcp', sid);
+		}, function(vcur) {
+			return !vcur.get('dhcp', sid);
+		}, deps, function(txr) {
 			release_lock();
-			audit_append(actor, 'client_lease_delete', sid, r.ok ? 'committed' : 'failed', 'Removed static DHCP lease');
-			reply_cb({ ok: r.ok, message_ar: 'تم حذف حجز IP الثابت بنجاح' });
+			reply_cb(txr.ok ? { ok: true, message_ar: 'تم حذف حجز IP الثابت بنجاح' } : txr);
 		});
 		return;
 	}
 
 	if (verb == 'network_save_dhcp') {
-		let st = +(params.start || 5);
-		let lim = +(params.limit || 31);
-		let ltime = trim(params.leasetime || '1h');
-		let rebind = params.rebind_protection !== false ? '1' : '0';
-		let csize = +(params.cachesize != null ? params.cachesize : 1000);
-		if (st < 2 || st > 250 || lim < 5 || lim > 250 || (st + lim) > 254 || !match(ltime, /^([0-9]{1,4}[hm]|infinite)$/) || csize < 0 || csize > 10000) {
+		let vp = nms_access_dhcp.validate_dhcp_pool_config(params);
+		if (!vp.ok) {
 			release_lock();
-			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'إعدادات خادم DHCP غير صالحة أو تتجاوز نطاق الشبكة' });
+			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: vp.message_ar });
 			return;
 		}
+		let dm_sid = '@dnsmasq[0]';
 		try {
-			let cur = uci.cursor();
-			cur.set('dhcp', 'lan', 'start', '' + int(st));
-			cur.set('dhcp', 'lan', 'limit', '' + int(lim));
-			cur.set('dhcp', 'lan', 'leasetime', ltime);
-			let dm_sid = '@dnsmasq[0]';
-			cur.foreach('dhcp', 'dnsmasq', function(s) { dm_sid = s['.name']; return false; });
-			cur.set('dhcp', dm_sid, 'rebind_protection', rebind);
-			cur.set('dhcp', dm_sid, 'cachesize', '' + int(csize));
-			cur.commit('dhcp');
-		} catch (e) {
+			let cur0 = uci.cursor();
+			cur0.foreach('dhcp', 'dnsmasq', function(s) { dm_sid = s['.name']; return false; });
+		} catch (e) {}
+		let deps = {
+			uci_cursor: function() { return uci.cursor(); },
+			reload_dnsmasq: function(cb2) { exec_argv_async('/etc/init.d/dnsmasq', ['reload'], 8000, CAP_GENERAL, cb2); },
+			enter_emergency_freeze: enter_emergency_freeze,
+			audit_append: audit_append,
+			actor: actor, verb: 'network_save_dhcp', target_id: 'lan',
+			commit_detail: sprintf('start=%s limit=%s lease=%s', vp.start, vp.limit, vp.leasetime)
+		};
+		nms_access_dhcp.apply_dhcp_tx([{ cfg: 'dhcp', sid: 'lan' }, { cfg: 'dhcp', sid: dm_sid }], function(cur) {
+			cur.set('dhcp', 'lan', 'start', vp.start);
+			cur.set('dhcp', 'lan', 'limit', vp.limit);
+			cur.set('dhcp', 'lan', 'leasetime', vp.leasetime);
+			cur.set('dhcp', dm_sid, 'rebind_protection', vp.rebind_protection);
+			cur.set('dhcp', dm_sid, 'cachesize', vp.cachesize);
+		}, function(vcur) {
+			return (vcur.get('dhcp', 'lan', 'start') == vp.start && vcur.get('dhcp', 'lan', 'limit') == vp.limit && vcur.get('dhcp', 'lan', 'leasetime') == vp.leasetime);
+		}, deps, function(txr) {
 			release_lock();
-			reply_cb({ ok: false, error_code: 'INTERNAL', message_ar: 'فشل حفظ إعدادات DHCP' });
-			return;
-		}
-		exec_argv_async('/etc/init.d/dnsmasq', ['reload'], 8000, CAP_GENERAL, function(r) {
-			release_lock();
-			audit_append(actor, 'network_save_dhcp', 'lan', r.ok ? 'committed' : 'failed', sprintf('start=%d limit=%d lease=%s', int(st), int(lim), ltime));
-			reply_cb({ ok: r.ok, message_ar: 'تم حفظ وتطبيق إعدادات خادم DHCP بنجاح' });
+			reply_cb(txr.ok ? { ok: true, message_ar: 'تم حفظ وتطبيق إعدادات خادم DHCP بنجاح' } : txr);
 		});
 		return;
 	}

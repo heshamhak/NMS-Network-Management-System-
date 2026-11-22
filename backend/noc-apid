@@ -7,6 +7,7 @@ import * as digest from 'digest';
 import * as ubus from 'ubus';
 import * as uci from 'uci';
 import * as nms_discovery from '/usr/libexec/nms_discovery.uc';
+import * as nms_access_dhcp from '/usr/libexec/nms_access_dhcp.uc';
 
 const HELPER_SOCK = getenv('NOC_HELPER_SOCK') || '/tmp/noc-console/helper.sock';
 const RUN_DIR = getenv('NOC_RUN_DIR') || '/tmp/noc-console';
@@ -1152,6 +1153,12 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 		return;
 	}
 
+	let rbac = nms_access_dhcp.check_rbac_access(sess, action, method);
+	if (!rbac.ok) {
+		send_json_env(cli, rbac.status || 403, 'auth', {}, [{ code: rbac.error_code || 'FORBIDDEN', section: 'auth', message_ar: rbac.message_ar, request_id: req_id }]);
+		return;
+	}
+
 	// Origin & CSRF checks for mutations AND admin-sensitive endpoints
 	if (method == 'POST' || action == 'diagnostics' || action == 'logs' || action == 'audit' || action == 'stream') {
 		if (!is_origin_allowed(headers, method == 'POST')) {
@@ -1170,7 +1177,9 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 			return;
 		}
 		if (action == 'auth_set_readonly') {
-			call_helper('auth_set_readonly', { username: body.username || 'viewer', password: body.password || '' }, sess.username, remote_ip, function(res) {
+			let ro_user = body.username || 'viewer';
+			call_helper('auth_set_readonly', { username: ro_user, password: body.password || '' }, sess.username, remote_ip, function(res) {
+				if (res.ok) nms_access_dhcp.revoke_sessions_for_user(sessions, ro_user, null);
 				send_json_env(cli, res.ok ? 200 : (res.status || 400), 'auth', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'auth', message_ar: res.message_ar, request_id: req_id }]);
 			});
 			return;
@@ -1370,7 +1379,7 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 	}
 
 	if (action == 'clients') {
-		cached_helper_call('clients', 4500, 'clients', 'clients_read', {}, sess.username, remote_ip, function(res, errs) {
+		cached_helper_call('clients_' + sess.role, 4500, 'clients', 'clients_read', {}, sess.username, remote_ip, function(res, errs) {
 			if (!res.ok) return { ok: false, clients: [] };
 			let list = nms_discovery.merge_discovered_clients(res);
 			let nlbw_ok = !!(res.discovery_status && res.discovery_status.nlbw);
@@ -1569,7 +1578,7 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 				return;
 			}
 			call_helper(cverb, body, sess.username, remote_ip, function(res) {
-				delete cache_map['clients'];
+				delete cache_map['clients_admin']; delete cache_map['clients_readonly'];
 				send_json_env(cli, res.ok ? 200 : (res.status || 400), 'clients', res, res.ok ? [] : [{ code: res.error_code || 'INTERNAL', section: 'clients', message_ar: res.message_ar, request_id: req_id }]);
 			});
 			return;
@@ -1713,7 +1722,7 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 		}
 		if (action == 'client_quota_set' || action == 'schedule_action_set' || action == 'schedule_action_delete') {
 			call_helper(action, body, sess.username, remote_ip, function(res) {
-				if (res.ok) delete cache_map['clients'];
+				if (res.ok) { delete cache_map['clients_admin']; delete cache_map['clients_readonly']; }
 				send_json_env(cli, res.ok ? 200 : (res.status || 400), 'clients', res, res.ok ? [] : [{ code: res.error_code || 'VALIDATION', section: 'clients', message_ar: res.message_ar, request_id: req_id }]);
 			});
 			return;
