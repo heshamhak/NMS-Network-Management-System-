@@ -1,15 +1,5 @@
-// Phase 4E: QoS & SQM Hardening (Validation, Transactional UCI + tc qdisc Verification & Rollback)
+// Phase 4E: QoS & SQM Hardening (Strict Validation, Runtime Topology Protection, Transactional UCI + Root tc qdisc Verification & Rollback)
 // Zero external dependencies; executed in-process by noc-helperd and OpenWrt chroot suites.
-
-const ALLOWED_IFACES = {
-	'pppoe-wan': true,
-	'wlan0': true,
-	'eth0': true,
-	'eth1': true,
-	'br-lan': true,
-	'wan': true,
-	'wwan': true
-};
 
 const ALLOWED_QDISCS = { 'cake': true, 'fq_codel': true };
 const ALLOWED_SCRIPTS = { 'piece_of_cake.qos': true, 'layer_cake.qos': true, 'simple.qos': true };
@@ -20,6 +10,7 @@ const SCRIPT_QDISC_MAP = {
 };
 const ALLOWED_LINKLAYERS = { 'ethernet': true, 'atm': true, 'none': true };
 const ALLOWED_ECN = { 'ECN': true, 'NOECN': true };
+const HARD_PROTECTED_IFACES = { 'lo': true, 'br-lan': true, 'tailscale0': true, 'docker0': true };
 
 export function parse_strict_int(val, fallback) {
 	if (val == null) return { ok: true, value: fallback };
@@ -37,18 +28,50 @@ export function parse_strict_int(val, fallback) {
 	return { ok: false };
 };
 
-export function validate_sqm_config(params, iface_exists_fn) {
+export function parse_strict_bool(val, default_val) {
+	if (val == null) return { ok: true, value: !!default_val };
+	if (type(val) == 'bool') return { ok: true, value: val };
+	return { ok: false };
+};
+
+export function validate_sqm_config(params, topology) {
 	let p = (type(params) == 'object') ? params : {};
-	let en = !!p.enabled;
+	let topo = (type(topology) == 'object') ? topology : {};
+
+	let ben = parse_strict_bool(p.enabled, false);
+	let bdbg = parse_strict_bool(p.debug_logging, false);
+	let bsqd = parse_strict_bool(p.squash_dscp, true);
+	let bsqi = parse_strict_bool(p.squash_ingress, true);
+	if (!ben.ok || !bdbg.ok || !bsqd.ok || !bsqi.ok) {
+		return { ok: false, error_code: 'VALIDATION', message_ar: 'القيم المنطقية لخيارات SQM يجب أن تكون true أو false فقط' };
+	}
+	let en = ben.value;
+	let dbg = bdbg.value ? '1' : '0';
+	let sq_dscp = bsqd.value ? '1' : '0';
+	let sq_ing = bsqi.value ? '1' : '0';
+
 	let iface = trim(p.interface || '');
+	if (!match(iface, /^[a-zA-Z0-9_.-]{1,15}$/)) {
+		return { ok: false, error_code: 'VALIDATION', message_ar: 'اسم واجهة الشبكة غير صالح' };
+	}
+
+	let lan_ifaces = (type(topo.lan_ifaces) == 'object') ? topo.lan_ifaces : {};
+	let wan_ifaces = (type(topo.wan_ifaces) == 'object') ? topo.wan_ifaces : {};
+	if (HARD_PROTECTED_IFACES[iface] || lan_ifaces[iface]) {
+		return { ok: false, error_code: 'FORBIDDEN', status: 403, message_ar: 'مرفوض: لا يُسمح بتطبيق SQM على واجهات الشبكة المحلية أو الإدارة أو الحلقة الراجعة' };
+	}
+	if (!wan_ifaces[iface]) {
+		return { ok: false, error_code: 'VALIDATION', message_ar: 'الواجهة المحددة (' + iface + ') غير مثبتة كواجهة WAN صالحة في طوبولوجيا الشبكة الحالية' };
+	}
+	if (en && topo.iface_exists && !topo.iface_exists(iface)) {
+		return { ok: false, error_code: 'DEPENDENCY', message_ar: 'واجهة الشبكة المحددة (' + iface + ') غير موجودة أو غير نشطة حالياً' };
+	}
+
 	let qdisc = trim(p.qdisc || 'cake');
 	let script = trim(p.script || 'piece_of_cake.qos');
 	let linkl = trim(p.linklayer || 'ethernet');
-	let sq_dscp = p.squash_dscp === false ? '0' : '1';
-	let sq_ing = p.squash_ingress === false ? '0' : '1';
 	let in_ecn = trim(p.ingress_ecn || 'ECN');
 	let eg_ecn = trim(p.egress_ecn || 'ECN');
-	let dbg = p.debug_logging ? '1' : '0';
 
 	let pdl = parse_strict_int(p.download_kbps, 0);
 	let pul = parse_strict_int(p.upload_kbps, 0);
@@ -62,12 +85,6 @@ export function validate_sqm_config(params, iface_exists_fn) {
 	let overh = pov.value;
 	let verb_lvl = pvb.value;
 
-	if (!ALLOWED_IFACES[iface]) {
-		return { ok: false, error_code: 'VALIDATION', message_ar: 'واجهة الشبكة غير مدرجة ضمن واجهات SQM المعتمدة' };
-	}
-	if (en && iface_exists_fn && !iface_exists_fn(iface)) {
-		return { ok: false, error_code: 'DEPENDENCY', message_ar: 'واجهة الشبكة المحددة (' + iface + ') غير موجودة أو غير نشطة حالياً' };
-	}
 	if (!ALLOWED_QDISCS[qdisc] || !ALLOWED_SCRIPTS[script] || !ALLOWED_LINKLAYERS[linkl] || !ALLOWED_ECN[in_ecn] || !ALLOWED_ECN[eg_ecn]) {
 		return { ok: false, error_code: 'VALIDATION', message_ar: 'معاملات خوارزمية SQM غير صالحة' };
 	}
@@ -129,10 +146,10 @@ export function parse_tc_qdisc_summary(tc_raw, target_iface) {
 	let qdiscs = [];
 	let cur = null;
 	for (let ln in lines) {
-		let m = match(ln, /^qdisc\s+([a-zA-Z0-9_]+)\s+\S+\s+dev\s+(\S+)/);
+		let m = match(ln, /^qdisc\s+([a-zA-Z0-9_]+)\s+\S+\s+dev\s+(\S+)\s+(root|parent)(\s|$)/);
 		if (m) {
 			if (cur) push(qdiscs, cur);
-			cur = { qdisc: m[1], dev: m[2], dropped: 0, overlimits: 0 };
+			cur = { qdisc: m[1], dev: m[2], is_root: (m[3] == 'root'), dropped: 0, overlimits: 0 };
 			continue;
 		}
 		if (cur) {
@@ -146,7 +163,7 @@ export function parse_tc_qdisc_summary(tc_raw, target_iface) {
 	if (cur) push(qdiscs, cur);
 	let active_match = false;
 	for (let q in qdiscs) {
-		if ((!target_iface || q.dev == target_iface) && (q.qdisc == 'cake' || q.qdisc == 'fq_codel')) {
+		if (q.is_root && (!target_iface || q.dev == target_iface) && (q.qdisc == 'cake' || q.qdisc == 'fq_codel')) {
 			active_match = true;
 			break;
 		}
@@ -155,9 +172,10 @@ export function parse_tc_qdisc_summary(tc_raw, target_iface) {
 };
 
 export function verify_tc_qdisc_active(tc_raw, iface, expected_qdisc) {
-	let lines = split(tc_raw || '', '\n');
+	if (!tc_raw || !iface || !expected_qdisc) return false;
+	let lines = split(tc_raw, '\n');
 	for (let ln in lines) {
-		let m = match(ln, /^qdisc\s+([a-zA-Z0-9_]+)\s+\S+\s+dev\s+(\S+)/);
+		let m = match(ln, /^qdisc\s+([a-zA-Z0-9_]+)\s+\S+\s+dev\s+(\S+)\s+root(\s|$)/);
 		if (m && m[1] == expected_qdisc && m[2] == iface) return true;
 	}
 	return false;
@@ -211,6 +229,9 @@ function restore_and_verify_sqm(snap, deps) {
 export function apply_sqm_tx(cfg, deps, cb) {
 	let cur = deps.uci_cursor();
 	let snap = snapshot_sqm(cur);
+	let prev_enabled = !!(snap.exists && snap.values.enabled == '1');
+	let prev_iface = (snap.exists && snap.values.interface) ? snap.values.interface : cfg.interface;
+	let prev_qdisc = (snap.exists && snap.values.qdisc) ? snap.values.qdisc : 'cake';
 
 	let commit_ok = true;
 	try {
@@ -268,24 +289,48 @@ export function apply_sqm_tx(cfg, deps, cb) {
 			return;
 		}
 		deps.reload_sqm(function(rr) {
-			let all_ok = !!(rr && rr.ok);
-			let fr = !all_ok ? deps.enter_emergency_freeze('sqm_update reload rollback failed') : null;
-			deps.audit_append(deps.actor, 'sqm_update', cfg.interface, all_ok ? 'rolled_back' : 'rollback_failed', detail_msg);
-			cb({
-				ok: false,
-				error_code: all_ok ? 'DEPENDENCY' : 'INTERNAL',
-				rolled_back: all_ok,
-				rollback_failed: !all_ok,
-				freeze_persisted: fr ? !!fr.freeze_persisted : false,
-				freeze_persist_failed: fr ? !!fr.freeze_persist_failed : false,
-				message_ar: all_ok ? reason_msg : 'فشل حرج: تعذر استعادة خدمة SQM — تم تجميد التعديلات'
+			if (!rr || !rr.ok) {
+				let fr = deps.enter_emergency_freeze('sqm_update reload rollback failed');
+				deps.audit_append(deps.actor, 'sqm_update', cfg.interface, 'rollback_failed', detail_msg + '; rollback reload failed');
+				cb({
+					ok: false,
+					error_code: 'INTERNAL',
+					rolled_back: false,
+					rollback_failed: true,
+					freeze_persisted: !!fr.freeze_persisted,
+					freeze_persist_failed: !!fr.freeze_persist_failed,
+					message_ar: 'فشل حرج: تعذر إعادة تحميل خدمة SQM أثناء التراجع — تم تجميد التعديلات'
+				});
+				return;
+			}
+			let check_iface = prev_enabled ? prev_iface : cfg.interface;
+			deps.show_tc(check_iface, function(tc_rb) {
+				let rt_ok = !!(tc_rb && tc_rb.ok);
+				if (rt_ok) {
+					if (prev_enabled) {
+						rt_ok = verify_tc_qdisc_active(tc_rb.output, prev_iface, prev_qdisc);
+					} else if (cfg.enabled == '1' && cfg.qdisc == 'cake') {
+						rt_ok = !verify_tc_qdisc_active(tc_rb.output, cfg.interface, 'cake');
+					}
+				}
+				let fr = !rt_ok ? deps.enter_emergency_freeze('sqm_update runtime rollback verify failed') : null;
+				deps.audit_append(deps.actor, 'sqm_update', cfg.interface, rt_ok ? 'rolled_back' : 'rollback_failed', rt_ok ? (detail_msg + '; runtime restored') : (detail_msg + '; runtime verify failed'));
+				cb({
+					ok: false,
+					error_code: rt_ok ? 'DEPENDENCY' : 'INTERNAL',
+					rolled_back: rt_ok,
+					rollback_failed: !rt_ok,
+					freeze_persisted: fr ? !!fr.freeze_persisted : false,
+					freeze_persist_failed: fr ? !!fr.freeze_persist_failed : false,
+					message_ar: rt_ok ? reason_msg : 'فشل حرج: تعذر التحقق من استعادة حالة SQM التشغيلية — تم تجميد التعديلات'
+				});
 			});
 		});
 	};
 
 	deps.reload_sqm(function(r) {
 		if (!r || !r.ok) {
-			rollback_with_reload('فشل إعادة تحميل خدمة SQM وتم التراجع عن الإعدادات', 'sqm reload failed');
+			rollback_with_reload('فشل إعادة تحميل خدمة SQM وتم التراجع والتحقق من استعادة الحالة السابقة', 'sqm reload failed');
 			return;
 		}
 		if (cfg.enabled != '1') {
@@ -295,7 +340,7 @@ export function apply_sqm_tx(cfg, deps, cb) {
 		}
 		deps.show_tc(cfg.interface, function(tc_res) {
 			if (!tc_res || !tc_res.ok || !verify_tc_qdisc_active(tc_res.output, cfg.interface, cfg.qdisc)) {
-				rollback_with_reload('لم يتم رصد خوارزمية ' + cfg.qdisc + ' على الواجهة ' + cfg.interface + ' وتم التراجع تلقائياً', 'tc qdisc verification failed');
+				rollback_with_reload('لم يتم رصد خوارزمية ' + cfg.qdisc + ' على جذر الواجهة ' + cfg.interface + ' وتم التراجع والتحقق من استعادة الحالة السابقة', 'tc qdisc verification failed');
 				return;
 			}
 			deps.audit_append(deps.actor, 'sqm_update', cfg.interface, 'committed', sprintf('en=1 dl=%s ul=%s qdisc=%s', cfg.download, cfg.upload, cfg.qdisc));
