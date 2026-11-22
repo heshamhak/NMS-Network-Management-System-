@@ -9,6 +9,8 @@ TLS_CERT=/etc/noc-console/tls.crt
 TLS_KEY=/etc/noc-console/tls.key
 TLS_FP=/etc/noc-console/tls.fingerprint
 STUNNEL_CONF=/tmp/noc-console/stunnel.conf
+TLS_STATE_DIR=/tmp/noc-console-tls
+TLS_MARKER=/tmp/noc-console-tls/tls.verified
 HTTPS_PORT=8743
 HTTP_PORT=8780
 
@@ -102,6 +104,30 @@ EOF
 	mv -f "$_tmp" "$STUNNEL_CONF"
 }
 
+write_tls_marker() {
+	_engine="$1"
+	_lan_ip="$2"
+	rm -rf "$TLS_STATE_DIR" 2>/dev/null || true
+	mkdir -p "$TLS_STATE_DIR"
+	chown 0:0 "$TLS_STATE_DIR" 2>/dev/null || true
+	chmod 0755 "$TLS_STATE_DIR"
+	cp -f "$TLS_CERT" "${TLS_STATE_DIR}/tls.crt.tmp.$$"
+	chown 0:0 "${TLS_STATE_DIR}/tls.crt.tmp.$$" 2>/dev/null || true
+	chmod 0644 "${TLS_STATE_DIR}/tls.crt.tmp.$$"
+	mv -f "${TLS_STATE_DIR}/tls.crt.tmp.$$" "${TLS_STATE_DIR}/tls.crt"
+	_fp_val="$(cat "$TLS_FP" 2>/dev/null || true)"
+	cat > "${TLS_MARKER}.tmp.$$" <<EOF
+verified=1
+engine=${_engine}
+lan_ip=${_lan_ip}
+https_port=${HTTPS_PORT}
+fingerprint=${_fp_val}
+EOF
+	chown 0:0 "${TLS_MARKER}.tmp.$$" 2>/dev/null || true
+	chmod 0644 "${TLS_MARKER}.tmp.$$"
+	mv -f "${TLS_MARKER}.tmp.$$" "$TLS_MARKER"
+}
+
 start_service() {
 	mkdir -p /tmp/noc-console
 	chmod 0755 /tmp/noc-console
@@ -111,11 +137,12 @@ start_service() {
 	TLS_ENGINE="$(detect_tls_engine)"
 
 	if ensure_tls_cert && [ "$TLS_ENGINE" != "none" ]; then
+		write_tls_marker "$TLS_ENGINE" "$LAN_IP"
 		procd_open_instance noc_apid
 		procd_set_param command "$PROG"
 		procd_set_param user noc-api
 		procd_set_param group noc-api
-		procd_set_param env NOC_WEB_ROOT=/www NOC_HELPER_SOCK=/tmp/noc-console/helper.sock NOC_HTTP_PORT="$HTTP_PORT" NOC_HTTPS_PORT="$HTTPS_PORT" NOC_BIND_HOST="127.0.0.1" NOC_TLS_VERIFIED="1" NOC_TLS_CERT="$TLS_CERT" NOC_TLS_KEY="$TLS_KEY"
+		procd_set_param env NOC_WEB_ROOT=/www NOC_HELPER_SOCK=/tmp/noc-console/helper.sock NOC_HTTP_PORT="$HTTP_PORT" NOC_HTTPS_PORT="$HTTPS_PORT" NOC_BIND_HOST="127.0.0.1" NOC_LAN_IP="$LAN_IP" NOC_TLS_VERIFIED="1" NOC_TLS_MARKER="$TLS_MARKER" NOC_TLS_CERT="$TLS_CERT" NOC_TLS_KEY="$TLS_KEY"
 		procd_set_param respawn 3600 5 5
 		procd_set_param stdout 1
 		procd_set_param stderr 1
@@ -140,17 +167,19 @@ start_service() {
 			procd_close_instance
 		fi
 	elif [ "$ALLOW_INSECURE" = "1" ]; then
+		rm -rf "$TLS_STATE_DIR" 2>/dev/null || true
 		logger -t noc-apid "WARNING: Explicit NOC_ALLOW_INSECURE_HTTP=1 active; binding unencrypted HTTP on ${LAN_IP}:${HTTP_PORT}"
 		procd_open_instance noc_apid
 		procd_set_param command "$PROG"
 		procd_set_param user noc-api
 		procd_set_param group noc-api
-		procd_set_param env NOC_WEB_ROOT=/www NOC_HELPER_SOCK=/tmp/noc-console/helper.sock NOC_HTTP_PORT="$HTTP_PORT" NOC_BIND_HOST="$LAN_IP" NOC_TLS_VERIFIED="0"
+		procd_set_param env NOC_WEB_ROOT=/www NOC_HELPER_SOCK=/tmp/noc-console/helper.sock NOC_HTTP_PORT="$HTTP_PORT" NOC_BIND_HOST="$LAN_IP" NOC_LAN_IP="$LAN_IP" NOC_TLS_VERIFIED="0"
 		procd_set_param respawn 3600 5 5
 		procd_set_param stdout 1
 		procd_set_param stderr 1
 		procd_close_instance
 	else
+		rm -rf "$TLS_STATE_DIR" 2>/dev/null || true
 		logger -t noc-apid "ERROR: TLS prerequisites (PEM cert/key + stunnel or OpenSSL-enabled socat) missing; refusing to expose unencrypted HTTP admin UI."
 		return 1
 	fi
@@ -158,6 +187,7 @@ start_service() {
 
 stop_service() {
 	rm -f "$STUNNEL_CONF" "${STUNNEL_CONF}.tmp."* 2>/dev/null || true
+	rm -rf "$TLS_STATE_DIR" 2>/dev/null || true
 }
 
 service_triggers() {

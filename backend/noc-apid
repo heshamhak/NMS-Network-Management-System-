@@ -21,8 +21,34 @@ const BIND_PORT = +(getenv('NOC_HTTP_PORT') || 8780);
 const HTTPS_PORT = +(getenv('NOC_HTTPS_PORT') || 8743);
 const TLS_CERT_PATH = getenv('NOC_TLS_CERT') || '/etc/noc-console/tls.crt';
 const TLS_KEY_PATH = getenv('NOC_TLS_KEY') || '/etc/noc-console/tls.key';
-// SEC-01: Never enable TLS_ACTIVE / Secure cookies from a flag alone; require loopback bind + verified TLS terminator + cert/key
-const TLS_ACTIVE = (getenv('NOC_TLS_VERIFIED') == '1') && (BIND_HOST == '127.0.0.1') && !!fs.stat(TLS_CERT_PATH) && !!fs.stat(TLS_KEY_PATH);
+const TLS_MARKER_PATH = getenv('NOC_TLS_MARKER') || '/tmp/noc-console-tls/tls.verified';
+
+function verify_tls_runtime() {
+	if (getenv('NOC_TLS_VERIFIED') != '1' || BIND_HOST != '127.0.0.1') return false;
+	let mst = fs.lstat(TLS_MARKER_PATH);
+	if (mst && mst.type == 'file' && !mst.perm.group_write && !mst.perm.other_write) {
+		let mdir = replace(TLS_MARKER_PATH, /\/[^\/]+$/, '');
+		let dst = fs.lstat(mdir);
+		let req_uid = (getenv('NOC_TLS_MARKER_UID') != null && getenv('NOC_TLS_MARKER_UID') != '') ? +getenv('NOC_TLS_MARKER_UID') : 0;
+		if (dst && dst.type == 'directory' && dst.uid == req_uid && mst.uid == req_uid && !dst.perm.group_write && !dst.perm.other_write) {
+			if (fs.lstat(mdir + '/tls.key')) return false;
+			let pub_crt = mdir + '/tls.crt';
+			let cst = fs.lstat(pub_crt);
+			if (cst && cst.type == 'file' && cst.uid == req_uid && !cst.perm.group_write && !cst.perm.other_write) {
+				let mtxt = fs.readfile(TLS_MARKER_PATH) || '';
+				let ctxt = fs.readfile(pub_crt) || '';
+				if (index(mtxt, 'verified=1') >= 0 && index(ctxt, '-----BEGIN CERTIFICATE-----') >= 0 && index(ctxt, 'PRIVATE KEY') < 0 && index(mtxt, 'PRIVATE KEY') < 0) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+	return !!fs.stat(TLS_CERT_PATH) && !!fs.stat(TLS_KEY_PATH);
+}
+
+// SEC-01: Never enable TLS_ACTIVE / Secure cookies from a flag alone; require loopback bind + verified TLS terminator + root marker or cert/key
+const TLS_ACTIVE = (getenv('NOC_TLS_VERIFIED') == '1') && (BIND_HOST == '127.0.0.1') && verify_tls_runtime();
 const STAGING_MODE = getenv('NOC_STAGING_MODE') == '1';
 
 const MAX_HEADER_BYTES = 8192;
@@ -108,14 +134,16 @@ function next_seq(resource) {
 }
 
 function get_lan_ip() {
-	let override = getenv('NOC_BIND_HOST');
-	if (override && override != '') return override;
+	let lan_env = getenv('NOC_LAN_IP');
+	if (lan_env && lan_env != '') return split(trim(lan_env), /[ \/]/)[0];
 	try {
 		let cur = uci.cursor();
 		let ipaddr = cur.get('network', 'lan', 'ipaddr');
 		if (type(ipaddr) == 'array' && length(ipaddr) > 0) ipaddr = ipaddr[0];
-		if (type(ipaddr) == 'string' && ipaddr != '') return split(ipaddr, '/')[0];
+		if (type(ipaddr) == 'string' && ipaddr != '') return split(trim(ipaddr), /[ \/]/)[0];
 	} catch (e) {}
+	let override = getenv('NOC_BIND_HOST');
+	if (override && override != '' && override != '127.0.0.1') return override;
 	return '192.168.1.1';
 }
 
@@ -750,13 +778,17 @@ function is_origin_allowed(headers, require_present) {
 	let lan = get_lan_ip();
 	let hn = get_sys_hostname();
 	let allowed = {};
-	allowed[sprintf('http://%s:%d', lan, BIND_PORT)] = true;
-	allowed[sprintf('http://%s:%d', hn, BIND_PORT)] = true;
-	allowed[sprintf('http://%s.lan:%d', hn, BIND_PORT)] = true;
 	if (TLS_ACTIVE) {
 		allowed[sprintf('https://%s:%d', lan, HTTPS_PORT)] = true;
 		allowed[sprintf('https://%s:%d', hn, HTTPS_PORT)] = true;
 		allowed[sprintf('https://%s.lan:%d', hn, HTTPS_PORT)] = true;
+	} else {
+		allowed[sprintf('http://%s:%d', lan, BIND_PORT)] = true;
+		allowed[sprintf('http://%s:%d', hn, BIND_PORT)] = true;
+		allowed[sprintf('http://%s.lan:%d', hn, BIND_PORT)] = true;
+		if (BIND_HOST != '' && BIND_HOST != lan) {
+			allowed[sprintf('http://%s:%d', BIND_HOST, BIND_PORT)] = true;
+		}
 	}
 	if (STAGING_MODE) {
 		allowed[sprintf('http://127.0.0.1:%d', BIND_PORT)] = true;
@@ -1140,7 +1172,7 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 		}
 		let sess = get_session(headers);
 		if (sess) delete sessions[sess.id];
-		send_json_env(cli, 200, 'auth', { authenticated: false }, [], { 'Set-Cookie': 'noc_session=; HttpOnly; SameSite=Strict; Max-Age=0; Path=/' });
+		send_json_env(cli, 200, 'auth', { authenticated: false }, [], { 'Set-Cookie': sprintf('noc_session=; HttpOnly; SameSite=Strict; Max-Age=0; Path=/%s', TLS_ACTIVE ? '; Secure' : '') });
 		return;
 	}
 

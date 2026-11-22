@@ -1435,6 +1435,8 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
     key_p = os.path.join(st_td, "tls.key")
     fp_p = os.path.join(st_td, "tls.fingerprint")
     st_conf = os.path.join(st_td, "stunnel.conf")
+    st_state_dir = os.path.join(st_td, "noc-console-tls")
+    st_marker = os.path.join(st_state_dir, "tls.verified")
     subprocess.run(
         ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key_p, "-out", crt_p, "-days", "1", "-subj", "/CN=test.lan"],
         check=True, capture_output=True,
@@ -1448,6 +1450,8 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
     init_body = init_body.replace("TLS_KEY=/etc/noc-console/tls.key", f"TLS_KEY={key_p}")
     init_body = init_body.replace("TLS_FP=/etc/noc-console/tls.fingerprint", f"TLS_FP={fp_p}")
     init_body = init_body.replace("STUNNEL_CONF=/tmp/noc-console/stunnel.conf", f"STUNNEL_CONF={st_conf}")
+    init_body = init_body.replace("TLS_STATE_DIR=/tmp/noc-console-tls", f"TLS_STATE_DIR={st_state_dir}")
+    init_body = init_body.replace("TLS_MARKER=/tmp/noc-console-tls/tls.verified", f"TLS_MARKER={st_marker}")
     init_shim = os.path.join(st_td, "noc_apid_shim.sh")
     open(init_shim, "w", encoding="utf-8").write(init_body)
 
@@ -1550,6 +1554,151 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
         ok("SEC-01-STUNNEL[cidr_and_multi_ip_lan_ipaddr_stripped]")
     else:
         fail(f"SEC-01-STUNNEL[cidr_and_multi_ip_lan_ipaddr_stripped]: rc={r_cidr.returncode} conf={cidr_conf_txt!r}")
+
+    # 8e. SEC-01-TLS-ACTIVE (5 tests): root-owned TLS marker without private key, auth_status tls_active:true, Secure cookie, HTTPS Origin check, insecure HTTP mode isolation
+    r_mk = subprocess.run(
+        ["sh", "-c", cidr_harness],
+        env={"PATH": f"{bin_stunnel}:/usr/bin:/bin"}, capture_output=True, text=True,
+    )
+    apid_src_full = open(os.path.join(ROOT, "backend", "noc-apid"), "r", encoding="utf-8").read()
+    m_tls_fn = re.search(r"(const TLS_CERT_PATH = .*?const TLS_ACTIVE = .*?;)", apid_src_full, re.S)
+    m_lan_fn = re.search(r"(function get_lan_ip\(\) \{.*?\n\})", apid_src_full, re.S)
+    m_orig_fn = re.search(r"(function is_origin_allowed\(headers, require_present\) \{.*?\n\})", apid_src_full, re.S)
+    m_auth_st = re.search(r"(\tif \(action == 'auth_status'\) \{.*?\n\t\treturn;\n\t\})", apid_src_full, re.S)
+    m_auth_lg = re.search(r"(\tif \(action == 'auth_login' && method == 'POST'\) \{.*?\n\t\treturn;\n\t\})", apid_src_full, re.S)
+    assert all((m_tls_fn, m_lan_fn, m_orig_fn, m_auth_st, m_auth_lg)), "Failed to extract noc-apid TLS/auth handlers"
+
+    rfs_25 = "/tmp/openwrt-x86-64-rootfs"
+    if os.path.isdir(rfs_25) and os.path.isfile(os.path.join(rfs_25, "usr/bin/ucode")):
+        uc_stage = os.path.join(rfs_25, "tmp", "tls_active_test")
+        if os.path.exists(uc_stage):
+            shutil.rmtree(uc_stage, ignore_errors=True)
+        os.makedirs(uc_stage, exist_ok=True)
+        try:
+            # Copy marker dir created by init.d/noc-apid into chroot /tmp/tls_active_test/marker_ok
+            mk_ok_dir = os.path.join(uc_stage, "marker_ok")
+            shutil.copytree(st_state_dir, mk_ok_dir)
+            os.chmod(mk_ok_dir, 0o755)
+            os.chmod(os.path.join(mk_ok_dir, "tls.verified"), 0o644)
+            os.chmod(os.path.join(mk_ok_dir, "tls.crt"), 0o644)
+
+            # Create forged marker dir (world-writable 0777, simulating noc-api writable dir)
+            mk_forged_dir = os.path.join(uc_stage, "marker_forged")
+            shutil.copytree(st_state_dir, mk_forged_dir)
+            os.chmod(mk_forged_dir, 0o777)
+
+            # Create marker dir that illegally leaks tls.key
+            mk_leak_dir = os.path.join(uc_stage, "marker_leak")
+            shutil.copytree(st_state_dir, mk_leak_dir)
+            os.chmod(mk_leak_dir, 0o755)
+            open(os.path.join(mk_leak_dir, "tls.key"), "w").write("LEAKED_KEY\n")
+
+            uc_driver = (
+                "import * as fs from 'fs';\n"
+                "let env_map = {};\n"
+                "function getenv(k) { return env_map[k]; }\n"
+                "let uci = { cursor: () => ({ get: (p, s, o) => '192.168.1.1/24' }) };\n"
+                "function get_sys_hostname() { return 'OpenWrt'; }\n"
+                "function urandom_hex(n) { return 'deadbeefcafebabe0123456789abcdef'; }\n"
+                "let sessions = {};\n"
+                "function get_session(h) { return null; }\n"
+                "function call_helper(verb, params, actor, ip, cb) {\n"
+                "  if (verb == 'auth_status') cb({ ok: true, initialized: true });\n"
+                "  else if (verb == 'auth_login') cb({ ok: true, username: 'admin', role: 'admin' });\n"
+                "}\n"
+                "function eval_instance(e) {\n"
+                "  env_map = e;\n"
+                "  let BIND_HOST = getenv('NOC_BIND_HOST') || '';\n"
+                "  let BIND_PORT = +(getenv('NOC_HTTP_PORT') || 8780);\n"
+                "  let HTTPS_PORT = +(getenv('NOC_HTTPS_PORT') || 8743);\n"
+                "  let STAGING_MODE = false;\n"
+                + m_tls_fn.group(1) + "\n"
+                + m_lan_fn.group(1) + "\n"
+                + m_orig_fn.group(1) + "\n"
+                "  function dispatch(action, method, headers, body) {\n"
+                "    let cli = { status: 0, data: null, errs: [], hdrs: {} };\n"
+                "    let req_id = 'r1'; let remote_ip = '127.0.0.1'; let query = { action: action };\n"
+                "    function send_json_env(c, st, res, d, er, h) { c.status = st; c.data = d; c.errs = er; c.hdrs = h || {}; }\n"
+                "    (function() {\n"
+                + m_auth_st.group(1) + "\n"
+                + m_auth_lg.group(1) + "\n"
+                "    })();\n"
+                "    return cli;\n"
+                "  }\n"
+                "  return { tls_active: TLS_ACTIVE, lan_ip: get_lan_ip(), is_origin_allowed: is_origin_allowed, dispatch: dispatch };\n"
+                "}\n"
+                "// Test 1: Verify TLS without private key (/etc/noc-console inaccessible) & reject forged/leaked markers\n"
+                "let inst_ok = eval_instance({\n"
+                "  NOC_BIND_HOST: '127.0.0.1', NOC_HTTP_PORT: '8780', NOC_HTTPS_PORT: '8743',\n"
+                "  NOC_LAN_IP: '192.168.1.1', NOC_TLS_VERIFIED: '1',\n"
+                "  NOC_TLS_MARKER: '/tmp/tls_active_test/marker_ok/tls.verified',\n"
+                "  NOC_TLS_CERT: '/etc/noc-console-noaccess/tls.crt',\n"
+                "  NOC_TLS_KEY: '/etc/noc-console-noaccess/tls.key'\n"
+                "});\n"
+                "let inst_forged_perm = eval_instance({\n"
+                "  NOC_BIND_HOST: '127.0.0.1', NOC_TLS_VERIFIED: '1',\n"
+                "  NOC_TLS_MARKER: '/tmp/tls_active_test/marker_forged/tls.verified',\n"
+                "  NOC_TLS_CERT: '/etc/noc-console-noaccess/tls.crt', NOC_TLS_KEY: '/etc/noc-console-noaccess/tls.key'\n"
+                "});\n"
+                "let inst_forged_uid = eval_instance({\n"
+                "  NOC_BIND_HOST: '127.0.0.1', NOC_TLS_VERIFIED: '1', NOC_TLS_MARKER_UID: '999',\n"
+                "  NOC_TLS_MARKER: '/tmp/tls_active_test/marker_ok/tls.verified',\n"
+                "  NOC_TLS_CERT: '/etc/noc-console-noaccess/tls.crt', NOC_TLS_KEY: '/etc/noc-console-noaccess/tls.key'\n"
+                "});\n"
+                "let inst_leak = eval_instance({\n"
+                "  NOC_BIND_HOST: '127.0.0.1', NOC_TLS_VERIFIED: '1',\n"
+                "  NOC_TLS_MARKER: '/tmp/tls_active_test/marker_leak/tls.verified',\n"
+                "  NOC_TLS_CERT: '/etc/noc-console-noaccess/tls.crt', NOC_TLS_KEY: '/etc/noc-console-noaccess/tls.key'\n"
+                "});\n"
+                "if (!inst_ok.tls_active || inst_forged_perm.tls_active || inst_forged_uid.tls_active || inst_leak.tls_active) exit(11);\n"
+                "print('PASS_T1\\n');\n"
+                "// Test 2: auth_status reports tls_active: true and transport: https_tls\n"
+                "let st_res = inst_ok.dispatch('auth_status', 'GET', {}, {});\n"
+                "if (st_res.status != 200 || st_res.data.tls_active !== true || st_res.data.transport != 'https_tls') exit(12);\n"
+                "print('PASS_T2\\n');\n"
+                "// Test 3: Login Set-Cookie contains ; Secure\n"
+                "let lg_res = inst_ok.dispatch('auth_login', 'POST', { origin: 'https://192.168.1.1:8743' }, { username: 'admin', password: 'pw' });\n"
+                "let ck = lg_res.hdrs['Set-Cookie'] || '';\n"
+                "if (lg_res.status != 200 || index(ck, '; Secure') < 0 || index(ck, 'HttpOnly') < 0 || index(ck, 'SameSite=Strict') < 0) exit(13);\n"
+                "print('PASS_T3\\n');\n"
+                "// Test 4: Origin check accepts https://192.168.1.1:8743 and rejects http:// origins when TLS is active\n"
+                "let lg_http_orig = inst_ok.dispatch('auth_login', 'POST', { origin: 'http://192.168.1.1:8780' }, { username: 'admin', password: 'pw' });\n"
+                "let lg_http_8743 = inst_ok.dispatch('auth_login', 'POST', { origin: 'http://192.168.1.1:8743' }, { username: 'admin', password: 'pw' });\n"
+                "let lg_loop_orig = inst_ok.dispatch('auth_login', 'POST', { origin: 'https://127.0.0.1:8743' }, { username: 'admin', password: 'pw' });\n"
+                "if (lg_http_orig.status != 403 || lg_http_8743.status != 403 || lg_loop_orig.status != 403) exit(14);\n"
+                "print('PASS_T4\\n');\n"
+                "// Test 5: Insecure HTTP mode is never treated as HTTPS\n"
+                "let inst_http = eval_instance({\n"
+                "  NOC_BIND_HOST: '192.168.1.1', NOC_LAN_IP: '192.168.1.1', NOC_HTTP_PORT: '8780', NOC_HTTPS_PORT: '8743',\n"
+                "  NOC_TLS_VERIFIED: '0', NOC_TLS_MARKER: '/tmp/tls_active_test/nonexistent/tls.verified',\n"
+                "  NOC_TLS_CERT: '/etc/noc-console-noaccess/tls.crt', NOC_TLS_KEY: '/etc/noc-console-noaccess/tls.key'\n"
+                "});\n"
+                "let st_http = inst_http.dispatch('auth_status', 'GET', {}, {});\n"
+                "let lg_http_ok = inst_http.dispatch('auth_login', 'POST', { origin: 'http://192.168.1.1:8780' }, { username: 'admin', password: 'pw' });\n"
+                "let lg_https_on_http = inst_http.dispatch('auth_login', 'POST', { origin: 'https://192.168.1.1:8743' }, { username: 'admin', password: 'pw' });\n"
+                "if (inst_http.tls_active || st_http.data.tls_active !== false || st_http.data.transport != 'http_lan_only') exit(15);\n"
+                "if (lg_http_ok.status != 200 || index(lg_http_ok.hdrs['Set-Cookie'] || '', 'Secure') >= 0 || lg_https_on_http.status != 403) exit(16);\n"
+                "print('PASS_T5\\n');\n"
+            )
+            open(os.path.join(uc_stage, "run_tls_active.uc"), "w", encoding="utf-8").write(uc_driver)
+            r_uc = subprocess.run(
+                ["unshare", "-r", "/usr/sbin/chroot", rfs_25, "/usr/bin/ucode", "/tmp/tls_active_test/run_tls_active.uc"],
+                capture_output=True, text=True, timeout=15,
+            )
+            no_key_in_marker = not os.path.exists(os.path.join(st_state_dir, "tls.key"))
+            for tag, desc in (
+                ("PASS_T1", "SEC-01-TLS-ACTIVE[verify_without_private_key_and_reject_forged_marker]"),
+                ("PASS_T2", "SEC-01-TLS-ACTIVE[auth_status_reports_tls_active_true]"),
+                ("PASS_T3", "SEC-01-TLS-ACTIVE[login_cookie_contains_secure_flag]"),
+                ("PASS_T4", "SEC-01-TLS-ACTIVE[https_origin_accepted_and_http_origin_rejected]"),
+                ("PASS_T5", "SEC-01-TLS-ACTIVE[insecure_http_never_treated_as_https]"),
+            ):
+                if r_uc.returncode == 0 and tag in r_uc.stdout and no_key_in_marker:
+                    ok(desc)
+                else:
+                    fail(f"{desc}: rc={r_uc.returncode} out={r_uc.stdout} err={r_uc.stderr}")
+        finally:
+            shutil.rmtree(uc_stage, ignore_errors=True)
 
 print(f"\n=== SUMMARY: {len(passes)} passed, {len(failures)} failed ===")
 sys.exit(1 if failures else 0)
