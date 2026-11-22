@@ -139,6 +139,18 @@ cleanup_tls() {
 trap 'cleanup_tls; exit 0' INT TERM HUP
 trap 'cleanup_tls' EXIT
 
+child_owns_socket_inode() {
+	_c="\$1"
+	_target="socket:[\$2]"
+	for _fd in "/proc/\${_c}/fd/"*; do
+		[ -L "\$_fd" ] || continue
+		if [ "\$(readlink "\$_fd" 2>/dev/null || true)" = "\$_target" ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
 rm -f "\$MARKER" "\${MARKER}.tmp."* 2>/dev/null || true
 "\$@" &
 _child=\$!
@@ -146,6 +158,7 @@ _child=\$!
 _i=0
 _ready=0
 _matched_inode=""
+_matched_stime=""
 while [ "\$_i" -lt 50 ]; do
 	if ! kill -0 "\$_child" 2>/dev/null; then
 		wait "\$_child" 2>/dev/null || true
@@ -153,8 +166,9 @@ while [ "\$_i" -lt 50 ]; do
 	fi
 	_inodes="\$(awk -v p=":\${PORT_HEX}" '\$2 ~ p"\$" && \$4 == "0A" { print \$10 }' /proc/net/tcp /proc/net/tcp6 2>/dev/null || true)"
 	for _ino in \$_inodes; do
-		if [ -n "\$_ino" ] && [ "\$_ino" != "0" ] && ls -l "/proc/\${_child}/fd" 2>/dev/null | grep -Fq "socket:[\${_ino}]"; then
+		if [ -n "\$_ino" ] && [ "\$_ino" != "0" ] && child_owns_socket_inode "\$_child" "\$_ino"; then
 			_matched_inode="\$_ino"
+			_matched_stime="\$(sed 's/^.*)[[:space:]]*//' "/proc/\${_child}/stat" 2>/dev/null | awk '{print \$20}' || true)"
 			_ready=1
 			break
 		fi
@@ -164,7 +178,7 @@ while [ "\$_i" -lt 50 ]; do
 	_i=\$((_i + 1))
 done
 
-if [ "\$_ready" -ne 1 ] || [ -z "\$_matched_inode" ]; then
+if [ "\$_ready" -ne 1 ] || [ -z "\$_matched_inode" ] || [ -z "\$_matched_stime" ]; then
 	exit 1
 fi
 
@@ -172,6 +186,7 @@ cat > "\${MARKER}.tmp.\$\$" <<MKEOF
 verified=1
 engine=\${ENGINE}
 pid=\${_child}
+starttime=\${_matched_stime}
 inode=\${_matched_inode}
 lan_ip=\${LAN_IP}
 https_port=\${HTTPS_P}
@@ -181,7 +196,15 @@ chown 0:0 "\${MARKER}.tmp.\$\$" 2>/dev/null || true
 chmod 0644 "\${MARKER}.tmp.\$\$"
 mv -f "\${MARKER}.tmp.\$\$" "\$MARKER"
 
-wait "\$_child"
+while kill -0 "\$_child" 2>/dev/null; do
+	if ! child_owns_socket_inode "\$_child" "\$_matched_inode"; then
+		rm -f "\$MARKER" "\${MARKER}.tmp."* 2>/dev/null || true
+		kill -TERM "\$_child" 2>/dev/null || true
+		break
+	fi
+	sleep 1
+done
+wait "\$_child" 2>/dev/null || true
 _rc=\$?
 rm -f "\$MARKER" "\${MARKER}.tmp."* 2>/dev/null || true
 exit "\$_rc"

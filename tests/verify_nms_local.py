@@ -1652,8 +1652,13 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
                 time.sleep(0.05)
             assert os.path.isfile(st_marker), "run_tls_proxy.sh did not create tls.verified after listener started"
             m_pid1 = re.search(r"^pid=([0-9]+)$", open(st_marker).read(), re.M)
-            assert m_pid1, f"missing pid in {open(st_marker).read()!r}"
+            m_ino1 = re.search(r"^inode=([1-9][0-9]*)$", open(st_marker).read(), re.M)
+            assert m_pid1 and m_ino1, f"missing pid/inode in {open(st_marker).read()!r}"
             child_pid1 = int(m_pid1.group(1))
+            inode1 = m_ino1.group(1)
+
+            # Spawn a separate live process that does NOT own socket:[inode1]
+            non_owner_proc = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(0.5)\n"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
             # Copy marker dir created by run_tls_proxy.sh into chroot /tmp/tls_active_test/marker_ok
             mk_ok_dir = os.path.join(uc_stage, "marker_ok")
@@ -1661,6 +1666,16 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
             os.chmod(mk_ok_dir, 0o755)
             os.chmod(os.path.join(mk_ok_dir, "tls.verified"), 0o644)
             os.chmod(os.path.join(mk_ok_dir, "tls.crt"), 0o644)
+
+            # Create marker dir where pid is alive (non_owner_proc) and inode1 is actively listening on https_live_p,
+            # BUT pid does NOT own socket:[inode1] in /proc/<pid>/fd!
+            mk_non_owner_dir = os.path.join(uc_stage, "marker_non_owner_pid")
+            shutil.copytree(st_state_dir, mk_non_owner_dir)
+            os.chmod(mk_non_owner_dir, 0o755)
+            open(os.path.join(mk_non_owner_dir, "tls.verified"), "w").write(
+                f"verified=1\nengine=stunnel\npid={non_owner_proc.pid}\ninode={inode1}\nlan_ip=192.168.1.1\nhttps_port={https_live_p}\n"
+            )
+            os.chmod(os.path.join(mk_non_owner_dir, "tls.verified"), 0o644)
 
             # Create forged marker dir (world-writable 0777, simulating noc-api writable dir)
             mk_forged_dir = os.path.join(uc_stage, "marker_forged")
@@ -1729,7 +1744,23 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
                 "  NOC_TLS_MARKER: '/tmp/tls_active_test/marker_leak/tls.verified',\n"
                 "  NOC_TLS_CERT: '/etc/noc-console-noaccess/tls.crt', NOC_TLS_KEY: '/etc/noc-console-noaccess/tls.key'\n"
                 "});\n"
+                "let inst_non_owner = eval_instance({\n"
+                "  NOC_BIND_HOST: '127.0.0.1', NOC_HTTP_PORT: '8780', NOC_HTTPS_PORT: HP,\n"
+                "  NOC_LAN_IP: '192.168.1.1', NOC_TLS_VERIFIED: '1',\n"
+                "  NOC_TLS_MARKER: '/tmp/tls_active_test/marker_non_owner_pid/tls.verified',\n"
+                "  NOC_TLS_CERT: '/etc/noc-console-noaccess/tls.crt', NOC_TLS_KEY: '/etc/noc-console-noaccess/tls.key'\n"
+                "});\n"
+                "// Also test direct /proc/self/fd readlink where process is alive + same userns + matching starttime, but does NOT own socket:[inode]\n"
+                "let self_stat = fs.readfile('/proc/self/stat') || '';\n"
+                "let self_pid = split(trim(self_stat), /[[:space:]]+/)[0];\n"
+                "let self_st = split(replace(trim(self_stat), /^.*\\)[[:space:]]+/, ''), /[[:space:]]+/)[19];\n"
+                "let ok_mtxt = fs.readfile('/tmp/tls_active_test/marker_ok/tls.verified') || '';\n"
+                "let ok_ino = match(ok_mtxt, /(^|\\n)inode=([1-9][0-9]*)(\\n|$)/)[2];\n"
+                "fs.writefile('/tmp/tls_active_test/marker_non_owner_pid/tls.verified', sprintf('verified=1\\nengine=stunnel\\npid=%s\\nstarttime=%s\\ninode=%s\\nlan_ip=192.168.1.1\\nhttps_port=%s\\n', self_pid, self_st, ok_ino, HP));\n"
+                "let st_non_owner = inst_non_owner.dispatch('auth_status', 'GET', {}, {});\n"
                 "if (!inst_ok.is_tls_active() || inst_forged_perm.is_tls_active() || inst_forged_uid.is_tls_active() || inst_leak.is_tls_active()) exit(11);\n"
+                "if (inst_non_owner.is_tls_active() || st_non_owner.data.tls_active !== false) exit(17);\n"
+                "print('PASS_NON_OWNER_PID\\n');\n"
                 "print('PASS_T1\\n');\n"
                 "// Test 2: auth_status reports tls_active: true and transport: https_tls\n"
                 "let st_res = inst_ok.dispatch('auth_status', 'GET', {}, {});\n"
@@ -1766,6 +1797,7 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
             )
             no_key_in_marker = not os.path.exists(os.path.join(st_state_dir, "tls.key"))
             for tag, desc in (
+                ("PASS_NON_OWNER_PID", "SEC-01-TLS-LIFECYCLE[live_process_not_owning_socket_inode_rejected]"),
                 ("PASS_T1", "SEC-01-TLS-ACTIVE[verify_without_private_key_and_reject_forged_marker]"),
                 ("PASS_T2", "SEC-01-TLS-ACTIVE[auth_status_reports_tls_active_true]"),
                 ("PASS_T3", "SEC-01-TLS-ACTIVE[login_cookie_contains_secure_flag]"),
@@ -1832,13 +1864,21 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
                     break
                 time.sleep(0.05)
             m_pid2 = re.search(r"^pid=([0-9]+)$", open(st_marker).read(), re.M) if os.path.isfile(st_marker) else None
+            m_ino2 = re.search(r"^inode=([1-9][0-9]*)$", open(st_marker).read(), re.M) if os.path.isfile(st_marker) else None
             child_pid2 = int(m_pid2.group(1)) if m_pid2 else -1
+            inode2 = m_ino2.group(1) if m_ino2 else "0"
             shutil.copy2(st_marker, os.path.join(mk_ok_dir, "tls.verified"))
             os.chmod(os.path.join(mk_ok_dir, "tls.verified"), 0o644)
+            open(os.path.join(mk_non_owner_dir, "tls.verified"), "w").write(
+                f"verified=1\nengine=stunnel\npid={non_owner_proc.pid}\ninode={inode2}\nlan_ip=192.168.1.1\nhttps_port={https_live_p}\n"
+            )
+            os.chmod(os.path.join(mk_non_owner_dir, "tls.verified"), 0o644)
             r_recover = subprocess.run(
                 ["unshare", "-rm", "sh", "-c", f"mount --rbind /proc {rfs_25}/proc && exec /usr/sbin/chroot {rfs_25} /usr/bin/ucode /tmp/tls_active_test/run_tls_active.uc"],
                 capture_output=True, text=True, timeout=15,
             )
+            non_owner_proc.terminate()
+            non_owner_proc.wait(timeout=3)
             if (
                 child_pid2 > 0
                 and child_pid2 != child_pid1

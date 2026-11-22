@@ -47,7 +47,37 @@ function is_pid_alive_non_zombie(pid_str) {
 	return !!(m && m[1] != 'Z' && m[1] != 'X');
 }
 
-// SEC-01: Never enable TLS_ACTIVE / Secure cookies from a flag alone; require loopback bind + live verified TLS terminator process + active listener inode + root marker
+function get_pid_starttime(pid_str) {
+	let st_raw = fs.readfile('/proc/' + pid_str + '/stat');
+	if (!st_raw) return '';
+	let after = replace(trim(st_raw), /^.*\)[[:space:]]+/, '');
+	let cols = split(after, /[[:space:]]+/);
+	return (length(cols) >= 20) ? cols[19] : '';
+}
+
+function pid_owns_socket_inode(pid_str, expected_inode, mtxt) {
+	if (!pid_str || !expected_inode) return false;
+	let fd_dir = '/proc/' + pid_str + '/fd';
+	let entries = fs.lsdir(fd_dir);
+	let target = 'socket:[' + expected_inode + ']';
+	let readable_links = 0;
+	if (type(entries) == 'array') {
+		for (let e in entries) {
+			let lnk = fs.readlink(fd_dir + '/' + e);
+			if (lnk != null) {
+				readable_links++;
+				if (lnk == target) return true;
+			}
+		}
+		if (readable_links > 0) return false;
+	}
+	let sm = match(mtxt || '', /(^|\n)starttime=([0-9]+)(\n|$)/);
+	if (!sm) return false;
+	let cur_st = get_pid_starttime(pid_str);
+	return (cur_st != '' && cur_st == sm[2]);
+}
+
+// SEC-01: Never enable TLS_ACTIVE / Secure cookies from a flag alone; require loopback bind + live verified TLS terminator process owning active listener inode + root marker
 function is_tls_active() {
 	if (!((getenv('NOC_TLS_VERIFIED') == '1') && (BIND_HOST == '127.0.0.1'))) return false;
 	let mst = fs.lstat(TLS_MARKER_PATH);
@@ -67,6 +97,7 @@ function is_tls_active() {
 					let im = match(mtxt, /(^|\n)inode=([1-9][0-9]*)(\n|$)/);
 					if (!pm || !im || !is_pid_alive_non_zombie(pm[2])) return false;
 					if (!is_tls_port_listening_inode(HTTPS_PORT, im[2])) return false;
+					if (!pid_owns_socket_inode(pm[2], im[2], mtxt)) return false;
 					return true;
 				}
 			}
