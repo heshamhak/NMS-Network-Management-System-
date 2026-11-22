@@ -3114,6 +3114,29 @@
       });
     }
 
+    if (qs('btnRestoreBackupArchive')) {
+      qs('btnRestoreBackupArchive').addEventListener('click', async () => {
+        const inp = qs('sysBackupValidateFile');
+        const file = (inp && inp.files && inp.files[0]) ? inp.files[0] : null;
+        if (!file) {
+          showToast('اختر ملف أرشيف (.tar.gz) أولاً للاستعادة', 'warning');
+          return;
+        }
+        const confirmed = await confirmAction('تأكيد استعادة النسخة الاحتياطية', 'هل أنت متأكد من استعادة هذه النسخة؟ سيتم التحقق من سلامة الأرشيف أولاً قبل تطبيقه.');
+        if (!confirmed) return;
+        const buf = await file.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let binStr = '';
+        for (let i = 0; i < bytes.length; i++) binStr += String.fromCharCode(bytes[i]);
+        const r = await apiCall('backup_restore', { method: 'POST', body: { archive_b64: btoa(binStr) }, skipSeqCheck: true });
+        if (r.ok) {
+          showToast('تمت استعادة النسخة الاحتياطية بنجاح', 'success');
+        } else {
+          showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'فشلت عملية استعادة النسخة الاحتياطية', 'error');
+        }
+      });
+    }
+
     if (qs('btnLoadSysupgradeConf')) {
       qs('btnLoadSysupgradeConf').addEventListener('click', async () => {
         const r = await apiCall('system_control', { method: 'POST', body: { subaction: 'sysupgrade_conf_get' }, skipSeqCheck: true });
