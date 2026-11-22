@@ -102,8 +102,13 @@ if [ -f "$RESTORE_FILE" ]; then
       UNINSTALL_ERR=1
       continue
     fi
-    cur_mode="$(stat -c '%a' "$target" 2>/dev/null || echo '')"
-    cur_owner="$(stat -c '%u:%g' "$target" 2>/dev/null || echo '')"
+    if command -v ucode >/dev/null 2>&1; then
+      cur_mode="$(ucode -e "import * as fs from 'fs'; let s = fs.stat(ARGV[0]); if (!s) exit(1); printf('%o\n', s.mode & 0o7777);" "$target" 2>/dev/null || echo '')"
+      cur_owner="$(ucode -e "import * as fs from 'fs'; let s = fs.stat(ARGV[0]); if (!s) exit(1); printf('%d:%d\n', s.uid, s.gid);" "$target" 2>/dev/null || echo '')"
+    else
+      cur_mode="$(stat -c '%a' "$target" 2>/dev/null || echo '')"
+      cur_owner="$(stat -c '%u:%g' "$target" 2>/dev/null || echo '')"
+    fi
     if ! cmp -s "$bak_src" "$target" || [ "$cur_mode" != "$orig_mode" ] || { [ -n "$orig_owner" ] && [ "$orig_owner" != ":" ] && [ "$cur_owner" != "$orig_owner" ]; }; then
       echo "UNINSTALL ERROR: verification failed for restored $target (mode=${cur_mode}/${orig_mode}, owner=${cur_owner}/${orig_owner})" >&2
       RESTORE_ERR=1

@@ -167,10 +167,31 @@ ${TX_CREATED_DIRS}"
   fi
 }
 
+get_file_mode() {
+  if command -v ucode >/dev/null 2>&1; then
+    ucode -e "import * as fs from 'fs'; let s = fs.stat(ARGV[0]); if (!s) exit(1); printf('%o\n', s.mode & 0o7777);" "$1" 2>/dev/null && return 0
+  fi
+  stat -c '%a' "$1" 2>/dev/null
+}
+
+get_file_uid() {
+  if command -v ucode >/dev/null 2>&1; then
+    ucode -e "import * as fs from 'fs'; let s = fs.stat(ARGV[0]); if (!s) exit(1); printf('%d\n', s.uid);" "$1" 2>/dev/null && return 0
+  fi
+  stat -c '%u' "$1" 2>/dev/null
+}
+
+get_file_gid() {
+  if command -v ucode >/dev/null 2>&1; then
+    ucode -e "import * as fs from 'fs'; let s = fs.stat(ARGV[0]); if (!s) exit(1); printf('%d\n', s.gid);" "$1" 2>/dev/null && return 0
+  fi
+  stat -c '%g' "$1" 2>/dev/null
+}
+
 backup_for_tx() {
   _target="$1"
   if [ -e "$_target" ] || [ -L "$_target" ]; then
-    _omode="$(stat -c '%a' "$_target" 2>/dev/null || echo '644')"
+    _omode="$(get_file_mode "$_target" || echo '644')"
     _tbak="${TX_TMP_DIR}/$(printf '%s' "$_target" | tr '/' '_').txbak"
     cp -p "$_target" "$_tbak"
     echo "${_target}|${_omode}|${_tbak}" >> "$TX_RESTORE_LIST"
@@ -247,7 +268,7 @@ rollback_tx() {
           _rb_err=1
           continue
         fi
-        _cur_mode="$(stat -c '%a' "$_dst" 2>/dev/null || echo '')"
+        _cur_mode="$(get_file_mode "$_dst" || echo '')"
         if ! cmp -s "$_bak" "$_dst" || [ "$_cur_mode" != "$_mode" ]; then
           echo "ROLLBACK ERROR: verification failed after restoring $_dst (mode=${_cur_mode}/${_mode})" >&2
           _rb_err=1
@@ -304,7 +325,10 @@ done
 
 if [ -d "$RUN_DIR" ]; then
   RUN_DIR_EXISTED=1
-  RUN_DIR_ORIG_OWNER="$(stat -c '%u:%g' "$RUN_DIR" 2>/dev/null || true)"
+  _u="$(get_file_uid "$RUN_DIR" || true)"
+  _g="$(get_file_gid "$RUN_DIR" || true)"
+  RUN_DIR_ORIG_OWNER=""
+  [ -n "$_u" ] && [ -n "$_g" ] && RUN_DIR_ORIG_OWNER="${_u}:${_g}"
 fi
 
 ensure_dir "$ETC_DIR" 0700
@@ -388,9 +412,9 @@ install_managed_file() {
   backup_for_tx "$_dst"
 
   if [ -e "$_dst" ] || [ -L "$_dst" ]; then
-    _orig_mode="$(stat -c '%a' "$_dst" 2>/dev/null || echo '644')"
-    _orig_uid="$(stat -c '%u' "$_dst" 2>/dev/null || echo '')"
-    _orig_gid="$(stat -c '%g' "$_dst" 2>/dev/null || echo '')"
+    _orig_mode="$(get_file_mode "$_dst" || echo '644')"
+    _orig_uid="$(get_file_uid "$_dst" || echo '')"
+    _orig_gid="$(get_file_gid "$_dst" || echo '')"
     _orig_owner=""
     [ -n "$_orig_uid" ] && [ -n "$_orig_gid" ] && _orig_owner="${_orig_uid}:${_orig_gid}"
     _already_nms=0
