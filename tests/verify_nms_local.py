@@ -2074,8 +2074,9 @@ else:
             client_uc_p = os.path.join(rfs, "tmp", "test_fw_rpc_client.uc")
             open(client_uc_p, "w", encoding="utf-8").write(rpc_client_uc)
             try:
+                open(os.path.join(rfs, "tmp", "hd_in"), "w").close()
                 single_ns_cmd = (
-                    "/usr/bin/ucode /tmp/test_noc_helperd >/tmp/hd.log 2>&1 &\n"
+                    "/usr/bin/ucode /tmp/test_noc_helperd </tmp/hd_in >/tmp/hd.log 2>&1 &\n"
                     "HPID=$!\n"
                     "i=0; while [ $i -lt 6 ] && [ ! -S " + sock_rel + " ]; do sleep 1; i=$((i+1)); done\n"
                     "/usr/bin/ucode /tmp/test_fw_rpc_client.uc\n"
@@ -2090,11 +2091,11 @@ else:
                     env=env_hd, capture_output=True, text=True, timeout=15,
                 )
                 if r_rpc.returncode == 0 and "REAL_HELPERD_SURVIVED" in r_rpc.stdout:
-                    ok(f"FIREWALL-READ[{ver_label}]: real noc-helperd daemon survived firewall_read and served subsequent auth_status RPC")
+                    ok(f"FIREWALL-READ[{ver_label}]: real noc-helperd daemon survived firewall_read and served subsequent services_read RPC")
                 else:
                     fail(f"FIREWALL-READ[{ver_label}]: real daemon test failed rc={r_rpc.returncode} out={r_rpc.stdout} err={r_rpc.stderr}")
             finally:
-                for p_clean in (helperd_chroot_p, client_uc_p, sock_host, os.path.join(rfs, "tmp", "hd.log")):
+                for p_clean in (helperd_chroot_p, client_uc_p, sock_host, os.path.join(rfs, "tmp", "hd.log"), os.path.join(rfs, "tmp", "hd_in")):
                     if os.path.exists(p_clean):
                         os.unlink(p_clean)
         finally:
