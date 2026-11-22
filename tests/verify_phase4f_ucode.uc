@@ -240,5 +240,28 @@ check(
 	sprintf('%J', exec2_res)
 );
 
+// 21. Deterministic regression: timeout fires with unavailable worker PID, cleanup runs, then delayed worker starts -> command never executes
+import * as h_race from '/tmp/p3a_test/helperd_exec_race_prod.uc';
+let race_marker = '/tmp/p3a_test/vec/race_should_not_exist';
+if (fs.stat(race_marker)) fs.unlink(race_marker);
+let race_res = null;
+let race_cb_count = 0;
+h_race.exec_argv_async('/bin/touch', [race_marker], 150, 65536, function(r) {
+	race_cb_count++;
+	race_res = r;
+});
+// Step 1: Timeout fires before worker starts (PID is null), kill_pid_tree(null) + on_done runs immediately
+h_race.sched.timer_fn();
+// Step 2: Delayed worker attempts to start AFTER timeout & cleanup
+let delayed_rc = h_race.sched.worker_fn();
+// Step 3: Worker completion callback runs in parent to clean up cancel_file
+h_race.sched.done_fn(delayed_rc);
+check(
+	race_cb_count == 1 && race_res && race_res.ok === false && race_res.error_code == 'TIMEOUT' &&
+	race_res.killed === false && delayed_rc == 124 && !fs.stat(race_marker),
+	'P4F-EXEC[delayed_worker_after_timeout_never_executes]',
+	sprintf('delayed_rc=%d marker=%J res=%J', delayed_rc, !!fs.stat(race_marker), race_res)
+);
+
 printf('UCODE4F_SUMMARY: %d passed, %d failed\n', passed, failed);
 exit(failed == 0 ? 0 : 1);

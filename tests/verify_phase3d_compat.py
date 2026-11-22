@@ -261,7 +261,7 @@ EXPECTED_SUITES = {
     "verify_phase4c_ucode.uc": ("UCODE4C_SUMMARY", 17),
     "verify_phase4d_ucode.uc": ("UCODE4D_SUMMARY", 16),
     "verify_phase4e_ucode.uc": ("UCODE4E_SUMMARY", 23),
-    "verify_phase4f_ucode.uc": ("UCODE4F_SUMMARY", 20),
+    "verify_phase4f_ucode.uc": ("UCODE4F_SUMMARY", 21),
 }
 
 
@@ -341,6 +341,17 @@ def run_ucode_suite_in_chroot(rootfs_dir, ver_label, script_name, helperd_prod_s
             raise RuntimeError("Failed to extract collect_descendant_pids/kill_pid_tree/exec_argv_async from backend/noc-helperd")
         with open(os.path.join(p3a_dir, "helperd_exec_prod.uc"), "w", encoding="utf-8") as f:
             f.write("import * as fs from 'fs';\nimport * as uloop from 'uloop';\nconst CAP_GENERAL = 65536;\n" + m_exec.group(1) + "\nexport { exec_argv_async };\n")
+        with open(os.path.join(p3a_dir, "helperd_exec_race_prod.uc"), "w", encoding="utf-8") as f:
+            f.write(
+                "import * as fs from 'fs';\n"
+                "const CAP_GENERAL = 65536;\n"
+                "let sched = { timer_fn: null, worker_fn: null, done_fn: null };\n"
+                "let uloop = {\n"
+                "  timer: function(ms, fn) { sched.timer_fn = fn; return { cancel: function() {} }; },\n"
+                "  task: function(wfn, dfn) { sched.worker_fn = wfn; sched.done_fn = dfn; return { pid: function() { return null; } }; }\n"
+                "};\n"
+                + m_exec.group(1) + "\nexport { exec_argv_async, sched };\n"
+            )
         shutil.copy2(os.path.join(REPO_ROOT, "tests", script_name), os.path.join(p3a_dir, script_name))
 
         vec_dir = os.path.join(p3a_dir, "vec")

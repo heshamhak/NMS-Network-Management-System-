@@ -642,7 +642,6 @@ function exec_argv_async(abs_exe, argv, timeout_ms, max_bytes, cb) {
 		if (pid_pp) try { pid_pp[0].close(); } catch (e) {}
 		kill_pid_tree(tpid, 120, function(k_info) {
 			try { pp[0].close(); } catch (e) {}
-			try { if (fs.stat(cancel_file)) fs.unlink(cancel_file); } catch (e) {}
 			cb({
 				ok: false,
 				exit_code: -1,
