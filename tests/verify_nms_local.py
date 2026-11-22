@@ -1469,16 +1469,27 @@ with tempfile.TemporaryDirectory(prefix="nms_stunnel_test_") as st_td:
     else:
         fail(f"SEC-01-STUNNEL[isolated_stunnel_conf_procd_loopback_and_stop_cleanup]: rc={r_st.returncode} mode={oct(conf_mode)} exists_after_stop={os.path.exists(st_conf)} out={r_st.stdout}")
 
-    # 8c. Corrupted TLS cert MUST fail closed even when stunnel is present
-    open(crt_p, "w").write("INVALID_PEM\n")
-    r_badc = subprocess.run(
-        ["sh", "-c", procd_harness + "start_service"],
-        env={"PATH": f"{bin_stunnel}:/usr/bin:/bin"}, capture_output=True, text=True,
-    )
-    if r_badc.returncode != 0 and "INST:noc_apid" not in r_badc.stdout:
-        ok("SEC-01-STUNNEL[invalid_cert_fails_closed_even_with_stunnel]")
-    else:
-        fail(f"SEC-01-STUNNEL[invalid_cert_fails_closed_even_with_stunnel]: rc={r_badc.returncode} out={r_badc.stdout}")
+    # 8c. Corrupted TLS cert in unwritable dir (cannot regenerate) MUST fail closed even when stunnel is present
+    bad_dir = os.path.join(st_td, "ro_certs")
+    os.makedirs(bad_dir)
+    bad_crt = os.path.join(bad_dir, "tls.crt")
+    bad_key = os.path.join(bad_dir, "tls.key")
+    bad_fp = os.path.join(bad_dir, "tls.fingerprint")
+    open(bad_crt, "w").write("INVALID_PEM\n")
+    open(bad_key, "w").write("INVALID_KEY\n")
+    open(bad_fp, "w").write("INVALID_FP\n")
+    os.chmod(bad_dir, 0o555)
+    try:
+        r_badc = subprocess.run(
+            ["sh", "-c", procd_harness + f"TLS_CERT={bad_crt}; TLS_KEY={bad_key}; TLS_FP={bad_fp}; start_service"],
+            env={"PATH": f"{bin_stunnel}:/usr/bin:/bin"}, capture_output=True, text=True,
+        )
+        if r_badc.returncode != 0 and "INST:noc_apid" not in r_badc.stdout:
+            ok("SEC-01-STUNNEL[invalid_cert_fails_closed_even_with_stunnel]")
+        else:
+            fail(f"SEC-01-STUNNEL[invalid_cert_fails_closed_even_with_stunnel]: rc={r_badc.returncode} out={r_badc.stdout}")
+    finally:
+        os.chmod(bad_dir, 0o755)
 
 print(f"\n=== SUMMARY: {len(passes)} passed, {len(failures)} failed ===")
 sys.exit(1 if failures else 0)

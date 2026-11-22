@@ -100,7 +100,7 @@ start_service() {
 
 	LAN_IP="$(uci -q get network.lan.ipaddr 2>/dev/null || echo '192.168.1.1')"
 	ALLOW_INSECURE="${NOC_ALLOW_INSECURE_HTTP:-0}"
-	TLS_ENGINE="$(detect_tls_engine || echo 'none')"
+	TLS_ENGINE="$(detect_tls_engine)"
 
 	if ensure_tls_cert && [ "$TLS_ENGINE" != "none" ]; then
 		procd_open_instance noc_apid
