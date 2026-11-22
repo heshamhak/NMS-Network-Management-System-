@@ -543,25 +543,72 @@ def test_apk_provenance_verification():
         sb = os.path.join(tmp, "rootfs")
         shutil.copytree(ROOTFS_2512, sb, symlinks=True)
         repo_in = os.path.join(sb, "tmp", "apk_repo")
-        os.makedirs(repo_in, exist_ok=True)
+        repo_arch = os.path.join(repo_in, "x86_64")
+        os.makedirs(repo_arch, exist_ok=True)
         for fn in expected_hashes:
             shutil.copy2(os.path.join(cache_dir, fn), os.path.join(repo_in, fn))
+            shutil.copy2(os.path.join(cache_dir, fn), os.path.join(repo_arch, fn))
         r_ver = subprocess.run(
             ["unshare", "-r", "/usr/sbin/chroot", sb, "/usr/bin/apk", "verify", "/tmp/apk_repo/packages.adb"],
             capture_output=True, text=True, timeout=15
         )
         check(r_ver.returncode == 0 and "packages.adb: OK" in r_ver.stdout, "P3D-PROVENANCE[apk_verify_signed_packages_adb]", (r_ver.stderr or r_ver.stdout)[-200:])
 
-        # Negative test: tampered packages.adb MUST fail apk verify
+        # Actual offline trusted installation inside isolated 25.12.6 rootfs (uninstall first, then install WITHOUT --allow-untrusted)
+        r_del = subprocess.run(
+            ["unshare", "-r", "/usr/sbin/chroot", sb, "/bin/sh", "-c",
+             "/usr/bin/apk del --no-network ucode-mod-digest ucode-mod-socket ucode-mod-struct"],
+            capture_output=True, text=True, timeout=15
+        )
+        pre_absent = (r_del.returncode == 0) and not os.path.exists(os.path.join(sb, "usr", "lib", "ucode", "digest.so"))
+        open(os.path.join(sb, "tmp", "apk_repos.list"), "w").write("/tmp/apk_repo/packages.adb\n")
+        r_add = subprocess.run(
+            ["unshare", "-r", "/usr/sbin/chroot", sb, "/bin/sh", "-c",
+             "/usr/bin/apk add --no-network --repositories-file /tmp/apk_repos.list ucode-mod-digest ucode-mod-socket ucode-mod-struct"],
+            capture_output=True, text=True, timeout=15
+        )
+        r_chk = subprocess.run(
+            ["unshare", "-r", "/usr/sbin/chroot", sb, "/bin/sh", "-c",
+             "/usr/bin/apk list --installed ucode* && /usr/bin/ucode -e \"import * as d from 'digest'; import * as s from 'socket'; import * as t from 'struct'; printf('APK_TRUSTED_INSTALL_OK\\n');\""],
+            capture_output=True, text=True, timeout=15
+        )
+        add_ok = (
+            pre_absent
+            and r_add.returncode == 0
+            and r_chk.returncode == 0
+            and "APK_TRUSTED_INSTALL_OK" in r_chk.stdout
+            and "ucode-mod-digest-2026.07.09~b885dd0f-r3 x86_64" in r_chk.stdout
+            and "ucode-mod-socket-2026.07.09~b885dd0f-r3 x86_64" in r_chk.stdout
+            and "ucode-mod-struct-2026.07.09~b885dd0f-r3 x86_64" in r_chk.stdout
+        )
+        check(add_ok, "P3D-PROVENANCE[offline_trusted_apk_add_without_allow_untrusted]", (r_add.stderr or r_chk.stderr or r_add.stdout)[-240:])
+
+        # Negative test: tampered packages.adb MUST fail apk verify AND fail apk add without installing
+        subprocess.run(
+            ["unshare", "-r", "/usr/sbin/chroot", sb, "/usr/bin/apk", "del", "--no-network", "ucode-mod-digest"],
+            capture_output=True, text=True, timeout=15
+        )
         adb_p = os.path.join(repo_in, "packages.adb")
+        adb_arch_p = os.path.join(repo_arch, "packages.adb")
         adb_raw = bytearray(open(adb_p, "rb").read())
         adb_raw[-10] ^= 0xFF
         open(adb_p, "wb").write(adb_raw)
+        open(adb_arch_p, "wb").write(adb_raw)
         r_tamper = subprocess.run(
             ["unshare", "-r", "/usr/sbin/chroot", sb, "/usr/bin/apk", "verify", "/tmp/apk_repo/packages.adb"],
             capture_output=True, text=True, timeout=15
         )
         check(r_tamper.returncode != 0, "P3D-PROVENANCE[tampered_packages_adb_rejected]")
+        r_tamper_add = subprocess.run(
+            ["unshare", "-r", "/usr/sbin/chroot", sb, "/bin/sh", "-c",
+             "/usr/bin/apk add --no-network --repositories-file /tmp/apk_repos.list ucode-mod-digest"],
+            capture_output=True, text=True, timeout=15
+        )
+        check(
+            r_tamper_add.returncode != 0 and not os.path.exists(os.path.join(sb, "usr", "lib", "ucode", "digest.so")),
+            "P3D-PROVENANCE[tampered_packages_adb_blocks_apk_add]",
+            f"rc={r_tamper_add.returncode}"
+        )
 
     r_inst_list = subprocess.run(
         ["unshare", "-r", "/usr/sbin/chroot", ROOTFS_2512, "/bin/sh", "-c", "/usr/bin/apk list --installed ucode*"],
