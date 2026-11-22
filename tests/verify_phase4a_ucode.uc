@@ -49,7 +49,7 @@ check(length(n6_list) == 2 && n6_list[1].mac == 'aa:bb:cc:dd:ee:03' && n6_list[1
 let fdb_raw = "60:be:b4:1e:d3:5d dev eth1 master br-lan permanent\n" +
               "aa:bb:cc:dd:ee:01 dev phy1-ap0 vlan 1 master br-lan\n" +
               "aa:bb:cc:dd:ee:02 dev eth2.10 master br-guest\n";
-let fdb_map = nms_discovery.parse_bridge_fdb(fdb_raw);
+let fdb_map = nms_discovery.parse_bridge_fdb(fdb_raw, { '60:be:b4:1e:d3:5d': true });
 check(fdb_map['60:be:b4:1e:d3:5d'] == null && fdb_map['aa:bb:cc:dd:ee:01'].port == 'phy1-ap0' && fdb_map['aa:bb:cc:dd:ee:02'].bridge == 'br-guest', 'P4A-FDB[extracts_port_bridge_skips_permanent]', sprintf('%J', fdb_map));
 
 // 5. Wi-Fi station parsing + graceful empty fallback
@@ -69,6 +69,7 @@ let merged = nms_discovery.merge_discovered_clients({
 	neigh4: n4_raw,
 	neigh6: n6_raw,
 	fdb_raw: fdb_raw,
+	local_macs: { '60:be:b4:1e:d3:5d': true },
 	wifi_stations: wmap,
 	rules: { blocked_macs: {}, blocked_ips: {}, nicknames: { 'aa:bb:cc:dd:ee:01': 'Workstation' }, rate_limits: {} },
 	static_leases: {},
@@ -98,6 +99,45 @@ for (let j = 1; j <= 12; j++) {
 }
 let capped_ips = nms_discovery.merge_discovered_clients({ neigh4: many_ips_n4 });
 check(length(capped_ips) == 1 && length(capped_ips[0].ips) == 8 && capped_ips[0].overflow_ips === true, 'P4A-CAP[enforces_8_ips_per_mac_limit]', sprintf('%J', capped_ips[0]));
+
+// 8. Regression tests for Phase 4A Review Findings (P1 Wi-Fi unknown auth, P2 static FDB permanent, P2 interface vs bridge)
+let hc_unknown = { 'phy1-ap0': { clients: {
+	'AA:BB:CC:DD:EE:10': { signal: -61 },
+	'AA:BB:CC:DD:EE:11': { signal: -70, authorized: false }
+} } };
+let w_unk = nms_discovery.parse_wifi_stations(ws_mock, hc_unknown);
+let m_unk = nms_discovery.merge_discovered_clients({ wifi_stations: w_unk });
+let unk_by_m = {};
+for (let c in m_unk) unk_by_m[c.mac] = c;
+check(
+	w_unk['aa:bb:cc:dd:ee:10'].authorized === null && w_unk['aa:bb:cc:dd:ee:10'].auth_state == 'unknown'
+	&& unk_by_m['aa:bb:cc:dd:ee:10'].online === false && unk_by_m['aa:bb:cc:dd:ee:10'].wifi_auth == 'unknown',
+	'P4A-REG[wifi_missing_auth_stays_unknown_and_not_online]', sprintf('%J', unk_by_m['aa:bb:cc:dd:ee:10'])
+);
+check(
+	unk_by_m['aa:bb:cc:dd:ee:11'].online === false && unk_by_m['aa:bb:cc:dd:ee:11'].wifi_auth == 'unauthorized',
+	'P4A-REG[wifi_false_auth_stays_not_online]', sprintf('%J', unk_by_m['aa:bb:cc:dd:ee:11'])
+);
+
+let fdb_perm_raw = "60:be:b4:1e:d3:5d dev eth1 master br-lan permanent\n" +
+                   "02:aa:bb:cc:dd:99 dev br-lan self permanent\n" +
+                   "aa:bb:cc:dd:ee:44 dev eth2 master br-lan permanent\n";
+let fdb_perm = nms_discovery.parse_bridge_fdb(fdb_perm_raw, { '60:be:b4:1e:d3:5d': true });
+check(
+	fdb_perm['60:be:b4:1e:d3:5d'] == null && fdb_perm['02:aa:bb:cc:dd:99'] == null
+	&& fdb_perm['aa:bb:cc:dd:ee:44'] != null && fdb_perm['aa:bb:cc:dd:ee:44'].static_fdb === true && fdb_perm['aa:bb:cc:dd:ee:44'].bridge == 'br-lan',
+	'P4A-REG[fdb_preserves_client_permanent_skips_router_local]', sprintf('%J', fdb_perm)
+);
+
+let n4_non_br = "10.20.30.40 dev eth0.10 lladdr aa:bb:cc:dd:ee:55 REACHABLE\n192.168.1.51 dev br-lan lladdr aa:bb:cc:dd:ee:56 REACHABLE\n";
+let m_if_br = nms_discovery.merge_discovered_clients({ neigh4: n4_non_br, bridges: ['br-lan'] });
+let by_if = {};
+for (let c in m_if_br) by_if[c.mac] = c;
+check(
+	by_if['aa:bb:cc:dd:ee:55'].interface == 'eth0.10' && by_if['aa:bb:cc:dd:ee:55'].bridge == ''
+	&& by_if['aa:bb:cc:dd:ee:56'].interface == 'br-lan' && by_if['aa:bb:cc:dd:ee:56'].bridge == 'br-lan',
+	'P4A-REG[interface_kept_separate_from_bridge]', sprintf('%J', m_if_br)
+);
 
 printf('UCODE4A_SUMMARY: %d passed, %d failed\n', passed, failed);
 exit(failed == 0 ? 0 : 1);

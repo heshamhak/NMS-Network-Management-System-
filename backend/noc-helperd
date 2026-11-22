@@ -2037,6 +2037,7 @@ function handle_rpc(req, reply_cb) {
 							neigh6: n6.ok ? n6.output : '',
 							fdb_raw: fdb_raw,
 							bridges: bridges,
+							local_macs: get_gateway_macs(),
 							wifi_stations: wifi_stations,
 							discovery_status: {
 								neigh4: !!n4.ok,

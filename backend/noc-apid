@@ -1419,10 +1419,12 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 					c.static_lease = false;
 					c.rate_limit_kbps = 0;
 					c.port = '';
+					c.interface = '';
 					c.bridge = '';
 					c.ssid = null;
 					c.rssi = null;
 					c.band = null;
+					c.wifi_auth = null;
 					c.display_name = 'جهاز محلي';
 				}
 			}
