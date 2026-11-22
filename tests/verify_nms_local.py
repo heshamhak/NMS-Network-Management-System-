@@ -2227,6 +2227,31 @@ print('AUTH_SESS_OK\\n');
 else:
     fail(f"AUTH-SESSION-INVALIDATION: required OpenWrt rootfs missing at {rfs_auth}")
 
+# 8c. Live /proc Validation (mounted procfs inside OpenWrt chroot)
+print("\n=== 8c. Live /proc Validation ===")
+if os.path.isdir(rfs_auth):
+    r_proc = subprocess.run(
+        [
+            "sudo", "-n", "chroot", rfs_auth, "/bin/sh", "-c",
+            "cleanup() { umount /proc 2>/dev/null || true; }; trap cleanup EXIT; "
+            "mount -t proc proc /proc && "
+            "/usr/bin/ucode -e \"import * as fs from 'fs'; "
+            "let hn = trim(fs.readfile('/proc/sys/kernel/hostname') || ''); "
+            "let nf = fs.readfile('/proc/sys/kernel/nonexistent_nms_test'); "
+            "if (length(hn) == 0 || nf !== null) exit(1); "
+            "print('PROC_OK=' + hn + '\\n');\""
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if r_proc.returncode == 0 and "PROC_OK=" in r_proc.stdout:
+        ok("LIVE-PROC-VALIDATION: mounted procfs readfile('/proc/sys/kernel/hostname') non-empty and nonexistent path returns null")
+    else:
+        fail(f"LIVE-PROC-VALIDATION: rc={r_proc.returncode} out={r_proc.stdout.strip()} err={r_proc.stderr.strip()}")
+else:
+    fail(f"LIVE-PROC-VALIDATION: required OpenWrt rootfs missing at {rfs_auth}")
+
 # 9. Option A Root-Interface (/) Redirect & Atomic LuCI Restore Verification (Sections A, B, C, D)
 print("\n=== 8. Root-Interface (/) Redirect & Atomic LuCI Restore (Option A) ===")
 launcher_html_p = os.path.join(ROOT, "frontend", "launcher_index.html")
