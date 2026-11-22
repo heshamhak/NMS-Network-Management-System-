@@ -2269,14 +2269,15 @@ if os.path.isdir(rfs_auth):
         had_noc_cfg = os.path.isdir(noc_cfg_p)
         if had_noc_cfg:
             shutil.copytree(noc_cfg_p, os.path.join(td_bak, "noc-console"), symlinks=True)
-            shutil.rmtree(noc_cfg_p, ignore_errors=True)
         hn_src_dir = os.path.join(rfs_auth, "tmp", "nms_hn_src")
-        os.makedirs(os.path.join(hn_src_dir, "scripts"), exist_ok=True)
-        shutil.copytree(os.path.join(ROOT, "frontend"), os.path.join(hn_src_dir, "frontend"), dirs_exist_ok=True)
-        en_dst_p = os.path.join(hn_src_dir, "scripts", "enable-root-redirect.sh")
-        shutil.copy2(os.path.join(ROOT, "scripts", "enable-root-redirect.sh"), en_dst_p)
-        shutil.copy2(os.path.join(ROOT, "scripts", "luci_redirect_cgi.uc"), os.path.join(hn_src_dir, "scripts", "luci_redirect_cgi.uc"))
         try:
+            if had_noc_cfg:
+                shutil.rmtree(noc_cfg_p, ignore_errors=True)
+            os.makedirs(os.path.join(hn_src_dir, "scripts"), exist_ok=True)
+            shutil.copytree(os.path.join(ROOT, "frontend"), os.path.join(hn_src_dir, "frontend"), dirs_exist_ok=True)
+            en_dst_p = os.path.join(hn_src_dir, "scripts", "enable-root-redirect.sh")
+            shutil.copy2(os.path.join(ROOT, "scripts", "enable-root-redirect.sh"), en_dst_p)
+            shutil.copy2(os.path.join(ROOT, "scripts", "luci_redirect_cgi.uc"), os.path.join(hn_src_dir, "scripts", "luci_redirect_cgi.uc"))
             os.makedirs(os.path.join(www_p, "cgi-bin"), exist_ok=True)
             os.makedirs(os.path.join(www_p, "pro"), exist_ok=True)
             os.makedirs(os.path.join(rfs_auth, "etc", "noc-console"), exist_ok=True)
