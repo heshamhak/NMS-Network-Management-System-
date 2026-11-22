@@ -4143,7 +4143,7 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 			cur.set('dhcp', dm_sid, 'rebind_protection', vp.rebind_protection);
 			cur.set('dhcp', dm_sid, 'cachesize', vp.cachesize);
 		}, function(vcur) {
-			return (vcur.get('dhcp', 'lan', 'start') == vp.start && vcur.get('dhcp', 'lan', 'limit') == vp.limit && vcur.get('dhcp', 'lan', 'leasetime') == vp.leasetime);
+			return nms_access_dhcp.verify_dhcp_pool_uci(vcur, dm_sid, vp);
 		}, deps, function(txr) {
 			release_lock();
 			reply_cb(txr.ok ? { ok: true, message_ar: 'تم حفظ وتطبيق إعدادات خادم DHCP بنجاح' } : txr);
