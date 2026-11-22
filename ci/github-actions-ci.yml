@@ -34,7 +34,7 @@ jobs:
         run: |
           mkdir -p /tmp/openwrt-sdk
           curl -sL https://downloads.openwrt.org/releases/25.12.6/targets/x86/64/openwrt-sdk-25.12.6-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst \
-            | tar --zstd -xf - --strip-components=1 -C /tmp/openwrt-sdk --wildcards '*/staging_dir/host/bin/apk*' '*/staging_dir/host/lib/*'
+            | tar --zstd -xf - --strip-components=1 -C /tmp/openwrt-sdk --wildcards '*/staging_dir/host/bin/apk' '*/staging_dir/host/bin/.apk.bin' '*/staging_dir/host/lib/*'
           echo "APK_BIN=/tmp/openwrt-sdk/staging_dir/host/bin/apk" >> "$GITHUB_ENV"
           /tmp/openwrt-sdk/staging_dir/host/bin/apk --version
 
