@@ -2328,10 +2328,15 @@
 
   function startSSE() {
     if (state.sse) return;
+    if (state.sseReconnectTimer) {
+      clearTimeout(state.sseReconnectTimer);
+      state.sseReconnectTimer = null;
+    }
     try {
       const es = new EventSource('/api?action=stream');
       es.addEventListener('overview', (ev) => {
         try {
+          state.sseRetryDelayMs = 1000;
           const nowMs = Date.now();
           if (state.sampleSpeedMs > 1000 && state.lastOverviewTs && (nowMs - state.lastOverviewTs) < (state.sampleSpeedMs - 150)) {
             return;
@@ -2350,7 +2355,12 @@
       });
       es.addEventListener('expire', () => {
         stopSSE();
-        setTimeout(() => { if (state.authenticated) startSSE(); }, 1000);
+        if (state.authenticated) {
+          state.sseReconnectTimer = setTimeout(() => {
+            state.sseReconnectTimer = null;
+            if (state.authenticated) startSSE();
+          }, 1000);
+        }
       });
       es.onerror = () => {
         stopSSE();
@@ -2358,12 +2368,24 @@
           qs('cmdConnBadge').textContent = 'البث منقطع (إعادة المحاولة)';
           qs('cmdConnBadge').className = 'status-pill pill-warning';
         }
+        if (state.authenticated) {
+          const delay = Math.min(state.sseRetryDelayMs || 1000, 30000);
+          state.sseRetryDelayMs = Math.min(delay * 2, 30000);
+          state.sseReconnectTimer = setTimeout(() => {
+            state.sseReconnectTimer = null;
+            if (state.authenticated) startSSE();
+          }, delay);
+        }
       };
       state.sse = es;
     } catch (e) {}
   }
 
   function stopSSE() {
+    if (state.sseReconnectTimer) {
+      clearTimeout(state.sseReconnectTimer);
+      state.sseReconnectTimer = null;
+    }
     if (state.sse) {
       try { state.sse.close(); } catch (e) {}
       state.sse = null;
@@ -3094,6 +3116,10 @@
 
     if (qs('btnValidateSysBackup')) {
       qs('btnValidateSysBackup').addEventListener('click', async () => {
+        if (state.role !== 'admin') {
+          showToast('متاح لصلاحية المدير فقط', 'error');
+          return;
+        }
         const fInput = qs('sysBackupValidateFile');
         const file = fInput && fInput.files ? fInput.files[0] : null;
         if (!file) {
@@ -3105,17 +3131,23 @@
         let binStr = '';
         for (let i = 0; i < bytes.length; i++) binStr += String.fromCharCode(bytes[i]);
         const r = await apiCall('backup_validate', { method: 'POST', body: { archive_b64: btoa(binStr) }, skipSeqCheck: true });
+        const d = (r && r.data) ? r.data : {};
+        const validOk = !!(r && r.ok && d.valid === true);
         if (qs('sysBackupStatusPre')) {
           qs('sysBackupStatusPre').classList.remove('hidden');
-          const d = r.data || {};
-          qs('sysBackupStatusPre').textContent = (r.ok && d.valid ? 'VALID' : 'INVALID') + '\nSHA-256: ' + (d.sha256 || '--') + '\nEntries: ' + (d.entries_count || 0) + ((d.errors && d.errors.length) ? '\nErrors: ' + d.errors.join('; ') : '');
+          qs('sysBackupStatusPre').textContent = (validOk ? 'VALID (VALIDATION ONLY — NO CHANGES APPLIED)' : 'INVALID') + '\nSHA-256: ' + (d.sha256 || '--') + '\nEntries: ' + (d.entries_count || 0) + ((d.errors && d.errors.length) ? '\nErrors: ' + d.errors.join('; ') : '');
         }
-        showToast(r.ok ? 'الأرشيف سليم واجتاز فحص المسارات' : 'الأرشيف غير صالح أو يحتوي مسارات مرفوضة', r.ok ? 'success' : 'error');
+        showToast(validOk ? 'فحص فقط: الأرشيف سليم ولم يتم تطبيق أي تغييرات' : 'الأرشيف غير صالح أو يحتوي مسارات مرفوضة', validOk ? 'info' : 'error');
       });
     }
 
     if (qs('btnRestoreBackupArchive')) {
       qs('btnRestoreBackupArchive').addEventListener('click', async () => {
+        if (state.role !== 'admin') {
+          showToast('متاح لصلاحية المدير فقط', 'error');
+          return;
+        }
+        const btn = qs('btnRestoreBackupArchive');
         const inp = qs('sysBackupValidateFile');
         const file = (inp && inp.files && inp.files[0]) ? inp.files[0] : null;
         if (!file) {
@@ -3124,15 +3156,31 @@
         }
         const confirmed = await confirmAction('تأكيد استعادة النسخة الاحتياطية', 'هل أنت متأكد من استعادة هذه النسخة؟ سيتم التحقق من سلامة الأرشيف أولاً قبل تطبيقه.');
         if (!confirmed) return;
-        const buf = await file.arrayBuffer();
-        const bytes = new Uint8Array(buf);
-        let binStr = '';
-        for (let i = 0; i < bytes.length; i++) binStr += String.fromCharCode(bytes[i]);
-        const r = await apiCall('backup_restore', { method: 'POST', body: { archive_b64: btoa(binStr) }, skipSeqCheck: true });
-        if (r.ok) {
-          showToast('تمت استعادة النسخة الاحتياطية بنجاح', 'success');
-        } else {
-          showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'فشلت عملية استعادة النسخة الاحتياطية', 'error');
+        if (btn) btn.disabled = true;
+        try {
+          const buf = await file.arrayBuffer();
+          const bytes = new Uint8Array(buf);
+          let binStr = '';
+          for (let i = 0; i < bytes.length; i++) binStr += String.fromCharCode(bytes[i]);
+          const r = await apiCall('backup_restore', { method: 'POST', body: { archive_b64: btoa(binStr) }, skipSeqCheck: true });
+          const d = (r && r.data) ? r.data : {};
+          const applied = Number(d.applied_count || 0);
+          const sections = Array.isArray(d.restored_sections) ? d.restored_sections.length : 0;
+          const restoredOk = !!(r && r.ok && (applied > 0 || sections > 0));
+          if (qs('sysBackupStatusPre')) {
+            qs('sysBackupStatusPre').classList.remove('hidden');
+            const errList = (d.errors && d.errors.length) ? d.errors : ((r && r.errors) ? r.errors.map((e) => e.message_ar || e.code || String(e)) : []);
+            qs('sysBackupStatusPre').textContent = restoredOk
+              ? ('RESTORED\nSHA-256: ' + (d.sha256 || '--') + '\nApplied: ' + (applied || sections) + '\nServices: ' + ((d.reloaded_services && d.reloaded_services.length) ? d.reloaded_services.join(', ') : 'none'))
+              : ('RESTORE FAILED' + (errList.length ? '\nErrors: ' + errList.join('; ') : ''));
+          }
+          if (restoredOk) {
+            showToast('تمت استعادة النسخة الاحتياطية بنجاح', 'success');
+          } else {
+            showToast((r && r.errors && r.errors[0] && r.errors[0].message_ar) || d.message_ar || 'فشلت عملية استعادة النسخة الاحتياطية', 'error');
+          }
+        } finally {
+          if (btn) btn.disabled = false;
         }
       });
     }
