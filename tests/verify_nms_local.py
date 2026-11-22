@@ -1243,27 +1243,71 @@ if r_dom.returncode == 0 and "DOM_TOPO_PASS" in r_dom.stdout:
 else:
     fail(f"P4F-DOM: failed rc={r_dom.returncode}: {r_dom.stderr} {r_dom.stdout}")
 
-# 7b. Real production noc-apid action=='topology' + noc-helperd global single-flight integration test on BOTH OpenWrt 24.10.0 & 25.12.6
+# 7b. Real production noc-apid action=='topology' + noc-helperd handle_rpc topology_read single-flight integration test on BOTH OpenWrt 24.10.0 & 25.12.6
 apid_src = open(os.path.join(ROOT, "backend/noc-apid"), "r", encoding="utf-8").read()
 helperd_src = open(os.path.join(ROOT, "backend/noc-helperd"), "r", encoding="utf-8").read()
 m_topo_handler = re.search(r"(\tif \(action == 'topology'\) \{.*?\n\t\treturn;\n\t\})", apid_src, re.S)
 m_rbac_block = re.search(r"(let rbac = nms_access_dhcp\.check_rbac_access\(sess, action, method\);.*?\n\t\})", apid_src, re.S)
 m_sf_global = re.search(r"^let topology_inflight_cbs = null;", helperd_src, re.M)
-if not m_topo_handler or not m_rbac_block or not m_sf_global:
-    fail("P4F-API: failed to extract production topology handler / RBAC / global topology_inflight_cbs")
+m_helperd_topo = re.search(r"(\tif \(verb == 'topology_read'\) \{.*?\n\t\treturn;\n\t\})", helperd_src, re.S)
+if not m_topo_handler or not m_rbac_block or not m_sf_global or not m_helperd_topo:
+    fail("P4F-API: failed to extract production topology handler / RBAC / noc-helperd topology_read")
 else:
     p4f_api_uc = (
         "import * as digest from 'digest';\n"
         "import * as nms_discovery from '/tmp/p3a_test/nms_discovery.uc';\n"
         "import * as nms_access_dhcp from '/tmp/p3a_test/nms_access_dhcp.uc';\n"
+        "import * as nms_sqm from '/tmp/p3a_test/nms_sqm.uc';\n"
         "import * as nms_topology from '/tmp/p3a_test/nms_topology.uc';\n"
         "let BOOT_ID = 'boot-test-4f';\n"
+        "let CAP_GENERAL = 65536;\n"
         "let cache_map = {};\n"
         "let last_valid_topology = null;\n"
         "let prev_client_rates = {};\n"
         "let helper_fail_mode = false;\n"
-        "let topology_inflight_cbs = null;\n"
-        "let topo_collector_runs = 0;\n"
+        "let defer_exec = false;\n"
+        "let pending_exec_cbs = [];\n"
+        "let ip_link_exec_count = 0;\n"
+        + m_sf_global.group(0) + "\n"
+        "let fs = {\n"
+        "  lsdir: function(p) { if (p == '/sys/class/net/br-lan/brif') return ['wlan1']; if (p == '/sys/class/net') return ['pppoe-wan', 'wlan1', 'br-lan']; return []; },\n"
+        "  readfile: function(p) { if (p == '/sys/class/net/pppoe-wan/carrier' || p == '/sys/class/net/wlan1/carrier') return '1\\n'; return null; },\n"
+        "  stat: function(p) { return true; }\n"
+        "};\n"
+        "let uci = { cursor: function() { return {\n"
+        "  foreach: function(pkg, st, fn) {\n"
+        "    if (pkg == 'wireless' && st == 'wifi-iface') fn({ ifname: 'wlan1', device: 'radio0', ssid: 'HomeAP', mode: 'ap', disabled: '0' });\n"
+        "  },\n"
+        "  get: function() { return null; }\n"
+        "}; } };\n"
+        "let ubus = { connect: function() { return {\n"
+        "  call: function(obj, meth, args) {\n"
+        "    if (obj == 'network.interface') return { interface: [{ interface: 'wan', l3_device: 'pppoe-wan', up: true }, { interface: 'lan', l3_device: 'br-lan', up: true }] };\n"
+        "    if (obj == 'network.wireless') return { radio0: { up: true, interfaces: [{ ifname: 'wlan1', config: { mode: 'ap', ssid: 'HomeAP' } }] } };\n"
+        "    if (obj == 'hostapd.wlan1') return { clients: { 'aa:bb:cc:dd:ee:01': { signal: -50 } } };\n"
+        "    return {};\n"
+        "  },\n"
+        "  disconnect: function() {}\n"
+        "}; } };\n"
+        "function find_exe(list) { return '/usr/sbin/bridge'; }\n"
+        "function mock_exec_result(exe, argv) {\n"
+        "  let a = join(' ', argv || []);\n"
+        "  if (exe == '/sbin/ip' && index(a, 'link') >= 0) {\n"
+        "    ip_link_exec_count++;\n"
+        "    return { ok: true, output: sprintf('%J', [{ ifname: 'pppoe-wan', operstate: 'UP', flags: ['UP'], address: '' }, { ifname: 'wlan1', operstate: 'UP', flags: ['UP'], address: '60:be:b4:1e:d3:5e', master: 'br-lan' }]) };\n"
+        "  }\n"
+        "  return { ok: true, output: (index(a, '-j') >= 0 ? '[]' : '') };\n"
+        "}\n"
+        "function exec_argv_async(exe, argv, t, c, cb) {\n"
+        "  if (defer_exec) {\n"
+        "    push(pending_exec_cbs, function() { cb(mock_exec_result(exe, argv)); });\n"
+        "    return;\n"
+        "  }\n"
+        "  cb(mock_exec_result(exe, argv));\n"
+        "}\n"
+        "function prod_helper_rpc(verb, params, reply_cb) {\n"
+        + m_helperd_topo.group(1) + "\n"
+        "}\n"
         "function now_mono_ms() { return 50000; }\n"
         "function send_json_env(cli, status, res_name, data, errs) { cli.status = status; cli.data = data; }\n"
         "function call_helper(verb, params, user, rip, cb) {\n"
@@ -1279,27 +1323,7 @@ else:
         "      static_leases: {}, nlbw_by_mac: {}, nlbw_by_ip: {}\n"
         "    });\n"
         "  } else if (verb == 'topology_read') {\n"
-        "    if (topology_inflight_cbs != null) { push(topology_inflight_cbs, cb); return; }\n"
-        "    topology_inflight_cbs = [cb];\n"
-        "    topo_collector_runs++;\n"
-        "    let payload = {\n"
-        "      ok: true,\n"
-        "      ip_link_raw: sprintf('%J', [\n"
-        "        { ifname: 'pppoe-wan', operstate: 'UP', flags: ['UP'], address: '' },\n"
-        "        { ifname: 'wlan1', operstate: 'UP', flags: ['UP'], address: '60:be:b4:1e:d3:5e', master: 'br-lan' }\n"
-        "      ]),\n"
-        "      ip_addr_raw: '[]', ip_route_raw: '[]', bridge_vlan_raw: '[]', fdb_raw: '',\n"
-        "      carrier_map: { 'pppoe-wan': true, 'wlan1': true },\n"
-        "      bridges: [{ name: 'br-lan', ports: ['wlan1'] }],\n"
-        "      uci_wireless: [{ ifname: 'wlan1', device: 'radio0', ssid: 'HomeAP', mode: 'ap', disabled: false }],\n"
-        "      runtime_ap_ifs: { wlan1: { up: true, radio: 'radio0', mode: 'ap', ssid: 'HomeAP' } },\n"
-        "      wifi_stations: { 'aa:bb:cc:dd:ee:01': { ifname: 'wlan1', signal: -50 } },\n"
-        "      wan_topology: { wan_ifaces: { 'pppoe-wan': true }, lan_ifaces: { 'br-lan': true } },\n"
-        "      collector_status: { ubus_network: true, wireless: true }\n"
-        "    };\n"
-        "    if (params && params.defer) return;\n"
-        "    let cbs = topology_inflight_cbs; topology_inflight_cbs = null;\n"
-        "    for (let fcb in cbs) fcb(payload);\n"
+        "    prod_helper_rpc('topology_read', params, cb);\n"
         "  }\n"
         "}\n"
         "function prod_dispatch(sess, action, method, remote_ip) {\n"
@@ -1325,21 +1349,29 @@ else:
         "helper_fail_mode = true;\n"
         "let r4 = prod_dispatch({ username: 'admin', role: 'admin' }, 'topology', 'GET', '127.0.0.1');\n"
         "if (r4.status != 200 || !r4.data.stale || !r4.data.refresh_failed || r4.data.clients[0].mac != 'aa:bb:cc:dd:ee:01') exit(4);\n"
-        "// 5. Global single-flight topology_read coalesces concurrent callers into 1 collector run\n"
-        "helper_fail_mode = false; topo_collector_runs = 0; topology_inflight_cbs = null;\n"
+        "// 5. Real production noc-helperd topology_read single-flight coalesces 3 concurrent RPC calls into 1 collector run\n"
+        "helper_fail_mode = false; ip_link_exec_count = 0; defer_exec = true; pending_exec_cbs = [];\n"
         "let sf_res = [];\n"
-        "call_helper('topology_read', { defer: true }, 'a', '127.0.0.1', (x) => push(sf_res, x));\n"
-        "call_helper('topology_read', { defer: true }, 'b', '127.0.0.1', (x) => push(sf_res, x));\n"
-        "let cbs_sf = topology_inflight_cbs; topology_inflight_cbs = null;\n"
-        "for (let fcb in cbs_sf) fcb({ ok: true });\n"
-        "if (topo_collector_runs != 1 || length(sf_res) != 2) exit(5);\n"
+        "prod_helper_rpc('topology_read', {}, (x) => push(sf_res, x));\n"
+        "prod_helper_rpc('topology_read', {}, (x) => push(sf_res, x));\n"
+        "prod_helper_rpc('topology_read', {}, (x) => push(sf_res, x));\n"
+        "if (length(pending_exec_cbs) != 1 || length(sf_res) != 0) exit(5);\n"
+        "while (length(pending_exec_cbs) > 0) {\n"
+        "  let next_cb = shift(pending_exec_cbs);\n"
+        "  next_cb();\n"
+        "}\n"
+        "if (ip_link_exec_count != 1 || length(sf_res) != 3 || !sf_res[0].ok || !sf_res[1].ok || !sf_res[2].ok || topology_inflight_cbs != null) exit(6);\n"
+        "// 6. Subsequent call after completion starts a fresh collector run\n"
+        "defer_exec = false;\n"
+        "prod_helper_rpc('topology_read', {}, (x) => push(sf_res, x));\n"
+        "if (ip_link_exec_count != 2 || length(sf_res) != 4 || !sf_res[3].ok) exit(7);\n"
         "print('API_TOPO_PASS\\n');\n"
     )
     for ver_label, rfs in (("24.10.0-opkg", "/tmp/openwrt-24.10-x86-64-rootfs"), ("25.12.6-apk", "/tmp/openwrt-x86-64-rootfs")):
         if os.path.isdir(rfs) and os.path.isfile(os.path.join(rfs, "usr/bin/ucode")):
             stage_4f = tempfile.mkdtemp(prefix="p4f_api_")
             try:
-                for fn in ("nms_discovery.uc", "nms_access_dhcp.uc", "nms_topology.uc"):
+                for fn in ("nms_discovery.uc", "nms_access_dhcp.uc", "nms_sqm.uc", "nms_topology.uc"):
                     shutil.copy2(os.path.join(ROOT, "backend", fn), os.path.join(stage_4f, fn))
                 with open(os.path.join(stage_4f, "api_test.uc"), "w", encoding="utf-8") as f:
                     f.write(p4f_api_uc)
@@ -1350,7 +1382,7 @@ else:
                 r_api = subprocess.run(["unshare", "-r", "/usr/sbin/chroot", rfs, "/usr/bin/ucode", "/tmp/p3a_test/api_test.uc"], capture_output=True, text=True)
                 shutil.rmtree(dst_stage, ignore_errors=True)
                 if r_api.returncode == 0 and "API_TOPO_PASS" in r_api.stdout:
-                    ok(f"P4F-API[{ver_label}]: production noc-apid topology RBAC, cache isolation, stale fallback & global single-flight verified")
+                    ok(f"P4F-API[{ver_label}]: production noc-apid topology & noc-helperd topology_read single-flight verified")
                 else:
                     fail(f"P4F-API[{ver_label}]: failed rc={r_api.returncode}: {r_api.stderr} {r_api.stdout}")
             finally:

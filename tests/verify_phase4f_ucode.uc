@@ -194,11 +194,11 @@ s_wandown.ip_link_raw = sprintf('%J', [{ ifname: 'pppoe-wan', operstate: 'DOWN',
 let t_wd = nms_topo.build_live_topology(s_wandown);
 check(t_wd.wan_links[0].admin_up === true && t_wd.wan_links[0].observed_up === false && t_wd.wan_links[0].connectivity_state == 'down', 'P4F-WAN[admin_up_operstate_down_not_connected]');
 
-// 19. P1-3: exec_argv_async recursively terminates timed-out process tree (including grandchild), executes callback once
+// 19. P1-3a: exec_argv_async gives SIGTERM grace period before SIGKILL (process trapping TERM exits cleanly without SIGKILL)
 uloop.init();
 let exec_cb_count = 0;
 let exec_res = null;
-h_exec.exec_argv_async('/bin/sh', ['-c', '/bin/sleep 5'], 150, 65536, function(r) {
+h_exec.exec_argv_async('/bin/sh', ['-c', 'trap "exit 0" TERM; /bin/sleep 5'], 150, 65536, function(r) {
 	exec_cb_count++;
 	exec_res = r;
 	uloop.timer(50, function() { uloop.end(); });
@@ -210,9 +210,34 @@ for (let kp in (exec_res && exec_res.killed_pids ? exec_res.killed_pids : [])) {
 }
 check(
 	exec_cb_count == 1 && exec_res && exec_res.ok === false && exec_res.error_code == 'TIMEOUT' &&
-	exec_res.killed === true && length(exec_res.killed_pids || []) >= 2 && all_pids_dead,
-	'P4F-EXEC[timeout_kills_recursive_process_tree_and_single_callback]',
+	exec_res.killed === true && (exec_res.grace_ms || 0) >= 100 &&
+	length(exec_res.sigterm_pids || []) >= 1 && length(exec_res.sigkill_pids || []) < length(exec_res.sigterm_pids || []) &&
+	all_pids_dead,
+	'P4F-EXEC[sigterm_grace_period_allows_clean_exit]',
 	sprintf('%J', exec_res)
+);
+
+// 20. P1-3b: exec_argv_async escalates to SIGKILL after grace period for TERM-ignoring recursive process tree
+uloop.init();
+let exec2_cb_count = 0;
+let exec2_res = null;
+h_exec.exec_argv_async('/bin/sh', ['-c', 'trap "" TERM; /bin/sleep 5'], 150, 65536, function(r) {
+	exec2_cb_count++;
+	exec2_res = r;
+	uloop.timer(50, function() { uloop.end(); });
+});
+uloop.run();
+let all_pids2_dead = true;
+for (let kp in (exec2_res && exec2_res.killed_pids ? exec2_res.killed_pids : [])) {
+	if (fs.stat('/proc/' + kp)) all_pids2_dead = false;
+}
+check(
+	exec2_cb_count == 1 && exec2_res && exec2_res.ok === false && exec2_res.error_code == 'TIMEOUT' &&
+	exec2_res.killed === true && (exec2_res.grace_ms || 0) >= 100 &&
+	length(exec2_res.killed_pids || []) >= 2 && length(exec2_res.sigkill_pids || []) >= 1 &&
+	all_pids2_dead,
+	'P4F-EXEC[sigkill_after_grace_period_kills_recursive_tree]',
+	sprintf('%J', exec2_res)
 );
 
 printf('UCODE4F_SUMMARY: %d passed, %d failed\n', passed, failed);

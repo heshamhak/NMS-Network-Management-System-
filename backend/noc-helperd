@@ -567,13 +567,51 @@ function collect_descendant_pids(root_pid, out_list, seen) {
 	push(out_list, root_pid);
 }
 
-function kill_pid_tree(tpid) {
-	if (!tpid || tpid <= 0) return [];
+function kill_pid_tree(tpid, grace_ms, on_done) {
+	if (!tpid || tpid <= 0) {
+		if (on_done) on_done({ pids: [], sigterm_pids: [], sigkill_pids: [], grace_ms: 0 });
+		return [];
+	}
 	let pids = [];
 	collect_descendant_pids(tpid, pids, {});
-	for (let p in pids) system(['/bin/kill', '-TERM', '' + p]);
-	for (let p in pids) system(['/bin/kill', '-9', '' + p]);
-	return pids;
+	if (length(pids) == 0) {
+		if (on_done) on_done({ pids: [], sigterm_pids: [], sigkill_pids: [], grace_ms: 0 });
+		return [];
+	}
+	let sigterm_pids = [];
+	for (let p in pids) {
+		system(['/bin/kill', '-TERM', '' + p]);
+		push(sigterm_pids, p);
+	}
+	let wait_ms = (grace_ms && grace_ms > 0) ? grace_ms : 120;
+	let finalize_kill = function() {
+		let after_pids = [];
+		collect_descendant_pids(tpid, after_pids, {});
+		let seen_all = {};
+		let all_pids = [];
+		for (let p in pids) {
+			let sp = '' + p;
+			if (!seen_all[sp]) { seen_all[sp] = true; push(all_pids, p); }
+		}
+		for (let p in after_pids) {
+			let sp = '' + p;
+			if (!seen_all[sp]) { seen_all[sp] = true; push(all_pids, p); }
+		}
+		let sigkill_pids = [];
+		for (let p in all_pids) {
+			if (fs.stat('/proc/' + p)) {
+				system(['/bin/kill', '-9', '' + p]);
+				push(sigkill_pids, p);
+			}
+		}
+		if (on_done) on_done({ pids: all_pids, sigterm_pids: sigterm_pids, sigkill_pids: sigkill_pids, grace_ms: wait_ms });
+		return all_pids;
+	};
+	if (on_done) {
+		uloop.timer(wait_ms, finalize_kill);
+		return pids;
+	}
+	return finalize_kill();
 }
 
 function exec_argv_async(abs_exe, argv, timeout_ms, max_bytes, cb) {
@@ -589,21 +627,43 @@ function exec_argv_async(abs_exe, argv, timeout_ms, max_bytes, cb) {
 	let done = false;
 	let task = null;
 	let pid_pp = fs.pipe();
+	let cancel_file = '/tmp/.noc_exec_cancel_' + time() + '_' + pp[0].fileno();
+	try { if (fs.stat(cancel_file)) fs.unlink(cancel_file); } catch (e) {}
 	let timer = uloop.timer(timeout_ms || 8000, function() {
 		if (done) return;
 		done = true;
+		// Signal cancellation before PID lookup/kill so a late-starting worker never executes the command.
+		try { fs.writefile(cancel_file, '1'); } catch (e) {}
 		let tpid = (task && task.pid) ? task.pid() : null;
 		if (!tpid && pid_pp) {
 			let rpid = trim(pid_pp[0].read(32) || '');
 			if (match(rpid, /^[0-9]+$/)) tpid = +rpid;
 		}
 		if (pid_pp) try { pid_pp[0].close(); } catch (e) {}
-		let k_pids = kill_pid_tree(tpid);
-		try { pp[0].close(); } catch (e) {}
-		cb({ ok: false, exit_code: -1, output: '', error_code: 'TIMEOUT', killed: length(k_pids) > 0, killed_pids: k_pids, overflow: false });
+		kill_pid_tree(tpid, 120, function(k_info) {
+			try { pp[0].close(); } catch (e) {}
+			try { if (fs.stat(cancel_file)) fs.unlink(cancel_file); } catch (e) {}
+			cb({
+				ok: false,
+				exit_code: -1,
+				output: '',
+				error_code: 'TIMEOUT',
+				killed: length(k_info.pids) > 0,
+				killed_pids: k_info.pids,
+				sigterm_pids: k_info.sigterm_pids,
+				sigkill_pids: k_info.sigkill_pids,
+				grace_ms: k_info.grace_ms,
+				overflow: false
+			});
+		});
 	});
 
 	task = uloop.task(function() {
+		if (fs.stat(cancel_file)) {
+			try { pp[0].close(); pp[1].close(); } catch (e) {}
+			if (pid_pp) try { pid_pp[0].close(); pid_pp[1].close(); } catch (e) {}
+			return 124;
+		}
 		if (pid_pp) {
 			pid_pp[0].close();
 			let sp = fs.readlink('/proc/self') || '';
@@ -617,12 +677,14 @@ function exec_argv_async(abs_exe, argv, timeout_ms, max_bytes, cb) {
 			if (wfd != 2) fs.dup2(wfd, 2);
 		}
 		if (wfd > 2) pp[1].close();
+		if (fs.stat(cancel_file)) return 124;
 		let full_argv = [abs_exe];
 		for (let a in (argv || [])) push(full_argv, '' + a);
 		return system(full_argv);
 	}, function(rc) {
 		task = null;
 		if (pid_pp) try { pid_pp[0].close(); } catch (e) {}
+		try { if (fs.stat(cancel_file)) fs.unlink(cancel_file); } catch (e) {}
 		if (done) return;
 		done = true;
 		timer.cancel();
@@ -653,6 +715,7 @@ function exec_argv_async(abs_exe, argv, timeout_ms, max_bytes, cb) {
 		done = true;
 		timer.cancel();
 		try { pp[0].close(); } catch (e) {}
+		try { if (fs.stat(cancel_file)) fs.unlink(cancel_file); } catch (e) {}
 		cb({ ok: false, exit_code: -1, output: '', error_code: 'INTERNAL', overflow: false });
 	}
 }
