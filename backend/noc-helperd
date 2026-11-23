@@ -34,6 +34,22 @@ let emergency_freeze_state = null;
 let srv_sock = null;
 let srv_handle = null;
 let active_clients = 0;
+
+function safe_log_err(tag, err) {
+	try {
+		warn('noc-helperd [' + tag + '] error: ' + err + '\n');
+	} catch (e2) {}
+}
+
+function safe_cb(tag, fn) {
+	return function(...args) {
+		try {
+			return fn(...args);
+		} catch (e) {
+			safe_log_err(tag, e);
+		}
+	};
+}
 let last_tick_mono = 0;
 let reconciler_gaps = [];
 let reconciler_tick_count = 0;
@@ -5859,7 +5875,10 @@ srv_handle = uloop.handle(srv_sock, function(ev) {
 				cli.close();
 				return;
 			}
-			handle_rpc(req_obj, function(resp) {
+			let reply_sent = false;
+			let reply_once = function(resp) {
+				if (reply_sent) return;
+				reply_sent = true;
 				try {
 					let payload = sprintf('%J\n', resp);
 					let off = 0;
@@ -5877,10 +5896,18 @@ srv_handle = uloop.handle(srv_sock, function(ev) {
 							sock.poll(40, [cli, sock.POLLOUT]);
 						}
 					}
-				} catch (e) {}
+				} catch (e) {
+					safe_log_err('rpc_send', e);
+				}
 				try { cli.close(); } catch (e) {}
 				active_clients--;
-			});
+			};
+			try {
+				handle_rpc(req_obj, reply_once);
+			} catch (e) {
+				safe_log_err('handle_rpc', e);
+				reply_once({ ok: false, error_code: 'INTERNAL', message_ar: 'خطأ داخلي في الخادم' });
+			}
 		}
 	}, uloop.ULOOP_READ);
 }, uloop.ULOOP_READ);
@@ -5888,53 +5915,76 @@ srv_handle = uloop.handle(srv_sock, function(ev) {
 // 1-second P17 Lock TTL & P4 Timed-Disable Reconciler Timer (never stalls on PBKDF2!)
 let rec_timer = null;
 function reconciler_tick() {
-	let m = now_mono_ms();
-	if (last_tick_mono > 0) {
-		push(reconciler_gaps, m - last_tick_mono);
-		if (length(reconciler_gaps) > 20) reconciler_gaps = slice(reconciler_gaps, 1);
-	}
-	last_tick_mono = m;
-	reconciler_tick_count++;
-	if ((reconciler_tick_count % 5) == 0) {
-		try { gc('collect'); } catch (e) {}
-	}
+	try {
+		let m = now_mono_ms();
+		if (last_tick_mono > 0) {
+			push(reconciler_gaps, m - last_tick_mono);
+			if (length(reconciler_gaps) > 20) reconciler_gaps = slice(reconciler_gaps, 1);
+		}
+		last_tick_mono = m;
+		reconciler_tick_count++;
+		if ((reconciler_tick_count % 5) == 0) {
+			try { gc('collect'); } catch (e) {}
+		}
 
-	let lp = RUN_DIR + '/mutation.lock';
-	let lk = read_json(lp, null);
-	if (lk && (now_mono_ms() - (+lk.acquired_mono_ms || 0)) > (+lk.ttl_ms || LOCK_TTL_MS)) {
-		fs.unlink(lp);
-		audit_append('reconciler', 'lock_ttl_recover', lk.op || 'unknown', 'recovered', 'Cleared stale lock held by ' + (lk.owner || 'unknown'));
-	}
-	let td_path = ETC_DIR + '/timed_disable.json';
-	let td = read_json(td_path, null);
-	if (td && time() >= (+td.deadline_epoch || 0)) {
-		if (acquire_lock('reconciler', 'timed_disable_restore').ok) {
-			let res = adguard_http('POST', '/control/protection', { enabled: !!td.target_state });
-			if (res.ok) {
-				fs.unlink(td_path);
-				audit_append('reconciler', 'timed_disable_restore', 'protection_enabled', 'committed', 'TIMED_DISABLE_RESTORED');
-			}
-			release_lock();
+		let lp = RUN_DIR + '/mutation.lock';
+		let lk = read_json(lp, null);
+		if (lk && (now_mono_ms() - (+lk.acquired_mono_ms || 0)) > (+lk.ttl_ms || LOCK_TTL_MS)) {
+			fs.unlink(lp);
+			audit_append('reconciler', 'lock_ttl_recover', lk.op || 'unknown', 'recovered', 'Cleared stale lock held by ' + (lk.owner || 'unknown'));
 		}
-	}
-	if ((reconciler_tick_count % 30) == 0 && !auth_busy && !emergency_freeze_state) {
-		let eff = compute_current_effective_rules();
-		if (last_effective_rules_sig != '' && eff.signature != last_effective_rules_sig) {
-			if (acquire_lock('reconciler', 'client_policy_reconcile').ok) {
-				apply_bridge_block_rules(eff, function(r) {
-					if (r.ok) {
-						last_effective_rules_sig = eff.signature;
-						audit_append('reconciler', 'client_policy_reconcile', 'effective_rules', 'committed', 'Synced schedules/quotas');
+		let td_path = ETC_DIR + '/timed_disable.json';
+		let td = read_json(td_path, null);
+		if (td && time() >= (+td.deadline_epoch || 0)) {
+			if (acquire_lock('reconciler', 'timed_disable_restore').ok) {
+				try {
+					let res = adguard_http('POST', '/control/protection', { enabled: !!td.target_state });
+					if (res.ok) {
+						fs.unlink(td_path);
+						audit_append('reconciler', 'timed_disable_restore', 'protection_enabled', 'committed', 'TIMED_DISABLE_RESTORED');
 					}
-					release_lock();
-				});
+				} catch (e) {
+					safe_log_err('reconciler_timed_disable', e);
+				}
+				release_lock();
 			}
-		} else if (last_effective_rules_sig == '') {
-			last_effective_rules_sig = eff.signature;
 		}
+		if ((reconciler_tick_count % 30) == 0 && !auth_busy && !emergency_freeze_state) {
+			let eff = compute_current_effective_rules();
+			if (last_effective_rules_sig != '' && eff.signature != last_effective_rules_sig) {
+				if (acquire_lock('reconciler', 'client_policy_reconcile').ok) {
+					let lock_released = false;
+					let rel_once = function() {
+						if (lock_released) return;
+						lock_released = true;
+						release_lock();
+					};
+					try {
+						apply_bridge_block_rules(eff, function(r) {
+							try {
+								if (r && r.ok) {
+									last_effective_rules_sig = eff.signature;
+									audit_append('reconciler', 'client_policy_reconcile', 'effective_rules', 'committed', 'Synced schedules/quotas');
+								}
+							} catch (e) {
+								safe_log_err('reconciler_apply_cb', e);
+							}
+							rel_once();
+						});
+					} catch (e) {
+						rel_once();
+						safe_log_err('reconciler_apply_rules', e);
+					}
+				}
+			} else if (last_effective_rules_sig == '') {
+				last_effective_rules_sig = eff.signature;
+			}
+		}
+	} catch (e) {
+		safe_log_err('reconciler_tick', e);
 	}
-	rec_timer = uloop.timer(1000, reconciler_tick);
+	rec_timer = uloop.timer(1000, safe_cb('reconciler_timer', reconciler_tick));
 }
-rec_timer = uloop.timer(1000, reconciler_tick);
+rec_timer = uloop.timer(1000, safe_cb('reconciler_timer', reconciler_tick));
 
 uloop.run();

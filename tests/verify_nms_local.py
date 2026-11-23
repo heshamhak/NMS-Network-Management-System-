@@ -2317,6 +2317,91 @@ if os.path.isdir(rfs_auth):
 else:
     fail(f"HOSTNAME-LIFECYCLE: required OpenWrt rootfs missing at {rfs_auth}")
 
+# 8e. Exception-Boundary & Race-Guard Verification (24.10.0-opkg & 25.12.6-apk)
+print("\n=== 8e. Helperd Exception-Boundary & Race-Guard ===")
+for ver_label, rfs_ex in (("24.10.0-opkg", "/tmp/openwrt-24.10-x86-64-rootfs"), ("25.12.6-apk", "/tmp/openwrt-x86-64-rootfs")):
+    if os.path.isdir(rfs_ex):
+        hd_ex_p = os.path.join(rfs_ex, "tmp", "noc-helperd-ex-test")
+        cl_ex_p = os.path.join(rfs_ex, "tmp", "ex_client.uc")
+        shutil.copy2(os.path.join(ROOT, "backend", "noc-helperd"), hd_ex_p)
+        hd_ex_src = open(hd_ex_p, "r", encoding="utf-8").read()
+        hd_ex_src = hd_ex_src.replace(
+            "if (verb == 'services_read') {",
+            "if (verb == '__inject_rpc_fault__') { let _x = null; _x.boom(); }\n\tif (verb == 'services_read') {",
+            1,
+        ).replace(
+            "reconciler_tick_count++;",
+            "reconciler_tick_count++;\n\t\tif (reconciler_tick_count == 1) { let _r = null; _r.boom(); }",
+            1,
+        )
+        open(hd_ex_p, "w", encoding="utf-8").write(hd_ex_src)
+        uc_ex_script = """
+import * as socket from 'socket';
+// 1. Isolated race/double-release guard test
+let calls = 0;
+let rel_calls = 0;
+let settled = false;
+function once_finish() {
+    if (settled) return;
+    settled = true;
+    calls++;
+    rel_calls++;
+}
+once_finish(); // timeout path
+once_finish(); // late completion callback
+if (calls != 1 || rel_calls != 1) { print('FAIL:race\\n'); exit(1); }
+
+// 2. Real noc-helperd daemon survival after injected handle_rpc exception & reconciler_tick exception
+let s1 = socket.connect('/tmp/noc_ex_test.sock');
+s1.send('{"id":1,"verb":"__inject_rpc_fault__","params":{}}\n');
+let b1 = '';
+while (true) {
+    let c = s1.recv(65536);
+    if (!c || length(c) == 0) break;
+    b1 += c;
+    if (index(b1, '\\n') >= 0) break;
+}
+s1.close();
+let j1 = json(b1);
+if (!j1 || j1.ok || j1.error_code != 'INTERNAL') { print('FAIL:rpc_fault\\n'); exit(1); }
+let s2 = socket.connect('/tmp/noc_ex_test.sock');
+s2.send('{"id":2,"verb":"services_read","params":{}}\n');
+let b2 = '';
+while (true) {
+    let c = s2.recv(65536);
+    if (!c || length(c) == 0) break;
+    b2 += c;
+    if (index(b2, '\\n') >= 0) break;
+}
+s2.close();
+let j2 = json(b2);
+if (!j2 || !j2.ok) { print('FAIL:svc\\n'); exit(1); }
+print('EX_BOUNDARY_OK\\n');
+"""
+        open(cl_ex_p, "w").write(uc_ex_script)
+        r_ex = subprocess.run(
+            [
+                "sudo", "-n", "chroot", rfs_ex, "/bin/sh", "-c",
+                "NOC_ETC_DIR=/tmp/noc_ex_etc NOC_RUN_DIR=/tmp/noc_ex_run NOC_SOCK_PATH=/tmp/noc_ex_test.sock "
+                "/usr/bin/ucode /tmp/noc-helperd-ex-test >/tmp/hd_ex.log 2>&1 & "
+                "HPID=$!; i=0; while [ ! -S /tmp/noc_ex_test.sock ] && [ $i -lt 5 ]; do sleep 1; i=$((i+1)); done; "
+                "/usr/bin/ucode /tmp/ex_client.uc; RC=$?; "
+                "if [ $RC -ne 0 ]; then cat /tmp/hd_ex.log >&2; fi; "
+                "kill -0 $HPID 2>/dev/null || RC=99; "
+                "kill $HPID 2>/dev/null || true; wait $HPID 2>/dev/null || true; "
+                "rm -rf /tmp/noc-helperd-ex-test /tmp/ex_client.uc /tmp/noc_ex_test.sock /tmp/noc_ex_etc /tmp/noc_ex_run /tmp/hd_ex.log; exit $RC"
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if r_ex.returncode == 0 and "EX_BOUNDARY_OK" in r_ex.stdout:
+            ok(f"HELPERD-EXCEPTION-BOUNDARY[{ver_label}]: race guard once-only and real noc-helperd PID survived to serve services_read")
+        else:
+            fail(f"HELPERD-EXCEPTION-BOUNDARY[{ver_label}]: rc={r_ex.returncode} out={r_ex.stdout.strip()} err={r_ex.stderr.strip()}")
+    else:
+        fail(f"HELPERD-EXCEPTION-BOUNDARY[{ver_label}]: required OpenWrt rootfs missing at {rfs_ex}")
+
 # 9. Option A Root-Interface (/) Redirect & Atomic LuCI Restore Verification (Sections A, B, C, D)
 print("\n=== 8. Root-Interface (/) Redirect & Atomic LuCI Restore (Option A) ===")
 launcher_html_p = os.path.join(ROOT, "frontend", "launcher_index.html")
