@@ -430,7 +430,7 @@
     if (isLive && topo) {
       var isUnavail = (topo.completeness === 'unavailable' && !topo.stale);
       var isStale = !isUnavail && !!(topo.stale || topologyRefreshFailed);
-      var isPartial = !isUnavail && !!topo.partial;
+      var isPartial = !isUnavail && (!!topo.partial || topo.completeness === 'partial');
       if (qs('topoModeBadge')) {
         if (isUnavail) {
           qs('topoModeBadge').textContent = 'غير متاح (فشل الجمع)';

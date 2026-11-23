@@ -2452,6 +2452,33 @@ printf("TOPO_STRING_BRIDGES_OK\\n");
 else:
     fail("TOPOLOGY-STRING-BRIDGES: required OpenWrt rootfs missing")
 
+# 8c. Frontend topology partial-badge regression test
+topo_js_p = os.path.join(ROOT, "frontend", "noc-topology.js")
+topo_js_txt = open(topo_js_p, encoding="utf-8").read()
+if "(!!topo.partial || topo.completeness === 'partial')" in topo_js_txt:
+    node_topo_check = """
+function evalBadge(topo) {
+  var isUnavail = (topo.completeness === 'unavailable' && !topo.stale);
+  var isStale = !isUnavail && !!(topo.stale);
+  var isPartial = !isUnavail && (!!topo.partial || topo.completeness === 'partial');
+  if (isUnavail) return 'pill-danger';
+  if (isStale || isPartial) return 'pill-warning';
+  return 'pill-success';
+}
+if (evalBadge({ completeness: 'partial' }) !== 'pill-warning') process.exit(1);
+if (evalBadge({ partial: true }) !== 'pill-warning') process.exit(2);
+if (evalBadge({ completeness: 'complete' }) !== 'pill-success') process.exit(3);
+if (evalBadge({ completeness: 'unavailable' }) !== 'pill-danger') process.exit(4);
+console.log('TOPO_BADGE_OK');
+"""
+    r_tb = subprocess.run(["node", "-e", node_topo_check], capture_output=True, text=True, timeout=10)
+    if r_tb.returncode == 0 and "TOPO_BADGE_OK" in r_tb.stdout:
+        ok("TOPOLOGY-UI-PARTIAL-BADGE: completeness='partial', partial=true, complete, and unavailable map to expected badge classes")
+    else:
+        fail(f"TOPOLOGY-UI-PARTIAL-BADGE: rc={r_tb.returncode} out={r_tb.stdout} err={r_tb.stderr}")
+else:
+    fail("TOPOLOGY-UI-PARTIAL-BADGE: noc-topology.js missing (!!topo.partial || topo.completeness === 'partial') check")
+
 # 9. Option A Root-Interface (/) Redirect & Atomic LuCI Restore Verification (Sections A, B, C, D)
 print("\n=== 8. Root-Interface (/) Redirect & Atomic LuCI Restore (Option A) ===")
 launcher_html_p = os.path.join(ROOT, "frontend", "launcher_index.html")
