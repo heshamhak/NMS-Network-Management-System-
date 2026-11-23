@@ -2402,6 +2402,56 @@ print('EX_BOUNDARY_OK\\n');
     else:
         fail(f"HELPERD-EXCEPTION-BOUNDARY[{ver_label}]: required OpenWrt rootfs missing at {rfs_ex}")
 
+# 8b. Topology string-bridges regression test (bridges: ["br-lan", "docker0"])
+rfs_topo = rfs_ex if os.path.isdir(rfs_ex) else None
+if rfs_topo:
+    topo_mod = os.path.join(ROOT, "backend", "nms_topology.uc")
+    topo_script = """
+import * as nms_topology from '/tmp/nms_topology.uc';
+let ip_link_raw = '[{"ifindex":2,"ifname":"eth1","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"mtu":1500,"master":"br-lan","operstate":"UP","address":"60:be:b4:1e:d3:5d"},{"ifindex":3,"ifname":"br-lan","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"mtu":1500,"operstate":"UP","address":"60:be:b4:1e:d3:5d"}]';
+let built = nms_topology.build_live_topology({
+    sampled_ms: 1000,
+    ip_link_raw: ip_link_raw,
+    ip_addr_raw: "3: br-lan    inet 192.168.1.1/24 brd 192.168.1.255 scope global br-lan\\n",
+    ip_route_raw: "default via 192.168.1.254 dev wwan proto static\\n",
+    bridges: ["br-lan", "docker0"],
+    collector_status: { ubus_network: true, ip_link: true, ip_addr: true, ip_route: true, bridge_vlan: false, wireless: false, clients: true },
+    clients: []
+});
+if (!built || built.completeness == "unavailable") { printf("FAIL_OK comp=%J\n", built ? built.completeness : null); exit(1); }
+if (built.completeness != "partial") { printf("FAIL_COMP=%s\\n", built.completeness); exit(1); }
+let found_br = false;
+let found_port = false;
+for (let b in (built.bridges || [])) {
+    if (b.id == "bridge:br-lan" && b.name == "br-lan") {
+        found_br = true;
+        for (let p in (b.ports || [])) {
+            if (p.id == "port:eth1" && p.bridge == "br-lan") found_port = true;
+        }
+    }
+}
+if (!found_br || !found_port) { printf("FAIL_NODES br=%J port=%J\\n", found_br, found_port); exit(1); }
+printf("TOPO_STRING_BRIDGES_OK\\n");
+"""
+    r_topo = subprocess.run(
+        [
+            "bwrap", "--unshare-all", "--die-with-parent",
+            "--ro-bind", rfs_topo, "/",
+            "--tmpfs", "/tmp",
+            "--ro-bind", topo_mod, "/tmp/nms_topology.uc",
+            "/usr/bin/ucode", "-e", topo_script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if r_topo.returncode == 0 and "TOPO_STRING_BRIDGES_OK" in r_topo.stdout:
+        ok("TOPOLOGY-STRING-BRIDGES: build_live_topology handles string bridges ['br-lan', 'docker0'] and derives ports from links.master")
+    else:
+        fail(f"TOPOLOGY-STRING-BRIDGES: rc={r_topo.returncode} out={r_topo.stdout.strip()} err={r_topo.stderr.strip()}")
+else:
+    fail("TOPOLOGY-STRING-BRIDGES: required OpenWrt rootfs missing")
+
 # 9. Option A Root-Interface (/) Redirect & Atomic LuCI Restore Verification (Sections A, B, C, D)
 print("\n=== 8. Root-Interface (/) Redirect & Atomic LuCI Restore (Option A) ===")
 launcher_html_p = os.path.join(ROOT, "frontend", "launcher_index.html")

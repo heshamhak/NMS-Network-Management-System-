@@ -217,19 +217,27 @@ export function build_live_topology(sources) {
 	let vlan_nodes = [];
 	let sys_bridges = (type(src.bridges) == 'array') ? src.bridges : [];
 	for (let br in sys_bridges) {
-		if (!br || !br.name) continue;
-		let br_lnk = links[br.name];
+		let br_name = (type(br) == 'object' && br.name) ? br.name : (type(br) == 'string' && br != '' ? br : null);
+		if (!br_name) continue;
+		let br_lnk = links[br_name];
 		let br_ports = [];
-		for (let pt in (br.ports || [])) {
+		let raw_ports = (type(br) == 'object' && type(br.ports) == 'array') ? br.ports : null;
+		if (raw_ports == null) {
+			raw_ports = [];
+			for (let ifn in sort(keys(links))) {
+				if (links[ifn] && links[ifn].master == br_name) push(raw_ports, ifn);
+			}
+		}
+		for (let pt in raw_ports) {
 			let plnk = links[pt];
-			if (p_links.ok && plnk && plnk.master != '' && plnk.master != br.name) {
-				push(conflicts, { type: 'bridge_membership_conflict', port: pt, detail: 'sysfs bridge ' + br.name + ' != ip link master ' + plnk.master });
+			if (p_links.ok && plnk && plnk.master != '' && plnk.master != br_name) {
+				push(conflicts, { type: 'bridge_membership_conflict', port: pt, detail: 'sysfs bridge ' + br_name + ' != ip link master ' + plnk.master });
 			}
 			let p_vlans_list = p_vlans.vlans_by_dev[pt] || [];
 			let pnode = {
 				id: 'port:' + pt,
 				ifname: pt,
-				bridge: br.name,
+				bridge: br_name,
 				observed_up: !!(plnk && plnk.operational_up),
 				admin_up: plnk ? plnk.admin_up : false,
 				operstate: plnk ? plnk.operstate : 'unknown',
@@ -242,14 +250,14 @@ export function build_live_topology(sources) {
 			push(br_ports, pnode);
 		}
 		push(bridge_nodes, {
-			id: 'bridge:' + br.name,
-			name: br.name,
+			id: 'bridge:' + br_name,
+			name: br_name,
 			observed_up: !!(br_lnk && br_lnk.operational_up),
 			admin_up: br_lnk ? br_lnk.admin_up : false,
 			operstate: br_lnk ? br_lnk.operstate : 'unknown',
 			carrier: br_lnk ? br_lnk.carrier : null,
 			connectivity_state: br_lnk ? br_lnk.connectivity_state : 'unknown',
-			vlans: p_vlans.vlans_by_dev[br.name] || [],
+			vlans: p_vlans.vlans_by_dev[br_name] || [],
 			ports: br_ports,
 			evidence_source: br_lnk ? 'sysfs+ip_link' : 'sysfs_only'
 		});
