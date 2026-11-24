@@ -2008,6 +2008,12 @@
         runPkgAction('upgrade', basePkg);
       });
       chip.appendChild(upBtn);
+      const delBtn = el('button', 'pkg-chip-action', 'حذف', { type: 'button', title: 'حذف الحزمة ' + basePkg });
+      delBtn.addEventListener('click', () => {
+        if (qs('pkgActionNameInput')) qs('pkgActionNameInput').value = basePkg;
+        runPkgAction('del', basePkg);
+      });
+      chip.appendChild(delBtn);
       grid.appendChild(chip);
     }
   }
