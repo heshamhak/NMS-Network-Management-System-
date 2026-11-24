@@ -3318,6 +3318,21 @@
       else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'تم رفض إعادة التشغيل', 'error');
     });
 
+    if (qs('btnSysPoweroff')) {
+      qs('btnSysPoweroff').addEventListener('click', async () => {
+        const ch = await apiCall('system_control', { method: 'POST', body: { subaction: 'poweroff_challenge' } });
+        if (!ch.ok || !ch.data || !ch.data.nonce) {
+          showToast('تعذر إصدار رمز تحدي إطفاء البوابة', 'error');
+          return;
+        }
+        const ok = await confirmAction('تأكيد إطفاء البوابة الشبكية', 'سيتم إطفاء الراوتر بالكامل وقطع الاتصال حتى التشغيل اليدوي (رمز التحدي مفعل لمدة 60 ثانية).');
+        if (!ok) return;
+        const r = await apiCall('system_control', { method: 'POST', body: { subaction: 'poweroff', nonce: ch.data.nonce, confirm: 'CONFIRM_POWEROFF' } });
+        if (r.ok) showToast('جاري إطفاء البوابة...', 'success');
+        else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'تم رفض إطفاء البوابة', 'error');
+      });
+    }
+
     qs('btnAddCronJob').addEventListener('click', async () => {
       const template_id = qs('cronTemplateSelect').value;
       const schedule = qs('cronScheduleInput').value.trim();

@@ -1158,8 +1158,8 @@
                 <option value="lan">lan (br-lan)</option>
               </select>
               <input type="text" id="routeTargetInput" class="form-input mono" placeholder="الشبكة الهدف (مثال: 10.10.0.0)" />
-              <input type="text" id="routeMaskInput" class="form-input mono" value="255.255.255.0" placeholder="القناع Netmask" />
-              <input type="text" id="routeGwInput" class="form-input mono" placeholder="البوابة Gateway" />
+              <input type="text" id="routeMaskInput" class="form-input mono" value="255.255.255.0" placeholder="قناع الشبكة" />
+              <input type="text" id="routeGwInput" class="form-input mono" placeholder="البوابة الشبكية" />
               <input type="number" id="routeMetricInput" class="form-input mono diag-port-input" min="0" max="1000" value="10" placeholder="Metric" />
               <button type="button" id="btnAddStaticRoute" class="btn btn-primary btn-sm">إضافة مسار</button>
             </div>
@@ -1856,6 +1856,7 @@
                   <button type="button" id="btnExportSysBackup" class="btn btn-secondary btn-sm">تصدير نسخة احتياطية للإعدادات (JSON)</button>
                   <button type="button" id="btnExportSysupgradeBackup" class="btn btn-primary btn-sm">تصدير أرشيف النظام (sysupgrade -b)</button>
                   <button type="button" id="btnSysReboot" class="btn btn-danger btn-sm">إعادة تشغيل البوابة (بتحدي تأكيد ثنائي)</button>
+                  <button type="button" id="btnSysPoweroff" class="btn btn-danger btn-sm">إطفاء البوابة (بتحدي تأكيد ثنائي)</button>
                 </div>
                 <div class="inline-form">
                   <input type="file" id="sysBackupValidateFile" accept=".tar.gz,.tgz" class="form-input" />

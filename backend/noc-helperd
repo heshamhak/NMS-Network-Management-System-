@@ -3397,7 +3397,7 @@ function handle_rpc(req, reply_cb) {
 		'sys_save_general': true, 'sys_save_tuning': true,
 		'sys_cron_add': true, 'sys_cron_delete': true,
 		'sys_ssh_save': true, 'sys_ssh_key_add': true, 'sys_ssh_key_delete': true,
-		'sys_pkg_action': true, 'sys_sysupgrade_conf_save': true, 'sys_reboot_challenge': true, 'sys_reboot': true,
+		'sys_pkg_action': true, 'sys_sysupgrade_conf_save': true, 'sys_reboot_challenge': true, 'sys_reboot': true, 'sys_poweroff_challenge': true, 'sys_poweroff': true,
 		'auth_change_password': true, 'auth_delete_user': true,
 		'auth_totp_setup': true, 'auth_totp_enable': true, 'auth_totp_disable': true,
 		'rollback_confirm': true, 'rollback_revert': true,
@@ -5486,6 +5486,36 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 		}
 		release_lock();
 		reply_cb({ ok: true, message_ar: 'جاري إعادة تشغيل البوابة الشبكية خلال ثانيتين' });
+		return;
+	}
+
+	if (verb == 'sys_poweroff_challenge') {
+		let nonce = rand_hex(12);
+		let exp = now_mono_ms() + 60000;
+		if (!atomic_write_or_reply(RUN_DIR + '/poweroff_nonce.json', sprintf('%J\n', { nonce: nonce, actor: actor, exp: exp }), 0o600, null, null, actor, 'sys_poweroff_challenge', reply_cb)) return;
+		release_lock();
+		reply_cb({ ok: true, nonce: nonce, expires_in_ms: 60000 });
+		return;
+	}
+	if (verb == 'sys_poweroff') {
+		let nonce = trim(params.nonce || '');
+		let phrase = trim(params.confirm || '');
+		let saved = read_json(RUN_DIR + '/poweroff_nonce.json', null);
+		if (!saved || saved.nonce != nonce || now_mono_ms() > (+saved.exp || 0) || phrase != 'CONFIRM_POWEROFF') {
+			release_lock();
+			audit_append(actor, 'sys_poweroff', 'gateway', 'refused', 'Invalid phrase or expired nonce');
+			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'رمز التحدي غير صالح أو منتهي الصلاحية' });
+			return;
+		}
+		if (fs.stat(RUN_DIR + '/poweroff_nonce.json')) fs.unlink(RUN_DIR + '/poweroff_nonce.json');
+		audit_append(actor, 'sys_poweroff', 'gateway', 'committed', 'Scheduled poweroff -d 2');
+		if (!STAGING_MODE) {
+			uloop.timer(400, function() {
+				system(['/sbin/poweroff', '-d', '2']);
+			});
+		}
+		release_lock();
+		reply_cb({ ok: true, message_ar: 'جاري إطفاء البوابة الشبكية خلال ثانيتين' });
 		return;
 	}
 
