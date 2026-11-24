@@ -935,15 +935,28 @@
         if (!hasFitted) setTimeout(fitToScreen, 120);
       }
     });
-    document.addEventListener('noc:overview', function () {
-      if (window.NOC && window.NOC.state && window.NOC.state.activeTab === 'topology' && mode === 'live') {
-        renderTree();
-      }
-    });
+    var lastTopoSig = '';
+    function safeLiveRenderTree() {
+      var st = (window.NOC && window.NOC.state) ? window.NOC.state : {};
+      if (st.activeTab !== 'topology' || mode !== 'live') return;
+      var tc = qs('topoCanvas');
+      if (tc && tc.matches(':hover')) return;
+      var clArr = (st.lastClients && Array.isArray(st.lastClients.clients)) ? st.lastClients.clients : [];
+      var sig = JSON.stringify({
+        wan: st.lastOverview && st.lastOverview.wan ? !!st.lastOverview.wan.up : null,
+        deps: st.lastOverview ? st.lastOverview.dependencies : null,
+        cl: clArr.map(function (c) { return [c.mac, c.ip, c.online, c.blocked]; }),
+        topoNodes: (st.lastTopology && Array.isArray(st.lastTopology.nodes)) ? st.lastTopology.nodes.map(function (n) { return [n.id, n.status, n.parent]; }) : null
+      });
+      if (sig === lastTopoSig) return;
+      lastTopoSig = sig;
+      renderTree();
+    }
+    document.addEventListener('noc:overview', safeLiveRenderTree);
     document.addEventListener('noc:clients', function () {
       if (window.NOC && window.NOC.state && window.NOC.state.lastClients) {
         updateClientSpeeds(window.NOC.state.lastClients);
-        if (window.NOC.state.activeTab === 'topology' && mode === 'live') renderTree();
+        safeLiveRenderTree();
       }
     });
     window.addEventListener('resize', drawConnections);

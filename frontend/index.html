@@ -202,6 +202,16 @@
             </span>
             <span>الخدمات والصلاحيات</span>
           </button>
+          <button type="button" class="sidebar-btn admin-only" data-tab="packages">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+                <polyline points="3.27 6.96 12 12.01 20.73 6.96" />
+                <line x1="12" y1="22.08" x2="12" y2="12" />
+              </svg>
+            </span>
+            <span>الحزم والتحديثات</span>
+          </button>
           <button type="button" class="sidebar-btn" data-tab="docker">
             <span class="nav-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
@@ -1594,6 +1604,55 @@
         </section>
 
         <!-- TAB 7: DOCKER -->
+        <section id="view-packages" class="tab-view">
+          <article class="card admin-only">
+            <div class="card-head">
+              <h3>1. حالة النظام وتحديث المستودعات وترقية الحزم</h3>
+              <div class="inline-form">
+                <span class="status-pill pill-neutral mono" id="pkgManagerBadge">--</span>
+                <span class="status-pill pill-neutral mono" id="pkgCountBadge">--</span>
+              </div>
+            </div>
+            <div class="inset-panel">
+              <div class="card-head">
+                <h4>تحديث الفهرس وفحص الترقيات</h4>
+                <div class="inline-form">
+                  <button type="button" id="btnPkgUpdateRepos" class="btn btn-primary btn-sm">تحديث فهرس المستودعات (apk update)</button>
+                  <button type="button" id="btnPkgCheckUpgrades" class="btn btn-primary btn-sm">فحص ترقيات النظام والحزم</button>
+                  <button type="button" id="btnPkgUpgradeAll" class="btn btn-primary btn-sm">تحديث جميع الحزم المتاحة</button>
+                </div>
+              </div>
+              <div id="sysUpgradeSummaryRow" class="kv-row">
+                <span>إصدار النظام والنواة الحالي</span>
+                <strong id="sysPkgVersionText" class="mono">System OS 25.12.6 | Kernel 6.12.112</strong>
+              </div>
+              <pre id="pkgActionOutputPre" class="log-pre mono hidden"></pre>
+            </div>
+          </article>
+
+          <article class="card admin-only">
+            <div class="card-head">
+              <h3>2. تثبيت وتحديث البرامج</h3>
+            </div>
+            <div class="inline-form">
+              <input type="text" id="pkgActionNameInput" class="form-input mono" placeholder="اسم البرنامج أو الحزمة للتثبيت أو التحديث (مثال: htop أو curl أو tcpdump)..." />
+              <button type="button" id="btnPkgInstall" class="btn btn-primary btn-sm">تنزيل وتثبيت برنامج</button>
+              <button type="button" id="btnPkgUpgradeOne" class="btn btn-primary btn-sm">تحديث البرنامج</button>
+            </div>
+          </article>
+
+          <article class="card admin-only">
+            <div class="card-head">
+              <h3>3. الحزم المثبتة والبحث</h3>
+            </div>
+            <div class="inline-form">
+              <input type="text" id="pkgSearchInput" class="form-input mono" placeholder="ابحث في الحزم المثبتة (مثال: nftables أو ucode أو kmod)..." />
+              <button type="button" id="btnSearchPackages" class="btn btn-primary btn-sm">بحث في الحزم</button>
+            </div>
+            <div id="packagesListGrid" class="pkg-grid"></div>
+          </article>
+        </section>
+
         <section id="view-docker" class="tab-view">
           <article class="card">
             <div class="card-head">
@@ -1856,40 +1915,6 @@
               </div>
             </article>
           </div>
-
-          <article class="card admin-only">
-            <div class="card-head">
-              <h3>إدارة البرامج والحزم وترقية النظام (APK / OPKG Package Manager)</h3>
-              <div class="inline-form">
-                <span class="status-pill pill-neutral mono" id="pkgManagerBadge">--</span>
-                <span class="status-pill pill-neutral mono" id="pkgCountBadge">--</span>
-              </div>
-            </div>
-            <div class="inset-panel">
-              <div class="card-head">
-                <h4>حالة إصدار النظام وتحديث المستودعات وترقية الحزم</h4>
-                <div class="inline-form">
-                  <button type="button" id="btnPkgUpdateRepos" class="btn btn-primary btn-sm">تحديث فهرس المستودعات (apk update)</button>
-                  <button type="button" id="btnPkgCheckUpgrades" class="btn btn-primary btn-sm">فحص ترقيات النظام والحزم</button>
-                </div>
-              </div>
-              <div id="sysUpgradeSummaryRow" class="kv-row">
-                <span>إصدار النظام والنواة الحالي</span>
-                <strong id="sysPkgVersionText" class="mono">System OS 25.12.6 | Kernel 6.12.112</strong>
-              </div>
-              <div class="inline-form">
-                <input type="text" id="pkgActionNameInput" class="form-input mono" placeholder="اسم البرنامج أو الحزمة للتثبيت أو التحديث (مثال: htop أو curl أو tcpdump)..." />
-                <button type="button" id="btnPkgInstall" class="btn btn-primary btn-sm">تنزيل وتثبيت برنامج</button>
-                <button type="button" id="btnPkgUpgradeOne" class="btn btn-primary btn-sm">تحديث البرنامج</button>
-              </div>
-              <pre id="pkgActionOutputPre" class="log-pre mono hidden"></pre>
-            </div>
-            <div class="inline-form">
-              <input type="text" id="pkgSearchInput" class="form-input mono" placeholder="ابحث في الحزم المثبتة (مثال: nftables أو ucode أو kmod)..." />
-              <button type="button" id="btnSearchPackages" class="btn btn-primary btn-sm">بحث في الحزم</button>
-            </div>
-            <div id="packagesListGrid" class="pkg-grid"></div>
-          </article>
 
           <article id="readonlyProvisionCard" class="card admin-only">
             <div class="card-head">

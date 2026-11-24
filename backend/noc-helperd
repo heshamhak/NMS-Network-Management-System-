@@ -737,7 +737,7 @@ function exec_argv_async(abs_exe, argv, timeout_ms, max_bytes, cb) {
 }
 
 // --- HTTP client to loopback AdGuard Home (:8080) using dedicated adguard.json ---
-function adguard_http(method, path, body_json) {
+function adguard_http(method, path, body_json, timeout_ms) {
 	let creds = read_json(ETC_DIR + '/adguard.json', null);
 	if (!creds || !creds.username || !creds.password) {
 		return { ok: false, status: 401, error_code: 'AUTH', message_ar: 'بيانات اتصال واجهة AdGuard غير مهيأة في /etc/noc-console/adguard.json' };
@@ -759,8 +759,9 @@ function adguard_http(method, path, body_json) {
 	}
 	s.send(req_str);
 	let raw = '';
+	let poll_ms = timeout_ms || 1500;
 	while (length(raw) < 262144) {
-		if (!sock.poll(1500, [s, sock.POLLIN])) break;
+		if (!sock.poll(poll_ms, [s, sock.POLLIN])) break;
 		let chunk = s.recv(8192);
 		if (!chunk || length(chunk) == 0) break;
 		raw += chunk;
@@ -4102,7 +4103,7 @@ function handle_rpc(req, reply_cb) {
 	}
 
 	if (verb == 'agh_refresh_filters') {
-		let r = adguard_http('POST', '/control/filtering/refresh', { whitelist: false });
+		let r = adguard_http('POST', '/control/filtering/refresh', { whitelist: false }, 15000);
 		release_lock();
 		audit_append(actor, 'agh_refresh_filters', 'filtering', r.ok ? 'committed' : 'failed', 'Refreshed blocklists');
 		reply_cb(r.ok ? { ok: true, message_ar: 'تم تحديث قوائم الفلترة بنجاح' } : r);
@@ -5386,7 +5387,7 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 	if (verb == 'sys_pkg_action') {
 		let op = trim(params.op || '');
 		let pkg = trim(params.package || '');
-		let allow_ops = { 'update': true, 'check_upgrades': true, 'install': true, 'upgrade': true, 'del': true };
+		let allow_ops = { 'update': true, 'check_upgrades': true, 'upgrade_all': true, 'install': true, 'upgrade': true, 'del': true };
 		if (!allow_ops[op]) {
 			release_lock();
 			reply_cb({ ok: false, error_code: 'VALIDATION', message_ar: 'عملية إدارة الحزم غير مدعومة' });
@@ -5420,6 +5421,7 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 		if (mgr.manager == 'apk') {
 			if (op == 'update') argv = ['update'];
 			else if (op == 'check_upgrades') argv = ['upgrade', '-s'];
+			else if (op == 'upgrade_all') argv = ['upgrade'];
 			else if (op == 'install') argv = ['add', pkg];
 			else if (op == 'upgrade') argv = ['upgrade', pkg];
 			else if (op == 'del') argv = ['del', pkg];
@@ -5434,12 +5436,16 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 		exec_argv_async(mgr.bin, argv, 25000, 262144, function(r) {
 			release_lock();
 			let clean_out = scrub_prohibited(r.output || '');
-			audit_append(actor, 'sys_pkg_' + op, pkg || 'repositories', r.ok ? 'committed' : 'failed', substr(replace(clean_out, /\s+/g, ' '), 0, 120));
+			let fail_diag = 'error_code=' + (r.error_code || 'UNKNOWN') + ' exit_code=' + (r.exit_code != null ? r.exit_code : -1);
+			let audit_detail = clean_out != '' ? substr(replace(clean_out, /\s+/g, ' '), 0, 120) : (r.ok ? 'ok' : fail_diag);
+			audit_append(actor, 'sys_pkg_' + op, pkg || 'repositories', r.ok ? 'committed' : 'failed', audit_detail);
 			reply_cb({
 				ok: r.ok,
 				pkg_manager: mgr.manager,
 				op: op,
 				package: pkg,
+				error_code: r.ok ? null : (r.error_code || 'DEPENDENCY'),
+				exit_code: r.exit_code,
 				output: clean_out != '' ? clean_out : (r.ok ? 'اكتملت العملية بنجاح دون رسائل إضافية.' : 'تعذر تنفيذ عملية الحزمة.'),
 				message_ar: r.ok ? 'تم تنفيذ عملية الحزم البرمجية بنجاح' : 'تعذر إتمام عملية الحزمة البرمجية (راجع المخرجات)'
 			});
@@ -5616,17 +5622,11 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 		if (cfg.telegram_enabled && cfg.telegram_bot_token && cfg.telegram_chat_id) {
 			let tg_url = 'https://api.telegram.org/bot' + cfg.telegram_bot_token + '/sendMessage';
 			let txt = title + '\n' + msg;
-			system(sprintf('curl -fsS --max-time 4 -X POST %s -d chat_id=%s --data-urlencode text=%s >/dev/null 2>&1 &',
-				sprintf("'%s'", replace(tg_url, /'/g, '')),
-				sprintf("'%s'", replace('' + cfg.telegram_chat_id, /'/g, '')),
-				sprintf("'%s'", replace(txt, /'/g, ''))));
+			exec_argv_async('/usr/bin/curl', ['-fsS', '--max-time', '4', '-X', 'POST', tg_url, '-d', 'chat_id=' + cfg.telegram_chat_id, '--data-urlencode', 'text=' + txt], 5000, CAP_GENERAL, function() {});
 			push(sent_channels, 'Telegram');
 		}
 		if (cfg.ntfy_enabled && cfg.ntfy_url) {
-			system(sprintf('curl -fsS --max-time 4 -H %s -d %s %s >/dev/null 2>&1 &',
-				sprintf("'Title: %s'", replace(title, /'/g, '')),
-				sprintf("'%s'", replace(msg, /'/g, '')),
-				sprintf("'%s'", replace(cfg.ntfy_url, /'/g, ''))));
+			exec_argv_async('/usr/bin/curl', ['-fsS', '--max-time', '4', '-H', 'Title: ' + title, '-d', msg, cfg.ntfy_url], 5000, CAP_GENERAL, function() {});
 			push(sent_channels, 'ntfy');
 		}
 		release_lock();

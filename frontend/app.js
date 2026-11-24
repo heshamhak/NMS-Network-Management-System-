@@ -69,11 +69,23 @@
   function showToast(msg, kind) {
     const c = qs('toastContainer');
     if (!c) return;
-    const t = el('div', 'toast ' + (kind || ''), msg);
+    const t = el('div', 'toast ' + (kind || ''));
+    t.appendChild(el('span', '', msg));
+    if (kind === 'error' || kind === 'danger') {
+      const cp = el('button', 'btn btn-secondary btn-sm', 'نسخ');
+      cp.type = 'button';
+      cp.style.marginInlineStart = '10px';
+      cp.addEventListener('click', () => {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(String(msg || '')).then(() => { cp.textContent = 'تم النسخ'; }).catch(() => {});
+        }
+      });
+      t.appendChild(cp);
+    }
     c.appendChild(t);
     setTimeout(() => {
       if (t.parentNode) t.parentNode.removeChild(t);
-    }, 4200);
+    }, (kind === 'error' || kind === 'danger') ? 8000 : 4200);
   }
 
   const nfDec2 = new Intl.NumberFormat('ar', { numberingSystem: 'latn', minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -506,7 +518,7 @@
     const titleNode = qs('activePageTitle');
     if (titleNode) titleNode.textContent = TAB_TITLES[tab] || 'نظام إدارة الشبكة NMS';
     closeMobileDrawer();
-    refreshActiveTab();
+    refreshActiveTab(true);
     document.dispatchEvent(new CustomEvent('noc:tab', { detail: { tab: tab } }));
   }
 
@@ -2004,6 +2016,7 @@
     const labels = {
       update: 'تحديث فهرس مستودعات النظام (apk update)',
       check_upgrades: 'فحص ترقيات النظام والحزم المتاحة (apk upgrade -s)',
+      upgrade_all: 'تحديث جميع الحزم المتاحة (apk upgrade)',
       install: 'تنزيل وتثبيت البرنامج (' + pkgName + ')',
       upgrade: 'تحديث البرنامج (' + pkgName + ')',
       del: 'حذف الحزمة (' + pkgName + ')'
@@ -2016,20 +2029,47 @@
       const ok = await confirmAction('تأكيد عملية الحزم البرمجية', 'سيتم تنفيذ: ' + (labels[op] || op));
       if (!ok) return;
     }
+    const overlay = el('div', 'modal-backdrop');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(15,15,20,0.72);backdrop-filter:blur(4px);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px;';
+    const box = el('div', 'card');
+    box.style.cssText = 'width:min(640px,96vw);max-height:82vh;display:flex;flex-direction:column;gap:12px;padding:18px;';
+    const head = el('div', 'card-head');
+    head.appendChild(el('h3', '', labels[op] || op));
+    const pill = el('span', 'status-pill pill-neutral', 'جاري التنفيذ على الراوتر...');
+    head.appendChild(pill);
+    box.appendChild(head);
+    const modalPre = el('pre', 'log-pre mono', 'جاري إرسال الأمر إلى الراوتر والانتظار...');
+    modalPre.style.cssText = 'max-height:50vh;overflow:auto;margin:0;';
+    box.appendChild(modalPre);
+    const closeBtn = el('button', 'btn btn-secondary btn-sm', 'إغلاق');
+    closeBtn.type = 'button';
+    closeBtn.style.alignSelf = 'flex-end';
+    closeBtn.addEventListener('click', () => { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); });
+    box.appendChild(closeBtn);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
     const pre = qs('pkgActionOutputPre');
     if (pre) {
       pre.textContent = 'جاري تنفيذ (' + (labels[op] || op) + ')...';
       pre.classList.remove('hidden');
     }
     const r = await apiCall('system_control', { method: 'POST', body: { subaction: 'pkg_action', op, package: pkgName || '' } });
+    const outText = (r && r.data && (r.data.output || r.data.message_ar)) || '';
     if (r && r.data && pre) {
-      pre.textContent = r.data.output || r.data.message_ar || 'اكتملت العملية.';
+      pre.textContent = outText || 'اكتملت العملية.';
     }
     if (r && r.ok) {
+      pill.className = 'status-pill pill-ok';
+      pill.textContent = 'تم التنفيذ بنجاح';
+      modalPre.textContent = outText || 'اكتملت العملية بنجاح.';
       showToast((r.data && r.data.message_ar) || 'تم التنفيذ بنجاح', 'success');
       loadPackagesList(qs('pkgSearchInput') ? qs('pkgSearchInput').value.trim() : '');
     } else {
       const errMsg = (r && r.errors && r.errors[0] && r.errors[0].message_ar) || 'تعذر إتمام عملية الحزمة';
+      pill.className = 'status-pill pill-danger';
+      pill.textContent = 'فشلت العملية';
+      modalPre.textContent = outText || errMsg;
       if (pre && (!r || !r.data || !r.data.output)) pre.textContent = errMsg;
       showToast(errMsg, 'error');
     }
@@ -2086,7 +2126,7 @@
     if (res.ok) {
       showToast((res.data && res.data.message) || 'تمت إضافة القاعدة بنجاح', 'success');
       qs('customDnsRuleInput').value = '';
-      refreshActiveTab();
+      refreshActiveTab(true);
     } else {
       showToast((res.errors && res.errors[0] && res.errors[0].message_ar) || 'فشل إضافة القاعدة', 'error');
     }
@@ -2098,7 +2138,7 @@
     const res = await apiCall('adguard_control', { method: 'POST', body: { subaction: 'remove_rule', rule } });
     if (res.ok) {
       showToast('تمت إزالة القاعدة بنجاح', 'success');
-      refreshActiveTab();
+      refreshActiveTab(true);
     } else {
       showToast((res.errors && res.errors[0] && res.errors[0].message_ar) || 'تعذر حذف القاعدة', 'error');
     }
@@ -2111,10 +2151,10 @@
     });
     if (res.ok) {
       showToast('تم تحديث إعداد الحماية بنجاح', 'success');
-      refreshActiveTab();
+      refreshActiveTab(true);
     } else {
       showToast((res.errors && res.errors[0] && res.errors[0].message_ar) || 'تعذر تحديث الحماية', 'error');
-      refreshActiveTab();
+      refreshActiveTab(true);
     }
   }
 
@@ -2131,7 +2171,7 @@
     });
     if (res.ok) {
       showToast((res.data && res.data.message_ar) || 'تم تنفيذ الإجراء بنجاح', 'success');
-      refreshActiveTab();
+      refreshActiveTab(true);
     } else {
       showToast((res.errors && res.errors[0] && res.errors[0].message_ar) || 'رفض تنفيذ الحظر', 'error');
     }
@@ -2144,7 +2184,7 @@
     const res = await apiCall('service_control', { method: 'POST', body: { subaction, name } });
     if (res.ok) {
       showToast((res.data && res.data.message_ar) || 'تم التنفيذ بنجاح', 'success');
-      refreshActiveTab();
+      refreshActiveTab(true);
     } else {
       showToast((res.errors && res.errors[0] && res.errors[0].message_ar) || 'تعذر تنفيذ العملية', 'error');
     }
@@ -2183,7 +2223,7 @@
     const res = await apiCall('firewall_control', { method: 'POST', body: { subaction: 'toggle_rule', id, enabled } });
     if (res.ok) {
       showToast((res.data && res.data.message_ar) || 'تم التحديث بنجاح', 'success');
-      refreshActiveTab();
+      refreshActiveTab(true);
     } else {
       showToast((res.errors && res.errors[0] && res.errors[0].message_ar) || 'مرفوض', 'error');
     }
@@ -2195,7 +2235,7 @@
     const res = await apiCall('firewall_control', { method: 'POST', body: { subaction: 'delete_redirect', id } });
     if (res.ok) {
       showToast('تم حذف القاعدة بنجاح', 'success');
-      refreshActiveTab();
+      refreshActiveTab(true);
     } else {
       showToast((res.errors && res.errors[0] && res.errors[0].message_ar) || 'تعذر حذف القاعدة', 'error');
     }
@@ -2213,7 +2253,7 @@
         qs('dockerLogsPre').classList.remove('hidden');
       } else {
         showToast((res.data && res.data.message_ar) || 'تم التنفيذ بنجاح', 'success');
-        refreshActiveTab();
+        refreshActiveTab(true);
       }
     } else {
       showToast((res.errors && res.errors[0] && res.errors[0].message_ar) || 'فشل تنفيذ أمر الحاوية', 'error');
@@ -2244,7 +2284,7 @@
     const res = await apiCall('auth_admin', { method: 'POST', body: { subaction: 'delete_user', username } });
     if (res.ok) {
       showToast('تم حذف الحساب بنجاح', 'success');
-      refreshActiveTab();
+      refreshActiveTab(true);
     } else {
       showToast((res.errors && res.errors[0] && res.errors[0].message_ar) || 'تعذر حذف الحساب', 'error');
     }
@@ -2283,8 +2323,9 @@
     } catch (e) {}
   }
 
-  async function refreshActiveTab() {
-    if (!state.authenticated) return;
+  async function refreshActiveTab(forceManual) {
+    if (!state.authenticated || state.refreshInFlight) return;
+    state.refreshInFlight = true;
     const tab = state.activeTab;
     try {
       if (tab === 'dashboard') {
@@ -2301,7 +2342,17 @@
         if (r && r.ok && r.data) renderAdGuard(r.data);
       } else if (tab === 'clients') {
         const r = await apiCall('clients');
-        if (r && r.ok && r.data) renderClients(r.data);
+        if (r && r.ok && r.data) {
+          const clList = Array.isArray(r.data.clients) ? r.data.clients : [];
+          const sig = JSON.stringify(clList.map((c) => [c.mac, c.ip, c.name, c.blocked, c.online, c.iface]));
+          const tbody = qs('clientsTableBody');
+          const interacting = tbody && (tbody.matches(':hover') || (document.activeElement && tbody.contains(document.activeElement)));
+          state.lastClients = r.data;
+          if (!interacting && sig !== state.lastClientsSig) {
+            state.lastClientsSig = sig;
+            renderClients(r.data);
+          }
+        }
       } else if (tab === 'network') {
         const r = await apiCall('network');
         if (r && r.ok && r.data) renderNetwork(r.data);
@@ -2316,7 +2367,15 @@
         if (r && r.ok && r.data) renderDocker(r.data);
       } else if (tab === 'tailscale') {
         const r = await apiCall('tailscale');
-        if (r && r.ok && r.data) renderTailscale(r.data);
+        if (r && r.ok && r.data) {
+          const sig = JSON.stringify(r.data);
+          const tsView = qs('view-tailscale');
+          const interacting = tsView && (tsView.matches(':hover') || (document.activeElement && tsView.contains(document.activeElement)));
+          if (!interacting && sig !== state.lastTailscaleSig) {
+            state.lastTailscaleSig = sig;
+            renderTailscale(r.data);
+          }
+        }
       } else if (tab === 'services') {
         const r = await apiCall('services');
         if (r && r.ok && r.data) renderServices(r.data);
@@ -2327,9 +2386,14 @@
         }
       } else if (tab === 'diagnostics') {
         await fetchLogs();
-        loadReportAndAudit();
+        if (forceManual || state.lastDiagTabVisit !== state.activeTab) {
+          state.lastDiagTabVisit = state.activeTab;
+          loadReportAndAudit();
+        }
       }
-    } catch (e) {}
+    } catch (e) {} finally {
+      state.refreshInFlight = false;
+    }
   }
 
   function startSSE() {
@@ -2398,18 +2462,30 @@
     }
   }
 
+  function getPollIntervalMs(tab) {
+    return (tab === 'dashboard' || tab === 'topology' || tab === 'clients') ? 3500 : 15000;
+  }
+
   async function sequentialPollTick() {
     if (!state.authenticated) return;
-    if (!state.sse) await refreshOverview();
-    if (state.activeTab !== 'dashboard') await refreshActiveTab();
-    state.pollTimer = setTimeout(sequentialPollTick, 3500);
+    if (!document.hidden) {
+      if (!state.sse) await refreshOverview();
+      if (state.activeTab !== 'dashboard') await refreshActiveTab(false);
+    }
+    state.pollTimer = setTimeout(sequentialPollTick, getPollIntervalMs(state.activeTab));
   }
 
   function startLiveLoop() {
     stopLiveLoop();
     startSSE();
-    refreshActiveTab();
-    state.pollTimer = setTimeout(sequentialPollTick, 3500);
+    refreshActiveTab(true);
+    state.pollTimer = setTimeout(sequentialPollTick, getPollIntervalMs(state.activeTab));
+    if (!state.visBound) {
+      state.visBound = true;
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && state.authenticated) refreshActiveTab(false);
+      });
+    }
     state.ageTimer = setInterval(() => {
       const ageNode = qs('cmdSampleAge');
       if (!ageNode || !state.lastOverviewTs) return;
@@ -2452,7 +2528,7 @@
 
     qs('btnRefreshNow').addEventListener('click', () => {
       refreshOverview();
-      refreshActiveTab();
+      refreshActiveTab(true);
     });
 
     qs('mobileNavBtn').addEventListener('click', () => {
@@ -2607,7 +2683,7 @@
       if (r.ok) {
         qs('aghRewriteDomainInput').value = ''; qs('aghRewriteAnswerInput').value = '';
         showToast('تمت إضافة سجل التوجيه بنجاح', 'success');
-        refreshActiveTab();
+        refreshActiveTab(true);
       } else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'بيانات غير صالحة', 'error');
     });
 
@@ -2618,7 +2694,7 @@
       if (r.ok) {
         qs('aghFilterNameInput').value = ''; qs('aghFilterUrlInput').value = '';
         showToast('تمت إضافة قائمة الفلتر بنجاح', 'success');
-        refreshActiveTab();
+        refreshActiveTab(true);
       } else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'رابط غير صالح', 'error');
     });
 
@@ -2640,7 +2716,7 @@
           qs('aghFilterNameInput').value = '';
           qs('aghFilterUrlInput').value = '';
           showToast('تم تنزيل وتفعيل قائمة الحجب (' + name + ') بنجاح', 'success');
-          refreshActiveTab();
+          refreshActiveTab(true);
         } else {
           showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'تعذر تنزيل القائمة أو أنها مضافة مسبقاً', 'error');
         }
@@ -2658,7 +2734,7 @@
         qs('aghCredPass').value = '';
         qs('aghCredsSetupBox').classList.add('hidden');
         showToast('تم ربط حساب AdGuard بنجاح', 'success');
-        refreshActiveTab();
+        refreshActiveTab(true);
       } else {
         showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'فشل التحقق من البيانات', 'error');
       }
@@ -2685,7 +2761,7 @@
           if (hostname) await apiCall('client_control', { method: 'POST', body: { subaction: 'set_meta', mac, ip, nickname: hostname, rate_limit_kbps: 0 } });
           qs('staticLeaseNameInput').value = ''; qs('staticLeaseMacInput').value = ''; qs('staticLeaseIpInput').value = '';
           showToast('تمت إضافة الجهاز وتثبيت عنوان IP الثابت بنجاح', 'success');
-          refreshActiveTab();
+          refreshActiveTab(true);
         } else {
           showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'بيانات MAC أو IP غير صالحة', 'error');
         }
@@ -2717,7 +2793,7 @@
       const r2 = await apiCall('client_control', { method: 'POST', body: { subaction: 'static_lease', mac, ip, hostname: nickname.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24), enable: enableStatic } });
       qs('clientEditPanel').classList.add('hidden');
       showToast(r2.ok ? 'تم حفظ تعديلات الجهاز وتثبيت DHCP بنجاح' : 'تم حفظ التقييد والاسم', 'success');
-      refreshActiveTab();
+      refreshActiveTab(true);
     });
 
     qs('btnAddClientDomain').addEventListener('click', async () => {
@@ -2727,7 +2803,7 @@
       if (r.ok) {
         qs('clientDomainNameInput').value = ''; qs('clientDomainIpInput').value = '';
         showToast('تمت إضافة النطاق المحلي بنجاح', 'success');
-        refreshActiveTab();
+        refreshActiveTab(true);
       } else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'بيانات غير صالحة', 'error');
     });
 
@@ -2768,7 +2844,7 @@
       if (r.ok) {
         qs('netWanPass').value = '';
         showToast('تم حفظ إعدادات WAN PPPoE', 'success');
-        refreshActiveTab();
+        refreshActiveTab(true);
       } else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'فشل الحفظ', 'error');
     });
 
@@ -2790,7 +2866,7 @@
       if (r.ok) {
         qs('wifiUplinkPsk').value = '';
         showToast('تم حفظ وربط الشبكة اللاسلكية', 'success');
-        refreshActiveTab();
+        refreshActiveTab(true);
       } else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'فشل التحديث', 'error');
     });
 
@@ -2810,7 +2886,7 @@
       if (r.ok) {
         qs('wifiApKey').value = '';
         showToast('تم حفظ إعدادات نقطة الوصول 5GHz', 'success');
-        refreshActiveTab();
+        refreshActiveTab(true);
       } else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'فشل الحفظ', 'error');
     });
 
@@ -2829,7 +2905,7 @@
       if (r.ok) {
         qs('routeTargetInput').value = ''; qs('routeGwInput').value = '';
         showToast('تمت إضافة المسار الثابت بنجاح', 'success');
-        refreshActiveTab();
+        refreshActiveTab(true);
       } else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'بيانات غير صالحة', 'error');
     });
 
@@ -2951,7 +3027,7 @@
       if (r.ok) {
         qs('fwRuleName').value = ''; qs('fwRuleSrcIp').value = ''; qs('fwRulePort').value = '';
         showToast('تمت إضافة قاعدة الجدار الناري بنجاح', 'success');
-        refreshActiveTab();
+        refreshActiveTab(true);
       } else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'مرفوض أو غير صالح', 'error');
     });
 
@@ -2970,7 +3046,7 @@
       if (r.ok) {
         qs('fwFwdName').value = ''; qs('fwFwdExtPort').value = ''; qs('fwFwdIntIp').value = ''; qs('fwFwdIntPort').value = '';
         showToast('تمت إضافة قاعدة التحويل بنجاح', 'success');
-        refreshActiveTab();
+        refreshActiveTab(true);
       } else {
         showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'مرفوض أو غير صالح', 'error');
       }
@@ -3000,7 +3076,7 @@
       if (r.ok) {
         qs('banipEntryInput').value = '';
         showToast('تمت إضافة العنوان إلى القائمة', 'success');
-        refreshActiveTab();
+        refreshActiveTab(true);
       } else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'مرفوض أو غير صالح', 'error');
     });
 
@@ -3263,7 +3339,7 @@
       if (r.ok) {
         qs('sshNewKeyInput').value = '';
         showToast('تمت إضافة المفتاح العام بنجاح', 'success');
-        refreshActiveTab();
+        refreshActiveTab(true);
       } else showToast((r.errors && r.errors[0] && r.errors[0].message_ar) || 'مفتاح غير صالح', 'error');
     });
 
@@ -3276,6 +3352,9 @@
     }
     if (qs('btnPkgCheckUpgrades')) {
       qs('btnPkgCheckUpgrades').addEventListener('click', () => runPkgAction('check_upgrades', ''));
+    }
+    if (qs('btnPkgUpgradeAll')) {
+      qs('btnPkgUpgradeAll').addEventListener('click', () => runPkgAction('upgrade_all', ''));
     }
     if (qs('btnPkgInstall')) {
       qs('btnPkgInstall').addEventListener('click', () => runPkgAction('install', (qs('pkgActionNameInput').value || '').trim()));
@@ -3312,7 +3391,7 @@
         qs('roPasswordInput').value = '';
         qs('roStatusMsg').textContent = (r.data && r.data.message_ar) || 'تم الحفظ بنجاح';
         showToast('تم إعداد حساب المراقب بنجاح', 'success');
-        refreshActiveTab();
+        refreshActiveTab(true);
       } else {
         qs('roStatusMsg').textContent = (r.errors && r.errors[0] && r.errors[0].message_ar) || 'فشل إعداد الحساب';
         showToast(qs('roStatusMsg').textContent, 'error');
@@ -3533,7 +3612,7 @@
         activeRollbackToken = '';
         if (qs('rollbackBanner')) qs('rollbackBanner').classList.add('hidden');
         showToast((r && r.data && r.data.message_ar) || 'تم التراجع الفوري', r && r.ok ? 'success' : 'error');
-        refreshActiveTab();
+        refreshActiveTab(true);
       });
     }
     if (qs('btnTotpSetup')) {
@@ -3634,9 +3713,7 @@
     });
 
     // Register PWA Service Worker
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/pro/sw.js').catch(() => {});
-    }
+    // Service Worker registration omitted on self-signed TLS (:8743)
   }
 
   document.addEventListener('DOMContentLoaded', () => {
