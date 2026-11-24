@@ -858,6 +858,7 @@
     'تصدير الإعدادات وإعادة تشغيل البوابة': 'Export Config & Reboot Gateway',
     'تصدير نسخة احتياطية للإعدادات (JSON)': 'Export Config Backup (JSON)',
     'إعادة تشغيل البوابة (بتحدي تأكيد ثنائي)': 'Reboot Gateway (2-Step Confirm)',
+    'إطفاء البوابة (بتحدي تأكيد ثنائي)': 'Power Off Gateway (2-Step Confirm)',
     'المهام الدورية المجدولة (Crontab)': 'Scheduled Tasks (Crontab)',
     'إضافة مهمة مجدولة': 'Add Scheduled Task',
     'السطر المجدول': 'Cron Entry',
