@@ -37,7 +37,8 @@ let active_clients = 0;
 
 function safe_log_err(tag, err) {
 	try {
-		warn('noc-helperd [' + tag + '] error: ' + err + '\n');
+		let st = (type(err) == 'object' && err.stacktrace && err.stacktrace[0]) ? (' @' + (err.stacktrace[0].filename || '') + ':' + (err.stacktrace[0].line || '')) : '';
+		warn('noc-helperd [' + tag + '] error: ' + err + st + '\n');
 	} catch (e2) {}
 }
 
@@ -501,6 +502,18 @@ function enter_emergency_freeze(reason) {
 	return { frozen: true, freeze_persisted: !!f_aw.ok, freeze_persist_failed: !f_aw.ok, f_aw: f_aw };
 }
 
+function acquire_lock(owner, op) {
+	let lp = RUN_DIR + '/mutation.lock';
+	let now_m = now_mono_ms();
+	let cur = read_json(lp, null);
+	if (cur && (now_m - (+cur.acquired_mono_ms || 0)) <= (+cur.ttl_ms || LOCK_TTL_MS)) {
+		return { ok: false, holder: cur };
+	}
+	let aw = atomic_write(lp, sprintf('%J\n', { owner: owner, op: op, acquired_mono_ms: now_m, ttl_ms: LOCK_TTL_MS }), 0o600);
+	if (!aw.ok) return { ok: false, error: aw.error };
+	return { ok: true };
+}
+
 function enforce_mutation_gate(verb, params, actor, reply_cb) {
 	let stg = check_staging_guard();
 	if (!stg.ok) { reply_cb(stg); return false; }
@@ -547,18 +560,6 @@ function enforce_mutation_gate(verb, params, actor, reply_cb) {
 		return false;
 	}
 	return true;
-}
-
-function acquire_lock(owner, op) {
-	let lp = RUN_DIR + '/mutation.lock';
-	let now_m = now_mono_ms();
-	let cur = read_json(lp, null);
-	if (cur && (now_m - (+cur.acquired_mono_ms || 0)) <= (+cur.ttl_ms || LOCK_TTL_MS)) {
-		return { ok: false, holder: cur };
-	}
-	let aw = atomic_write(lp, sprintf('%J\n', { owner: owner, op: op, acquired_mono_ms: now_m, ttl_ms: LOCK_TTL_MS }), 0o600);
-	if (!aw.ok) return { ok: false, error: aw.error };
-	return { ok: true };
 }
 
 function release_lock() {
@@ -4286,15 +4287,17 @@ function rollback_client_rules(rules_path, snap_raw, prev_rules, reason_prefix, 
 	if (verb == 'service_restart' || verb == 'service_action') {
 		let svc = trim(params.name || '');
 		let sub = verb == 'service_restart' ? 'restart' : trim(params.subaction || 'restart');
-		let allow_svcs = { 'adguardhome': true, 'dnsmasq': true, 'firewall': true, 'sqm': true, 'miniupnpd': true, 'banip': true, 'cron': true, 'dockerd': true, 'tailscale': true, 'network': true, 'sysntpd': true };
-		let allow_ops = { 'start': true, 'stop': true, 'restart': true, 'enable': true, 'disable': true };
+		let deny_svcs = { 'dropbear': true, 'uhttpd': true, 'network': true, 'noc-helperd': true, 'noc-apid': true, 'boot': true, 'sysctl': true, 'done': true, 'umount': true };
+		let allow_ops = { 'start': true, 'stop': true, 'restart': true, 'reload': true, 'enable': true, 'disable': true };
 		let protected_stop = { 'uhttpd': true, 'dropbear': true, 'dnsmasq': true, 'firewall': true };
-		if (!allow_svcs[svc] || !allow_ops[sub] || !fs.stat('/etc/init.d/' + svc)) {
+		let svc_lst = match(svc, /^[a-zA-Z0-9._-]+$/) ? fs.lstat('/etc/init.d/' + svc) : null;
+		let svc_st = (svc_lst && svc_lst.type != 'symlink') ? fs.stat('/etc/init.d/' + svc) : null;
+		if (!allow_ops[sub] || deny_svcs[svc] || !svc_lst || svc_lst.type == 'symlink' || !svc_st || (svc_st.mode & 0o111) == 0) {
 			release_lock();
 			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'الخدمة أو العملية غير مدرجة ضمن القائمة المعتمدة' });
 			return;
 		}
-		if ((sub == 'stop' || sub == 'disable') && protected_stop[svc]) {
+		if ((sub == 'stop' || sub == 'disable' || sub == 'restart') && protected_stop[svc]) {
 			release_lock();
 			audit_append(actor, 'service_action', svc + ':' + sub, 'refused', 'Protected core service stop refused');
 			reply_cb({ ok: false, error_code: 'FORBIDDEN', message_ar: 'مرفوض: لا يُسمح بإيقاف أو تعطيل الخدمات الأساسية لضمان استقرار الاتصال' });

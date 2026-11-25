@@ -237,7 +237,6 @@ def build_helperd_prod_slice():
         "function apply_bridge_block_rules(rules, cb) { cb(mock_apply_res); }\n"
         "function check_staging_guard() { return { ok: true }; }\n"
         "function check_storage_budget() { return { ok: true }; }\n"
-        "function acquire_lock(o, op) { return { ok: true }; }\n"
         "function set_mock(ec, ap, ed, su_p, null_p) { ETC_DIR = ed; mock_exec_res = ec; mock_apply_res = ap; if (su_p != null) SYSUPGRADE_CONF_PATH = su_p; mock_readfile_null_path = null_p; spy_mutations = 0; }\n"
         "function clear_freeze_mem() { emergency_freeze_state = null; }\n"
         + m_aw.group(1) + "\n"
