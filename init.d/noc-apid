@@ -220,7 +220,7 @@ while kill -0 "\$_child" 2>/dev/null; do
 		break
 	fi
 	write_verified_marker
-	sleep 0.5
+	sleep 1
 done
 wait "\$_child" 2>/dev/null || true
 _rc=\$?
