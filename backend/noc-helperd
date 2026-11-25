@@ -3372,6 +3372,70 @@ function handle_rpc(req, reply_cb) {
 	}
 
 	// --- Mutating Verbs (Subject to P15 staging guard, P17 freeze, storage guard, & lock) ---
+	if (verb == 'deep_telemetry') {
+		let thermal = [];
+		let t_entries = fs.lsdir('/sys/class/thermal') || [];
+		for (let ze in t_entries) {
+			if (!match(ze, /^thermal_zone[0-9]+$/)) continue;
+			let raw_t = fs.readfile('/sys/class/thermal/' + ze + '/temp');
+			let t_c = (raw_t != null && match(trim(raw_t), /^-?[0-9]+$/)) ? (+trim(raw_t) / 1000.0) : null;
+			push(thermal, { zone: ze, temp_c: t_c, available: (t_c != null) });
+		}
+		exec_argv_async('/sbin/tc', ['-s', 'qdisc', 'show'], 4000, 65536, function(tc_res) {
+			let qdiscs = [];
+			let cake_active = false;
+			if (tc_res.ok && tc_res.output) {
+				let cur = null;
+				for (let ln in split(tc_res.output, '\n')) {
+					let m_q = match(ln, /^qdisc\s+(\S+)\s+\S+\s+dev\s+(\S+)/);
+					if (m_q) {
+						if (cur) push(qdiscs, cur);
+						if (m_q[1] == 'cake') cake_active = true;
+						cur = { qdisc: m_q[1], dev: m_q[2], bytes: null, packets: null, dropped: null, overlimits: null, requeues: null, ecn_mark: null };
+						continue;
+					}
+					if (!cur) continue;
+					let m_s = match(ln, /Sent\s+([0-9]+)\s+bytes\s+([0-9]+)\s+pkt\s+\(dropped\s+([0-9]+),\s+overlimits\s+([0-9]+)\s+requeues\s+([0-9]+)/);
+					if (m_s) {
+						cur.bytes = +m_s[1]; cur.packets = +m_s[2]; cur.dropped = +m_s[3]; cur.overlimits = +m_s[4]; cur.requeues = +m_s[5];
+					}
+					let m_e = match(ln, /ecn_mark\s+([0-9]+)/);
+					if (m_e) cur.ecn_mark = +m_e[1];
+				}
+				if (cur) push(qdiscs, cur);
+			}
+			exec_argv_async('/bin/ubus', ['call', 'service', 'list'], 4000, 131072, function(ub_res) {
+				let services = [];
+				if (ub_res.ok && ub_res.output) {
+					let parsed = null;
+					try { parsed = json(ub_res.output); } catch (e) { parsed = null; }
+					if (type(parsed) == 'object') {
+						for (let sname, sdata in parsed) {
+							let insts = [];
+							if (type(sdata) == 'object' && type(sdata.instances) == 'object') {
+								for (let iname, idata in sdata.instances) {
+									push(insts, {
+										instance: iname,
+										running: (type(idata) == 'object' && idata.running === true),
+										pid: (type(idata) == 'object' && idata.pid != null) ? +idata.pid : null
+									});
+								}
+							}
+							push(services, { name: sname, instances: insts });
+						}
+					}
+				}
+				reply_cb({
+					ok: true,
+					thermal: thermal,
+					traffic_control: { available: tc_res.ok, cake_active: cake_active, qdiscs: qdiscs },
+					procd: { available: ub_res.ok, service_count: length(services), services: services }
+				});
+			});
+		});
+		return;
+	}
+
 	let mutating_verbs = {
 		'agh_add_rule': true, 'agh_remove_rule': true, 'agh_toggle': true, 'agh_set_creds': true,
 		'agh_refresh_filters': true, 'agh_clear_querylog': true, 'agh_clear_cache': true,

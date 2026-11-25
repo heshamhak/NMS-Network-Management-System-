@@ -1415,6 +1415,16 @@ function handle_api_request(cli, method, url_path, headers, body_str, remote_ip)
 	}
 
 	// 3. Telemetry Endpoints (Single-flight coalesced cache in noc-apid memory)
+	if (action == 'deep_telemetry') {
+		call_helper('deep_telemetry', {}, (sess && sess.user) || 'admin', cip, function(hr) {
+			if (!hr || !hr.ok) {
+				send_json_env(cli, 503, 'system', null, [(hr && hr.error) || make_err('INTERNAL', 'system', 'تعذر قراءة القياسات العميقة للنظام')]);
+				return;
+			}
+			send_json_env(cli, 200, 'system', hr, []);
+		});
+		return;
+	}
 	if (action == 'overview') {
 		api_req_count++;
 		let c = cache_map['overview'];
